@@ -1,132 +1,120 @@
 # 🏔️ AndesCode
 
-**Your AI. Your hardware. Your code. Nobody else's business.**
+**Local AI coding assistant. No cloud. No leaks. No trust required.**
 
-AndesCode is a private, local AI coding assistant that runs entirely on your machine. No cloud. No token bills. Your code never leaves your machine during inference.
-The model and embedding weights are downloaded once on first run, then cached locally.
+[![License](https://img.shields.io/badge/license-Source--Available-lightgrey.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
+[![Model](https://img.shields.io/badge/model-Gemma%204%2026B-orange)](https://huggingface.co/lmstudio-community/gemma-4-26B-A4B-it-GGUF)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey)](#hardware-guide)
 
-It works with any IDE plugin that supports OpenAI-compatible APIs — Continue, Cursor, or any other tool you already use. Just point it at `localhost:8080`.
+AndesCode runs Gemma 4 26B entirely on your hardware. It indexes your codebase, understands your project structure, and answers questions about it — all locally, through its own native desktop interface. Your code is never uploaded anywhere.
 
 ---
 
-## Why AndesCode
+## Why local AI for code?
 
-Every cloud AI coding tool has the same problem: your code leaves your machine.
+Every cloud coding assistant has the same architecture: your code leaves your machine, hits someone else's server, and comes back as a suggestion. For most developers, that's a fine trade-off.
 
-GitHub Copilot, Cursor, Claude — they're all powerful, but they all require sending your proprietary code to someone else's server. For freelancers working on client projects, teams in regulated industries, or developers who simply believe their code is their own — that's not acceptable.
+For some, it isn't.
 
-AndesCode runs Gemma 4 26B locally on your hardware with Metal GPU acceleration. It indexes your codebase and answers questions about it. Your code never leaves your machine. The model is downloaded once from Hugging Face, then runs fully offline. A local audit log confirms every request was handled locally.
+| | AndesCode | GitHub Copilot | Cursor | Claude |
+|---|---|---|---|---|
+| Code stays on your machine | ✅ | ❌ | ❌ | ❌ |
+| Works fully offline | ✅ | ❌ | ❌ | ❌ |
+| No token bills | ✅ | ❌ | ❌ | ❌ |
+| Local audit log | ✅ | ❌ | ❌ | ❌ |
+| Frontier-class model | ✅ | ✅ | ✅ | ✅ |
+| Deterministic / no outages | ✅ | ❌ | ❌ | ❌ |
+
+AndesCode is built for developers who work with client code under NDA, operate in regulated industries (healthcare, legal, finance, defense), or simply believe their code is their own.
+
+---
+
+## Who this is for
+
+- Teams working with sensitive or proprietary code (NDA, IP-heavy projects)
+- Companies in regulated environments (finance, healthcare, legal)
+- Developers who want full control over their AI tooling and data flow
 
 ---
 
 ## Features
 
-- 🧠 **Gemma 4 26B** — frontier-class model running on your Mac or PC
-- 🔍 **Codebase-aware** — indexes your project and injects relevant context automatically
-- 🔒 **Local inference** — model runs on your hardware; your code is never uploaded
-- ⚡ **Fast** — 30+ tokens/second on Apple Silicon, streaming responses
-- 🔌 **Works with any IDE** — OpenAI-compatible API on localhost:8080
-- 📋 **Audit trail** — every request logged locally for compliance
+- 🧠 **Gemma 4 26B** — high-capability open-weight model running entirely on your hardware
+- 🔍 **Codebase-aware** — indexes your project, builds a project map, injects relevant context automatically
+- 🗺️ **Project intelligence** — detects language, stack, entry points, domain, and key symbols on indexing
+- 🔎 **Smart retrieval** — two-step planning (model selects relevant files first), query routing by filename/symbol/intent, and 4-axis re-ranking
+- ⚠️ **Coverage warnings** — the model is told when it has a partial view of a file, so it never pretends to have context it doesn't
+- 🔒 **Local inference** — offline flags enforced at OS level before any library loads; your code never leaves the machine
+- ⚡ **Fast** — KV cache warm-up on startup, 30–40 tokens/second on Apple Silicon, streaming responses
+- 🖥️ **Native desktop app** — runs as a native window on macOS and Windows via the built-in web UI
+- 📋 **Audit log** — every request logged locally with metadata only; proof of isolation for compliance
 
 ---
 
 ## Requirements
 
-- Apple Silicon Mac (M1/M2/M3/M4) with 32GB RAM — recommended
-- Or NVIDIA GPU with 24GB VRAM (RTX 3090/4090)
-- Python 3.11+
-- ~18GB disk space for the model
+| Platform | Hardware | RAM / VRAM |
+|---|---|---|
+| Apple Silicon Mac | M1 / M2 / M3 / M4 | 32GB unified memory |
+| Windows / Linux | NVIDIA RTX 3090, 4090, 5090 | 24–32GB VRAM |
+
+- Python 3.10+
+- ~18GB free disk space
 
 ---
 
 ## Quick Start
 
-**1. Clone and install**
+**1. Clone**
 
 ```bash
 git clone https://github.com/yourusername/andescode
 cd andescode
-pip3 install -r requirements.txt
 ```
 
-**2. Download the model**
+**2. Run the launcher**
 
 ```bash
-python3 -c "
-from huggingface_hub import snapshot_download
-snapshot_download(
-    repo_id='unsloth/gemma-4-26B-A4B-it-GGUF',
-    allow_patterns=['gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf'],
-    local_dir='models'
-)
-"
+python3 launch.py
 ```
 
-**3. Configure environment**
+That's it. On first run the launcher:
 
-```bash
-cp .env.example .env
-```
+- Detects your hardware (Apple Silicon → Metal, NVIDIA → CUDA)
+- Installs all dependencies with the correct GPU flags
+- Opens the AndesCode native window, which automatically:
+  - Downloads Gemma 4 26B (~16GB) from Hugging Face — progress shown on screen, resumes if interrupted
+  - Loads the model into memory
+  - Starts the local server
 
-**4. Start the server**
-
-```bash
-python3 server.py
-```
-
-**5. Index your project**
-
-> ⚠️ **This step is required before asking any questions.**
-> AndesCode has no knowledge of your codebase until you index it.
-> You only need to do this once per project, and again when files change significantly.
-
-```bash
-python3 indexer.py /path/to/your/project
-```
-
-You will see output like:
-
-```
-📂  Found 47 source files in /path/to/your/project
-✅  Indexed 47 files (0 skipped)
-```
-
-Once indexing is complete, AndesCode knows your codebase and will automatically inject relevant context into every query.
-
-**6. Connect your IDE**
-
-In Continue (`~/.continue/config.yaml`):
-
-```yaml
-models:
-  - name: AndesCode
-    provider: openai
-    model: andescode-gemma4-26b
-    apiBase: http://localhost:8080
-    apiKey: andescode
-```
-
-Ask anything about your codebase. Watch the answer appear. Check the audit log. Nothing left your machine.
+From there, the app guides you through indexing your project and you can start asking questions immediately. On subsequent runs, `python3 launch.py` just starts the app — model already cached, ready in seconds.
 
 ---
 
 ## How It Works
 
 ```
-You index your project once
-     ↓
-AndesCode stores your code as embeddings in ChromaDB (local)
-     ↓
-You ask a question in your IDE
-     ↓
-AndesCode finds the most relevant files for your question
-     ↓
-Injects that code into the prompt automatically
-     ↓
-Gemma 4 generates an answer grounded in your actual codebase
-     ↓
-Streams response to your IDE
-     ↓
+Index your project
+        ↓
+Files are chunked with language-aware boundary detection
+Embeddings stored in ChromaDB (local)
+Project map built: language, stack, domain, entry points, symbol index
+        ↓
+You ask a question in the AndesCode window
+        ↓
+Step 1 — Planning: model scans your project map and identifies
+         the most relevant files for your question
+        ↓
+Step 2 — Retrieval: those files are loaded in full, plus
+         semantic search fills any gaps the planner missed
+        ↓
+Project map + code context injected into system prompt
+Coverage warnings added if any file is only partially retrieved
+        ↓
+Gemma 4 generates a response grounded in your actual codebase
+Streams to the UI with timing metadata
+        ↓
 Everything logged locally. Code never uploaded.
 ```
 
@@ -134,124 +122,66 @@ Everything logged locally. Code never uploaded.
 
 ## Privacy Model
 
-This section documents exactly what stays on your machine, what requires a network connection, and what is logged.
+### Always local
 
-### What stays local — always
-- Your source code (never read by any remote server)
-- The ChromaDB vector embeddings of your code
-- Every query you send to AndesCode
-- Every response generated by the model
+- Your source code (never read by any external server)
+- ChromaDB vector embeddings of your code
+- Every query and every response
 - The audit log at `audit.log`
-- The project map and symbol index
+- Project map, symbol index, and file hash cache
 
-### What is downloaded once, then cached
-| Item | Size | Source | When |
-|---|---|---|---|
-| Gemma 4 26B Q4 model | ~16 GB | Hugging Face (lmstudio-community) | First run |
-| `all-MiniLM-L6-v2` embeddings | ~90 MB | Hugging Face (sentence-transformers) | First run |
+### Offline enforcement
 
-After first run, set `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` in `.env` to prevent any further outbound connections.
+Offline environment flags are set at process startup before model libraries initialize, preventing outbound network calls during inference.
 
-### What gets logged (audit.log)
-The audit log records metadata only — no code content, no queries, no responses:
-
-```
-2026-04-08 09:15:33 | REQUEST d24024dd | tokens=256 | messages=1
-2026-04-08 09:15:42 | CONTEXT d24024dd | chunks=3 | files=['auth.py', 'models.py']
-2026-04-08 09:15:48 | STREAM_DONE d24024dd | ttft=2.1s | total=8.4s
+```python
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_DATASETS_OFFLINE"]  = "1"
+os.environ["HF_HUB_OFFLINE"]       = "1"
 ```
 
-Logged: request ID, token count, number of messages, file names of retrieved chunks, timing.  
-Not logged: query text, response text, code content, absolute file paths, usernames.
+### Downloaded once, then cached
 
-### What never leaves the machine
-- Query text
-- Response text  
-- Code content of any kind
-- Absolute file paths or directory structure
-- Usernames or system information
+| Item | Size | Source |
+|---|---|---|
+| Gemma 4 26B Q4 model | ~16 GB | Hugging Face |
+| `all-MiniLM-L6-v2` embeddings | ~90 MB | Hugging Face |
+
+Both are cached permanently after first run.
+
+### Audit log format
+
+The audit log records metadata only — no code content, no query text, no responses. Absolute paths and usernames are stripped from all log entries.
+
+```
+2026-04-08 09:15:33 | REQUEST d24024dd | tokens=1024 | messages=1
+2026-04-08 09:15:34 | CONTEXT d24024dd | planned=['server.py', 'indexer.py'] | loaded=['server.py', 'indexer.py'] | chunks=14
+2026-04-08 09:15:42 | STREAM_DONE d24024dd | context=1.1s | think=2.3s | ttft=2.1s | total=8.4s | chunks=47
+```
+
+**Logged:** request ID, token count, file names of retrieved chunks, timing.  
+**Never logged:** query text, response text, code content, file paths, usernames.
 
 ### Network access summary
-| Phase | Network? | Notes |
-|---|---|---|
-| First-run model download | Yes | One-time, ~16GB from Hugging Face |
-| First-run embedding download | Yes | One-time, ~90MB from Hugging Face |
-| Indexing your code | No | Fully local |
-| Answering queries | No | Fully local |
-| Generating responses | No | Fully local |
 
+| Phase | Network | Notes |
+|---|---|---|
+| First-run model download | ✅ Once | ~16GB from Hugging Face |
+| First-run embedding download | ✅ Once | ~90MB from Hugging Face |
+| Indexing | ❌ Never | Fully local |
+| Answering queries | ❌ Never | Fully local |
 
 ---
 
 ## Hardware Guide
 
-| Hardware | Model | Performance |
+| Hardware | Model | Speed |
 |---|---|---|
 | Apple M1/M2 Pro 32GB | Gemma 4 26B Q4 | ~20–30 t/s |
 | Apple M3/M4 Pro 32GB | Gemma 4 26B Q4 | ~30–40 t/s |
 | Apple M2/M3 Max 64GB | Gemma 4 31B Q4 | ~25–35 t/s |
 | NVIDIA RTX 3090/4090 24GB | Gemma 4 26B Q4 | ~35–50 t/s |
 | NVIDIA RTX 5090 32GB | Gemma 4 31B Q4 | ~50–70 t/s |
-
----
-
-## Audit Log
-
-Every request is logged at `andescode/audit.log`:
-
-```
-2026-04-08 09:15:33 | REQUEST d24024dd | tokens=256 | messages=1
-2026-04-08 09:15:42 | CONTEXT d24024dd | chunks=3 | files=['auth.py', 'models.py']
-2026-04-08 09:15:48 | STREAM_DONE d24024dd
-```
-
-No code content is logged — only metadata. Proof of isolation without exposure.
-
----
-
-## API Reference
-
-AndesCode exposes an OpenAI-compatible REST API on `localhost:8080`.
-
-### Health check
-
-```bash
-GET /
-```
-
-```json
-{"status": "running", "product": "AndesCode", "version": "0.1.0"}
-```
-
-### List models
-
-```bash
-GET /v1/models
-```
-
-### Chat completion
-
-```bash
-POST /v1/chat/completions
-```
-
-```json
-{
-  "messages": [{"role": "user", "content": "How does auth work in this codebase?"}],
-  "max_tokens": 1024,
-  "stream": true
-}
-```
-
-### Index a project
-
-```bash
-POST /v1/index
-```
-
-```json
-{"path": "/path/to/your/project"}
-```
 
 ---
 
@@ -262,79 +192,100 @@ All configuration lives in `.env`:
 ```bash
 MODEL_PATH=models/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
 PORT=8080
-CONTEXT_CHUNKS=3
+CONTEXT_CHUNKS=5        # code chunks injected per query
+CACHE_SIZE_GB=2.0       # KV cache size allocated at startup
 TRANSFORMERS_OFFLINE=1
 HF_DATASETS_OFFLINE=1
-TRANSFORMERS_NO_ADVISORY_WARNINGS=1
+HF_HUB_OFFLINE=1
 TOKENIZERS_PARALLELISM=false
 ```
+
+For large projects or architectural questions, increase `CONTEXT_CHUNKS` to 7–10. The retrieval pipeline automatically widens its candidate pool for broad queries — this setting controls how many final chunks land in the prompt.
 
 ---
 
 ## Supported Languages
 
-Python, JavaScript, TypeScript, JSX, TSX, Go, Rust, Java, C, C++, Ruby, PHP, C#, Swift, Kotlin — and any other language with source files.
+Python, JavaScript, TypeScript, JSX/TSX, Go, Rust, Java, Kotlin, Swift, C, C++, Ruby, PHP, C# — with language-aware chunking that respects function and class boundaries for each.
 
 ---
 
 ## Roadmap
 
-- [ ] Auto-indexing — detect IDE workspace and index automatically on startup
-- [ ] Diff-aware incremental indexing — only re-index changed files
-- [ ] Private tunnel (Tailscale/WireGuard) for mobile access
-- [ ] iOS/Android chat client — code from your phone
+- [ ] File watcher — automatic incremental re-index on save
+- [ ] AST-aware chunking — deeper boundary detection beyond regex
 - [ ] KVTC context compression — fit larger codebases in context
-- [ ] AST-aware chunking — smarter function/class boundary detection
-- [ ] Fine-tuning on your codebase conventions
-- [ ] Pre-configured hardware bundle (Mac Mini)
+- [ ] Private tunnel (Tailscale/WireGuard) for mobile access
+- [ ] iOS/Android chat client
 - [ ] Cryptographic egress proof for SOC 2 compliance
+- [ ] Pre-configured hardware bundle (Mac Mini)
+
+---
+
+## Security Model
+
+AndesCode is designed to run fully locally and offline during inference.
+
+However, users are responsible for validating their own environment and dependencies for compliance requirements. AndesCode does not claim formal certification (e.g., SOC 2, ISO) at this stage.
 
 ---
 
 ## FAQ
 
-**Does any data leave my machine?**
-Your code never leaves your machine. Inference is entirely local. Two things require a network connection: (1) downloading the Gemma 4 26B model file (~16GB) from Hugging Face on first run, and (2) downloading the `all-MiniLM-L6-v2` embedding model weights (~90MB) on first run. Both are cached locally after that. Set `TRANSFORMERS_OFFLINE=1` and `HF_HUB_OFFLINE=1` in `.env` to enforce fully offline operation after first run.
+**Does any code leave my machine?**  
+No. Inference is entirely local. The only outbound connections are the one-time model download (~16GB) and embedding weights (~90MB) from Hugging Face on first run. Both are cached permanently. Offline flags are enforced at the OS level so no library can phone home during inference.
 
-**What about the embedding model?**
-The `all-MiniLM-L6-v2` embedding model is downloaded once from Hugging Face on first run, then cached locally. After the first run, set `TRANSFORMERS_OFFLINE=1` in `.env` to block any further network calls.
+**Does it integrate with VS Code, Cursor, or other IDEs?**  
+Not at this time. AndesCode is a standalone desktop app with its own interface. IDE plugin integration is on the roadmap but not currently supported.
 
-**Can I use a different model?**
-Yes. Any GGUF model compatible with llama.cpp works. Update `MODEL_PATH` in `.env`.
+**Can I use a different model?**  
+Yes — any GGUF model compatible with llama.cpp. Update `MODEL_PATH` in `.env`.
 
-**Does it work on Windows or Linux?**
-Yes, with an NVIDIA GPU. The setup instructions are the same — llama.cpp supports CUDA. Metal acceleration is Apple Silicon only.
+**Does it work on Windows or Linux?**  
+Yes, with an NVIDIA GPU. `launch.py` detects `nvidia-smi` and compiles llama-cpp-python with CUDA automatically. Metal acceleration is Apple Silicon only.
 
-**Can my whole team use one AndesCode server?**
-Yes. Run the server on a shared machine and point everyone's IDE config at that machine's IP instead of localhost. The Team tier supports this.
+**Answers seem generic or miss important files. What's wrong?**  
+Check that indexing completed — you should see `✅ Done — X files`. For large projects, increase `CONTEXT_CHUNKS` in `.env`. You can also reference a specific file by name in your question — AndesCode will load all indexed chunks from that file directly.
 
-**I indexed my project but answers seem generic. Why?**
-Make sure the index completed successfully — you should see `✅ Indexed X files`. If your project is large, increase `CONTEXT_CHUNKS` in `.env` to inject more code per query. Also try re-indexing after making significant changes.
+**How do I re-index after changing files?**  
+Run `python3 indexer.py /path/to/your/project` again. MD5 hashing ensures only changed files are re-processed — unchanged files are reused from the existing index instantly.
 
-**How do I re-index after changing files?**
-Just run `python3 indexer.py /path/to/your/project` again. It uses upsert so only changed chunks are updated.
+**Is there a hosted version?**  
+No. That would defeat the purpose.
+
+---
+
+## License
+
+AndesCode is source-available.
+
+- Free for personal use and internal company use
+- Commercial redistribution, resale, or offering AndesCode as a service requires a commercial license
+
+See [LICENSE](LICENSE) for full terms.
+
+This licensing model allows teams to use AndesCode freely inside their organization, while preventing third parties from reselling or hosting it as a competing service.
 
 ---
 
 ## Contributing
 
-AndesCode is open source under Apache 2.0. PRs welcome.
+PRs welcome.
 
-The most valuable contributions right now:
-- Windows/Linux setup testing and documentation
-- AST-aware chunking for better context retrieval
-- KVTC compression integration
-- JetBrains plugin testing
-- Auto-indexing from IDE workspace detection
+Highest-value contributions right now:
+
+- Windows / Linux setup testing and documentation
+- AST-aware chunking (deeper than current regex-based boundary detection)
+- File watcher for automatic incremental re-indexing
 
 ---
 
 ## Built in the Andes. Runs everywhere.
 
-AndesCode is built by an independent developer from Latin America. It exists because not every tool needs to come from Silicon Valley or Beijing, and not every developer should have to trust a corporation with their code.
+AndesCode is built by an independent developer from Latin America. It exists because some teams require full control over their code, infrastructure, and data flow.
 
-Apache 2.0 licensed. Free to use, fork, and build on.
+Source-available. Free to use internally. Commercial use requires a license.
 
 ---
 
-*"Your AI runs at home. Your code never leaves."*
+*Your AI runs at home. Your code never leaves.*
