@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AndesCode — Setting up</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=JetBrains+Mono:wght@300;400&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:       #080b0f;
+  --surface:  #0e1218;
+  --surface2: #131820;
+  --border:   #1c2330;
+  --accent:   #3d8ef0;
+  --accent-d: #1e4a8a;
+  --success:  #2dd4a0;
+  --danger:   #ef4444;
+  --warning:  #f59e0b;
+  --text:     #dde4f0;
+  --muted:    #5a6880;
+  --dim:      #3a4558;
+}
+
+html, body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'DM Sans', sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.container {
+  width: 480px;
+  padding: 0 20px;
+}
+
+/* Logo */
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 40px;
+}
+.logo-icon {
+  width: 48px;
+  height: 48px;
+  background: linear-gradient(135deg, #3d8ef0 0%, #5b5ef4 100%);
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 24px;
+  box-shadow: 0 0 30px rgba(61,142,240,0.3);
+}
+.logo-text h1 {
+  font-family: 'Syne', sans-serif;
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: -0.3px;
+}
+.logo-text p {
+  font-size: 12px;
+  color: var(--muted);
+  font-family: 'JetBrains Mono', monospace;
+  margin-top: 2px;
+}
+
+/* Steps */
+.steps {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 28px;
+}
+
+.step {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  transition: background 0.2s;
+}
+.step.active {
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+.step.done { opacity: 0.5; }
+.step.error   { background: rgba(239,68,68,0.08);  border: 1px solid rgba(239,68,68,0.2); }
+.step.warning { background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); }
+
+.step-icon {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  flex-shrink: 0;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--dim);
+}
+.step.active .step-icon {
+  background: var(--accent-d);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.step.done .step-icon {
+  background: rgba(45,212,160,0.15);
+  border-color: var(--success);
+  color: var(--success);
+}
+.step.error .step-icon {
+  background: rgba(239,68,68,0.15);
+  border-color: var(--danger);
+  color: var(--danger);
+}
+.step.warning .step-icon {
+  background: rgba(245,158,11,0.15);
+  border-color: var(--warning);
+  color: var(--warning);
+}
+
+.step-content { flex: 1; min-width: 0; }
+.step-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+}
+.step.done .step-label { color: var(--muted); }
+.step-detail {
+  font-size: 11px;
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--muted);
+  margin-top: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Spinner */
+@keyframes spin { to { transform: rotate(360deg); } }
+.spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+/* Progress bar */
+.progress-section {
+  margin-bottom: 24px;
+}
+.progress-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 8px;
+}
+.progress-label {
+  font-size: 13px;
+  font-weight: 500;
+}
+.progress-pct {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: var(--accent);
+}
+.progress-track {
+  height: 6px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 6px;
+}
+.progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), #5b5ef4);
+  border-radius: 3px;
+  transition: width 0.4s ease;
+  width: 0%;
+}
+.progress-detail {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--muted);
+  text-align: center;
+}
+
+/* Error panel */
+.error-panel {
+  display: none;
+  background: rgba(239,68,68,0.08);
+  border: 1px solid rgba(239,68,68,0.25);
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 20px;
+}
+.error-panel.visible { display: block; }
+.error-title {
+  font-weight: 600;
+  color: var(--danger);
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+.error-msg {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  line-height: 1.6;
+  margin-bottom: 12px;
+  max-height: 120px;
+  overflow-y: auto;
+}
+.retry-btn {
+  padding: 8px 18px;
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  font-family: 'DM Sans', sans-serif;
+  transition: background 0.15s;
+}
+.retry-btn:hover { background: #5a9ff5; }
+
+/* Footer */
+.footer {
+  text-align: center;
+  font-size: 11px;
+  color: var(--dim);
+  font-family: 'JetBrains Mono', monospace;
+  margin-top: 8px;
+}
+</style>
+</head>
+<body>
+<div class="container">
+
+  <div class="logo">
+    <div class="logo-icon">🏔️</div>
+    <div class="logo-text">
+      <h1>AndesCode</h1>
+      <p>private · local inference · code never uploaded</p>
+    </div>
+  </div>
+
+  <!-- Steps -->
+  <div class="steps" id="steps">
+    <div class="step" id="step-python">
+      <div class="step-icon" id="icon-python">1</div>
+      <div class="step-content">
+        <div class="step-label">Python environment</div>
+        <div class="step-detail" id="detail-python">Checking version...</div>
+      </div>
+    </div>
+    <div class="step" id="step-hardware">
+      <div class="step-icon" id="icon-hardware">2</div>
+      <div class="step-content">
+        <div class="step-label">Hardware compatibility</div>
+        <div class="step-detail" id="detail-hardware">Waiting...</div>
+      </div>
+    </div>
+    <div class="step" id="step-deps">
+      <div class="step-icon" id="icon-deps">3</div>
+      <div class="step-content">
+        <div class="step-label">Dependencies</div>
+        <div class="step-detail" id="detail-deps">Waiting...</div>
+      </div>
+    </div>
+    <div class="step" id="step-download">
+      <div class="step-icon" id="icon-download">4</div>
+      <div class="step-content">
+        <div class="step-label">AI Model (Gemma 4 26B)</div>
+        <div class="step-detail" id="detail-download">Waiting...</div>
+      </div>
+    </div>
+    <div class="step" id="step-server">
+      <div class="step-icon" id="icon-server">5</div>
+      <div class="step-content">
+        <div class="step-label">Starting server</div>
+        <div class="step-detail" id="detail-server">Waiting...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Progress bar -->
+  <div class="progress-section">
+    <div class="progress-header">
+      <span class="progress-label" id="progressLabel">Initializing...</span>
+      <span class="progress-pct" id="progressPct">0%</span>
+    </div>
+    <div class="progress-track">
+      <div class="progress-bar" id="progressBar"></div>
+    </div>
+    <div class="progress-detail" id="progressDetail"></div>
+  </div>
+
+  <!-- Error panel -->
+  <div class="error-panel" id="errorPanel">
+    <div class="error-title">⚠ Setup failed</div>
+    <div class="error-msg" id="errorMsg"></div>
+    <button class="retry-btn" onclick="retry()">Try Again</button>
+  </div>
+
+  <div class="footer">Inference runs entirely on your hardware. Code is never uploaded. Model downloaded once on first run.</div>
+</div>
+
+<script>
+// ── Get status server port from URL query param ───────────────────────────────
+const STATUS_PORT = new URLSearchParams(window.location.search).get('statusPort') || '9999';
+const STATUS_URL  = `http://127.0.0.1:${STATUS_PORT}/status`;
+const RETRY_URL   = `http://127.0.0.1:${STATUS_PORT}/retry`;
+
+const STEP_MAP = {
+  python:   'python',
+  hardware: 'hardware',
+  disk:     'hardware',
+  deps:     'deps',
+  download: 'download',
+  model:    'download',
+  port:     'server',
+  server:   'server',
+  done:     'server',
+  error:    null,
+};
+
+const STEP_ORDER = ['python', 'hardware', 'deps', 'download', 'server'];
+let isDone = false;
+
+function updateUI(status) {
+  if (isDone) return;
+
+  const { step, message, progress, detail, error } = status;
+  const uiStep = STEP_MAP[step];
+
+  if (progress != null) {
+    document.getElementById('progressBar').style.width = progress + '%';
+    document.getElementById('progressPct').textContent = progress + '%';
+  }
+  document.getElementById('progressLabel').textContent  = message || '';
+  document.getElementById('progressDetail').textContent = detail  || '';
+
+  if (error) {
+    document.getElementById('errorPanel').classList.add('visible');
+    document.getElementById('errorMsg').textContent = error;
+    if (uiStep) markStep(uiStep, 'error', error.split('\n')[0]);
+    return;
+  }
+
+  if (step === 'hardware' && message && message.includes('⚠')) {
+    markStep('hardware', 'warning', detail || message);
+    return;
+  }
+
+  document.getElementById('errorPanel').classList.remove('visible');
+  if (!uiStep) return;
+
+  const idx = STEP_ORDER.indexOf(uiStep);
+  for (let i = 0; i < idx; i++) markStep(STEP_ORDER[i], 'done', '✓');
+  markStep(uiStep, 'active', detail || message);
+
+  if (status.done) {
+    isDone = true;
+    STEP_ORDER.forEach(s => markStep(s, 'done', '✓'));
+    document.getElementById('progressLabel').textContent = '✓ Ready — opening AndesCode...';
+    document.getElementById('progressBar').style.background = 'var(--success)';
+    // Navigation handled exclusively by app.py window.load_url().
+    // DO NOT add window.location.href here — firing both simultaneously
+    // causes WKWebView to receive two conflicting navigations (file:// → http://)
+    // which it silently drops, leaving the screen frozen at 100%.
+  }
+}
+
+function markStep(id, state, detail) {
+  const el   = document.getElementById('step-' + id);
+  const icon = document.getElementById('icon-' + id);
+  const det  = document.getElementById('detail-' + id);
+  if (!el) return;
+  el.className = 'step ' + state;
+  if      (state === 'active')  icon.innerHTML   = '<div class="spinner"></div>';
+  else if (state === 'done')    icon.textContent = '✓';
+  else if (state === 'error')   icon.textContent = '✕';
+  else if (state === 'warning') icon.textContent = '⚠';
+  if (detail && det) det.textContent = detail;
+}
+
+async function retry() {
+  document.getElementById('errorPanel').classList.remove('visible');
+  isDone = false;
+  STEP_ORDER.forEach((s, i) => {
+    const el   = document.getElementById('step-' + s);
+    const icon = document.getElementById('icon-' + s);
+    const det  = document.getElementById('detail-' + s);
+    if (el)   el.className    = 'step';
+    if (icon) icon.textContent= i + 1;
+    if (det)  det.textContent = 'Waiting...';
+  });
+  document.getElementById('progressBar').style.width    = '0%';
+  document.getElementById('progressBar').style.background = '';
+  document.getElementById('progressPct').textContent    = '0%';
+  document.getElementById('progressLabel').textContent  = 'Retrying...';
+  document.getElementById('progressDetail').textContent = '';
+  try { await fetch(RETRY_URL); } catch {}
+}
+
+// ── Poll the status HTTP server — plain fetch, no pywebview bridge ─────────────
+// 800ms interval — slow enough to not stress the WebView
+async function poll() {
+  while (true) {
+    if (isDone) return;
+    try {
+      const r = await fetch(STATUS_URL);
+      if (r.ok) {
+        const status = await r.json();
+        updateUI(status);
+      }
+    } catch { /* server not ready yet */ }
+    await new Promise(r => setTimeout(r, 800));
+  }
+}
+
+poll();
+</script>
+</body>
+</html>

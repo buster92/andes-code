@@ -1,0 +1,780 @@
+import os
+os.environ.setdefault("TRANSFORMERS_OFFLINE",              "1")
+os.environ.setdefault("HF_DATASETS_OFFLINE",              "1")
+os.environ.setdefault("HF_HUB_OFFLINE",                   "1")
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM",            "false")
+
+import hashlib
+import json
+import logging
+import re
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Generator
+
+import chromadb
+from sentence_transformers import SentenceTransformer
+
+# ── Config ────────────────────────────────────────────────────────────────────
+EMBED_MODEL   = "all-MiniLM-L6-v2"
+CHROMA_PATH   = str(Path(__file__).parent / "index")
+COLLECTION    = "codebase"
+HASH_STORE    = Path(__file__).parent / "index" / ".file_hashes.json"
+PROJECT_MAP   = Path(__file__).parent / "index" / "project_map.json"
+SYMBOL_INDEX  = Path(__file__).parent / "index" / "symbol_index.json"
+EMBED_BATCH   = 64
+CHROMA_BATCH  = 4096
+CHUNK_LINES   = 80
+CHUNK_OVERLAP = 15
+
+# ── Language boundary patterns ────────────────────────────────────────────────
+_BOUNDARY = {
+    "py":   re.compile(r"^(def |class |async def )", re.MULTILINE),
+    "js":   re.compile(r"^(function |const \w+ ?= ?(async ?)?\(|class )", re.MULTILINE),
+    "ts":   re.compile(r"^(function |const |class |interface |type |export )", re.MULTILINE),
+    "jsx":  re.compile(r"^(function |const |class |export )", re.MULTILINE),
+    "tsx":  re.compile(r"^(function |const |class |export |interface )", re.MULTILINE),
+    "java": re.compile(r"^\s*(public|private|protected|static)[^\n]*\(", re.MULTILINE),
+    "kt":   re.compile(r"^\s*(fun |class |object |interface )", re.MULTILINE),
+    "swift":re.compile(r"^\s*(func |class |struct |protocol |extension )", re.MULTILINE),
+    "go":   re.compile(r"^(func |type )", re.MULTILINE),
+    "rs":   re.compile(r"^(fn |pub fn |impl |struct |enum |trait )", re.MULTILINE),
+}
+
+SUPPORTED_EXTENSIONS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx",
+    ".go", ".rs", ".java", ".cpp", ".c", ".h",
+    ".rb", ".php", ".cs", ".swift", ".kt",
+    ".gradle", ".xml",
+}
+
+SKIP_DIRS = {
+    ".git", ".svn", ".hg",
+    "node_modules", ".next", ".nuxt", "dist", "build",
+    "__pycache__", ".venv", "venv", ".pytest_cache", ".mypy_cache", "coverage",
+    "vendor", "bundle", "Pods", "Carthage",
+    ".gradle", ".idea", "target", "bin", "gen", "intermediates", "generated",
+    "pkg", "DerivedData", "xcuserdata",
+    "tmp", "temp", "cache", ".cache", "logs",
+    ".build", "release", "debug",
+}
+
+# ── Setup ─────────────────────────────────────────────────────────────────────
+logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
+print("🔍  Loading embedding model...")
+embedder = SentenceTransformer(EMBED_MODEL)
+chroma   = chromadb.PersistentClient(path=CHROMA_PATH)
+col      = chroma.get_or_create_collection(COLLECTION)
+print("✅  Indexer ready.")
+
+
+# ── Public API ─────────────────────────────────────────────────────────────────
+
+def index_codebase(root: str) -> dict:
+    result = {}
+    for event in index_codebase_stream(root):
+        if event["type"] == "done":
+            result = event
+    return result
+
+
+def index_codebase_stream(root: str) -> Generator[dict, None, None]:
+    """
+    Index a codebase with incremental support. Yields SSE progress events.
+    On completion builds project map + symbol index for smart retrieval.
+    """
+    root_path = Path(root).resolve()
+
+    if not root_path.exists():
+        yield {"type": "error", "message": f"Path not found: {root_path}"}
+        return
+
+    # ── Hash cache / project change detection ─────────────────────────────────
+    hashes          = _load_hashes()
+    is_same_project = hashes.get("__root__") == str(root_path)
+
+    if not is_same_project:
+        try:
+            chroma.delete_collection(COLLECTION)
+        except Exception:
+            pass
+        global col
+        col    = chroma.get_or_create_collection(COLLECTION)
+        hashes = {"__root__": str(root_path)}
+        # Clear old maps
+        for f in [PROJECT_MAP, SYMBOL_INDEX]:
+            try:
+                f.unlink()
+            except Exception:
+                pass
+
+    yield {"type": "clear"}
+
+    # ── Collect and diff ──────────────────────────────────────────────────────
+    all_files = _collect_files(root_path)
+    new_files, unchanged = [], []
+
+    for fp in all_files:
+        key   = str(fp.relative_to(root_path))
+        fhash = _file_hash(fp)
+        if hashes.get(key) == fhash:
+            unchanged.append(fp)
+        else:
+            new_files.append((fp, fhash))
+
+    yield {
+        "type": "scan", "files": len(all_files),
+        "new": len(new_files), "unchanged": len(unchanged),
+    }
+
+    if not all_files:
+        yield {"type": "error", "message": "No source files found in that directory"}
+        return
+
+    if not new_files and unchanged:
+        # Nothing changed — still emit map event so UI can display it
+        pmap = _load_project_map()
+        yield {
+            "type": "done", "indexed": len(unchanged),
+            "chunks": col.count(), "project": root_path.name,
+            "new": 0, "reused": len(unchanged),
+            "map": pmap,
+        }
+        return
+
+    # ── Chunk ─────────────────────────────────────────────────────────────────
+    all_chunks = []
+    for fp, _ in new_files:
+        try:
+            all_chunks.extend(_chunk_file(fp, root_path))
+        except Exception as e:
+            logging.warning(f"Skipped {fp}: {e}")
+
+    total_chunks = len(all_chunks)
+    yield {"type": "chunks", "total": total_chunks}
+
+    if not all_chunks:
+        yield {"type": "error", "message": "No chunks generated — check file contents"}
+        return
+
+    # ── Embed ─────────────────────────────────────────────────────────────────
+    all_embeddings = []
+    for start in range(0, total_chunks, EMBED_BATCH):
+        batch = all_chunks[start: start + EMBED_BATCH]
+        vecs  = embedder.encode([c["content"] for c in batch],
+                                show_progress_bar=False).tolist()
+        all_embeddings.extend(vecs)
+        done = min(start + EMBED_BATCH, total_chunks)
+        yield {"type": "embed", "done": done, "total": total_chunks,
+               "pct": int(done / total_chunks * 100)}
+
+    # ── Store ─────────────────────────────────────────────────────────────────
+    stored = 0
+    for start in range(0, total_chunks, CHROMA_BATCH):
+        bc = all_chunks[start: start + CHROMA_BATCH]
+        bv = all_embeddings[start: start + CHROMA_BATCH]
+        col.upsert(
+            ids        = [c["id"]      for c in bc],
+            embeddings = bv,
+            documents  = [c["content"] for c in bc],
+            metadatas  = [{"file": c["file"], "language": c["language"],
+                           "line": c["line"], "symbols": c.get("symbols", "")}
+                          for c in bc],
+        )
+        stored += len(bc)
+        yield {"type": "store", "done": stored, "total": total_chunks,
+               "pct": int(stored / total_chunks * 100)}
+
+    # ── Save hashes ───────────────────────────────────────────────────────────
+    for fp, fhash in new_files:
+        hashes[str(fp.relative_to(root_path))] = fhash
+    _save_hashes(hashes)
+
+    # ── Build project intelligence ────────────────────────────────────────────
+    yield {"type": "mapping", "message": "Building project map..."}
+
+    all_indexed = [fp for fp, _ in new_files] + unchanged
+    pmap   = build_project_map(root_path, all_indexed, all_chunks)
+    symidx = build_symbol_index(all_chunks)
+
+    _save_json(PROJECT_MAP, pmap)
+    _save_json(SYMBOL_INDEX, symidx)
+
+    yield {
+        "type":    "done",
+        "indexed": len({c["file"] for c in all_chunks}) + len(unchanged),
+        "chunks":  col.count(),
+        "project": root_path.name,
+        "new":     len(new_files),
+        "reused":  len(unchanged),
+        "map":     pmap,
+    }
+
+
+def search(query: str, n_results: int = 5) -> list[dict]:
+    """
+    Smart retrieval with query routing and re-ranking.
+
+    Routes:
+      - Filename mentioned   → fetch ALL chunks from that file
+      - Symbol name match    → boost chunks from that symbol's file
+      - Architectural query  → fetch more candidates (8 instead of 5)
+      - Default              → semantic search + re-ranking
+    """
+    count = col.count()
+    if count == 0:
+        return []
+
+    # ── Route 1: Filename detected ────────────────────────────────────────────
+    file_match = re.search(
+        r'\b[\w/]+\.(py|js|ts|jsx|tsx|java|kt|swift|go|rs|cpp|c|rb|cs)\b',
+        query, re.IGNORECASE
+    )
+    if file_match:
+        fname   = file_match.group(0).lower()
+        results = _fetch_all_from_file(fname, n_results)
+        if results:
+            return results
+
+    # ── Route 2: Symbol name lookup ───────────────────────────────────────────
+    symidx = _load_json(SYMBOL_INDEX)
+    if symidx:
+        query_words = set(re.findall(r"\w+", query))
+        matched_files = set()
+        for word in query_words:
+            if word in symidx:
+                matched_files.update(symidx[word])
+        if matched_files:
+            # Boost n_results for symbol queries — likely need more context
+            n_results = max(n_results, 6)
+
+    # ── Route 3: Architectural query ──────────────────────────────────────────
+    arch_patterns = re.compile(
+        r'\b(how does|how is|where is|where are|explain|overview|'
+        r'architecture|structure|flow|pipeline|what is the|'
+        r'how do you|entry point|main|startup)\b',
+        re.IGNORECASE
+    )
+    if arch_patterns.search(query):
+        n_results = max(n_results, 8)
+
+    # ── Semantic search + re-ranking ──────────────────────────────────────────
+    embedding = embedder.encode(query).tolist()
+    fetch     = min(n_results * 6, count)   # wider candidate pool → better rerank
+    results   = col.query(query_embeddings=[embedding], n_results=fetch)
+
+    candidates = [
+        {
+            "content":  doc,
+            "file":     results["metadatas"][0][i].get("file", ""),
+            "language": results["metadatas"][0][i].get("language", ""),
+            "symbols":  results["metadatas"][0][i].get("symbols", ""),
+            "score":    results["distances"][0][i],
+        }
+        for i, doc in enumerate(results["documents"][0])
+    ]
+
+    # Boost candidates from symbol-matched files
+    if symidx and matched_files:
+        for c in candidates:
+            if any(mf in c["file"] for mf in matched_files):
+                c["score"] *= 0.8   # lower distance = better match
+
+    ranked = _rerank(query, candidates)
+
+    # Add coverage metadata — lets server tell model how much of each file it has
+    return _add_coverage(ranked[:n_results])
+
+
+def get_chunks_for_file(filename: str) -> list[dict]:
+    """Retrieve ALL indexed chunks for a specific file."""
+    return _fetch_all_from_file(filename, max_results=999)
+
+
+def build_project_map(root_path: Path, files: list, chunks: list) -> dict:
+    """
+    Analyse the project structure and build a structured summary.
+    This gets injected into every system prompt so the model always
+    knows what project it's working with.
+    """
+    # ── Language detection ────────────────────────────────────────────────────
+    lang_counts = defaultdict(int)
+    for fp in files:
+        lang_counts[fp.suffix] += 1
+    primary_ext  = max(lang_counts, key=lang_counts.get) if lang_counts else ""
+    EXT_TO_LANG  = {
+        ".py": "Python", ".js": "JavaScript", ".ts": "TypeScript",
+        ".kt": "Kotlin", ".java": "Java", ".swift": "Swift",
+        ".go": "Go", ".rs": "Rust", ".cpp": "C++", ".cs": "C#",
+    }
+    primary_lang = EXT_TO_LANG.get(primary_ext, primary_ext.lstrip(".").upper())
+
+    # ── Framework / stack detection ───────────────────────────────────────────
+    root_files = {f.name for f in root_path.iterdir() if f.is_file()} \
+                 if root_path.exists() else set()
+
+    stack = []
+    if "requirements.txt" in root_files or "pyproject.toml" in root_files:
+        stack.append("Python")
+        reqs = ""
+        for rf in ["requirements.txt", "pyproject.toml"]:
+            try:
+                reqs = (root_path / rf).read_text(errors="ignore").lower()
+                break
+            except Exception:
+                pass
+        if "fastapi" in reqs or "flask" in reqs or "django" in reqs:
+            stack.append("Web API")
+        if "torch" in reqs or "tensorflow" in reqs:
+            stack.append("ML/Deep Learning")
+        if "pandas" in reqs or "numpy" in reqs:
+            stack.append("Data Science")
+        if "binance" in reqs or "ccxt" in reqs:
+            stack.append("Crypto Trading")
+        if "scikit" in reqs or "sklearn" in reqs:
+            stack.append("Machine Learning")
+
+    if "build.gradle" in root_files or "build.gradle.kts" in root_files:
+        stack.append("Android")
+    if "package.json" in root_files:
+        try:
+            pkg = json.loads((root_path / "package.json").read_text(errors="ignore"))
+            deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+            if "react" in deps:     stack.append("React")
+            if "next" in deps:      stack.append("Next.js")
+            if "vue" in deps:       stack.append("Vue")
+            if "express" in deps:   stack.append("Express")
+        except Exception:
+            stack.append("Node.js")
+    if "Podfile" in root_files or any(f.endswith(".xcodeproj") for f in root_files):
+        stack.append("iOS")
+    if "Cargo.toml" in root_files:
+        stack.append("Rust")
+    if "go.mod" in root_files:
+        stack.append("Go")
+
+    # ── Entry point detection ─────────────────────────────────────────────────
+    entry_candidates = [
+        "main.py", "app.py", "server.py", "run.py", "manage.py", "__main__.py",
+        "index.js", "app.js", "server.js", "main.js",
+        "index.ts", "app.ts", "main.ts",
+        "Main.java", "Application.java",
+        "main.go", "main.rs", "main.swift",
+    ]
+    entry_point = None
+    file_names  = {fp.name: fp for fp in files}
+    for candidate in entry_candidates:
+        if candidate in file_names:
+            entry_point = str(file_names[candidate].relative_to(root_path))
+            break
+
+    # ── Module list (top-level source files) ──────────────────────────────────
+    # Group by directory to give a clean module view
+    module_dirs = defaultdict(list)
+    for fp in files:
+        rel  = fp.relative_to(root_path)
+        parts = rel.parts
+        if len(parts) == 1:
+            module_dirs["root"].append(fp.name)
+        else:
+            module_dirs[parts[0]].append("/".join(parts[1:]))
+
+    # Keep top 15 most populated directories
+    top_modules = dict(
+        sorted(module_dirs.items(), key=lambda x: -len(x[1]))[:15]
+    )
+
+    # ── Domain detection from source content ──────────────────────────────────
+    domain_keywords = {
+        "crypto/trading": ["btcusdt", "binance", "cryptocurrency", "trading", "candlestick",
+                           "ohlcv", "binance", "coinbase", "kraken"],
+        "web backend":    ["endpoint", "router", "middleware", "request", "response",
+                           "http", "rest", "graphql"],
+        "mobile/android": ["activity", "fragment", "viewmodel", "recyclerview",
+                           "manifest", "gradle"],
+        "mobile/ios":     ["uiviewcontroller", "swiftui", "storyboard", "appdelegate"],
+        "data science":   ["dataframe", "numpy", "pandas", "sklearn", "model.fit"],
+        "ML/AI":          ["neural", "epoch", "loss", "gradient", "tensor"],
+        "devops/infra":   ["dockerfile", "kubernetes", "terraform", "deploy"],
+    }
+
+    domain_scores = defaultdict(int)
+    # Sample first 30 files to detect domain
+    sample_files = files[:30]
+    for fp in sample_files:
+        try:
+            text = fp.read_text(errors="ignore").lower()[:3000]
+            for domain, keywords in domain_keywords.items():
+                domain_scores[domain] += sum(1 for kw in keywords if kw in text)
+        except Exception:
+            pass
+
+    detected_domain = max(domain_scores, key=domain_scores.get) \
+                      if any(v > 0 for v in domain_scores.values()) else None
+
+    # ── Key symbols per file ──────────────────────────────────────────────────
+    # Build a compact function/class map: {file: [symbol1, symbol2, ...]}
+    file_symbols = defaultdict(list)
+    for c in chunks:
+        if c.get("symbols"):
+            syms = c["symbols"].split()
+            file_symbols[c["file"]].extend(syms)
+
+    # Deduplicate and keep top files by symbol count
+    file_symbol_map = {
+        f: list(dict.fromkeys(syms))[:10]   # preserve order, cap at 10
+        for f, syms in sorted(file_symbols.items(), key=lambda x: -len(x[1]))[:20]
+    }
+
+    return {
+        "project":      root_path.name,
+        "language":     primary_lang,
+        "stack":        stack,
+        "entry_point":  entry_point,
+        "file_count":   len(files),
+        "modules":      top_modules,
+        "domain":       detected_domain,
+        "file_symbols": file_symbol_map,
+    }
+
+
+def build_symbol_index(chunks: list) -> dict:
+    """
+    Build a symbol-to-file lookup: {"build_insights": ["market_insights.py"], ...}
+    Used for smart retrieval when query mentions a function/class name.
+    """
+    index = defaultdict(set)
+    for c in chunks:
+        if c.get("symbols"):
+            for sym in c["symbols"].split():
+                index[sym].add(c["file"])
+    return {k: list(v) for k, v in index.items()}
+
+
+def format_project_map_for_prompt(pmap: dict) -> str:
+    """
+    Format project map as a compact header for the system prompt.
+    Keeps it under ~300 tokens so it doesn't crowd out code context.
+    """
+    if not pmap:
+        return ""
+
+    lines = [
+        "## Project Context",
+        f"Name: {pmap.get('project', 'unknown')}",
+        f"Language: {pmap.get('language', 'unknown')}",
+    ]
+
+    if pmap.get("stack"):
+        lines.append(f"Stack: {', '.join(pmap['stack'])}")
+    if pmap.get("domain"):
+        lines.append(f"Domain: {pmap['domain']}")
+    if pmap.get("entry_point"):
+        lines.append(f"Entry point: {pmap['entry_point']}")
+
+    # Key modules with their symbols
+    fsyms = pmap.get("file_symbols", {})
+    if fsyms:
+        lines.append("Key modules:")
+        for fname, syms in list(fsyms.items())[:10]:
+            sym_str = ", ".join(syms[:6])
+            lines.append(f"  - {fname}: {sym_str}")
+
+    return "\n".join(lines)
+
+
+def _load_project_map() -> dict:
+    return _load_json(PROJECT_MAP)
+
+
+# ── Internal helpers ───────────────────────────────────────────────────────────
+
+def _fetch_all_from_file(filename: str, max_results: int = 20) -> list:
+    """Retrieve all indexed chunks for a given filename."""
+    count = col.count()
+    if count == 0:
+        return []
+
+    # Query with a high n_results and filter by file metadata
+    try:
+        results = col.get(
+            where={"file": {"$contains": filename.split("/")[-1]}},
+            limit=max_results,
+        )
+        if not results or not results.get("documents"):
+            return []
+
+        chunks = [
+            {
+                "content":   doc,
+                "file":      results["metadatas"][i].get("file", ""),
+                "language":  results["metadatas"][i].get("language", ""),
+                "symbols":   results["metadatas"][i].get("symbols", ""),
+                "score":     0.0,
+                "_rank":     1.0,
+                "full_file": True,
+            }
+            for i, doc in enumerate(results["documents"])
+            if doc
+        ]
+        # Sort by line number for coherent reading order
+        chunks.sort(key=lambda c: c.get("line", 0) if "line" in c else 0)
+        return chunks
+    except Exception:
+        return []
+
+
+def _add_coverage(chunks: list) -> list:
+    """
+    Add coverage metadata to each chunk:
+    how many chunks exist for that file vs how many we're returning.
+    This lets the server tell the model if it has partial file coverage.
+    """
+    # Count total chunks per file in the index
+    file_chunk_counts = {}
+    for c in chunks:
+        fname = c["file"]
+        if fname not in file_chunk_counts:
+            try:
+                result = col.get(where={"file": {"$contains": fname.split("/")[-1]}})
+                file_chunk_counts[fname] = len(result.get("documents", []))
+            except Exception:
+                file_chunk_counts[fname] = 0
+
+    returned_per_file = defaultdict(int)
+    for c in chunks:
+        returned_per_file[c["file"]] += 1
+
+    for c in chunks:
+        fname   = c["file"]
+        total   = file_chunk_counts.get(fname, 0)
+        returned= returned_per_file[fname]
+        c["coverage"] = {
+            "returned": returned,
+            "total":    total,
+            "partial":  total > 0 and returned < total,
+        }
+    return chunks
+
+
+def _camel_tokens(s: str) -> set:
+    """Split camelCase/PascalCase/snake_case into component words."""
+    parts = re.sub(r"([A-Z][a-z]+|[A-Z]+(?=[A-Z]|$))", r"_\1", s).lower()
+    return set(re.findall(r"\w+", parts))
+
+
+def _rerank(query: str, candidates: list) -> list:
+    """
+    Score each candidate on four axes then sort descending.
+
+    Axes:
+      base       — cosine similarity converted to 0-1 (1 = best)
+      kw_bonus   — query term overlap with chunk text, tf-weighted
+      sym_bonus  — query term overlap with declared symbols (higher weight)
+      phrase     — bonus when a multi-word query phrase appears verbatim
+      len_penalty— penalise very short chunks (< 5 lines) — usually noise
+    """
+    q_lower = query.lower()
+    terms   = set(re.findall(r"\w+", q_lower))
+    # Expand query terms with camelCase decomposition
+    q_tokens = terms.copy()
+    for t in list(terms):
+        q_tokens |= _camel_tokens(t)
+
+    # Build bigrams from query for phrase-match bonus
+    q_words  = re.findall(r"\w+", q_lower)
+    q_bigrams = {f"{q_words[i]} {q_words[i+1]}" for i in range(len(q_words)-1)}
+
+    for c in candidates:
+        content  = c["content"].lower()
+        cwords   = set(re.findall(r"\w+", content))
+        n_lines  = content.count("\n") + 1
+
+        # Base similarity score (ChromaDB distance → similarity)
+        base = max(0.0, 1.0 - (c["score"] / 2.0))
+
+        # Keyword overlap — weight by rarity (terms that appear in few words get more credit)
+        matched  = q_tokens & cwords
+        kw_bonus = min(len(matched) / max(len(q_tokens), 1) * 0.25, 0.25)
+
+        # Symbol bonus — exact symbol name match carries more signal
+        sym_bonus = 0.0
+        if c.get("symbols"):
+            sw = set(re.findall(r"\w+", c["symbols"].lower()))
+            sw |= _camel_tokens(c["symbols"])
+            sym_bonus = min(len(q_tokens & sw) / max(len(q_tokens), 1) * 0.20, 0.20)
+
+        # Phrase bonus — verbatim multi-word matches are very strong signal
+        phrase_bonus = 0.0
+        for bg in q_bigrams:
+            if bg in content:
+                phrase_bonus = min(phrase_bonus + 0.08, 0.16)
+
+        # Length penalty — very short chunks are usually incomplete / noise
+        len_penalty = 0.05 if n_lines < 4 else 0.0
+
+        c["_rank"] = base + kw_bonus + sym_bonus + phrase_bonus - len_penalty
+
+    return sorted(candidates, key=lambda x: x["_rank"], reverse=True)
+
+
+def _collect_files(root: Path) -> list:
+    files = []
+    for fp in root.rglob("*"):
+        if fp.is_file() and fp.suffix in SUPPORTED_EXTENSIONS:
+            if not any(s in fp.parts for s in SKIP_DIRS):
+                files.append(fp)
+    return sorted(files)
+
+
+def _chunk_file(fp: Path, root: Path) -> list:
+    text = fp.read_text(encoding="utf-8", errors="ignore")
+    if not text.strip():
+        return []
+
+    rel_path = str(fp.relative_to(root))
+    language = fp.suffix.lstrip(".")
+    lines    = text.splitlines()
+    symbols  = _extract_symbols(text, language)
+    pattern  = _BOUNDARY.get(language)
+
+    if pattern and len(lines) > CHUNK_LINES:
+        chunks = _boundary_chunks(text, rel_path, language, symbols, pattern)
+        if chunks:
+            return chunks
+    return _line_chunks(lines, rel_path, language, symbols)
+
+
+def _boundary_chunks(text, rel_path, language, symbols, pattern) -> list:
+    lines      = text.splitlines()
+    matches    = list(pattern.finditer(text))
+    if len(matches) < 2:
+        return []
+
+    boundaries = [text[:m.start()].count("\n") for m in matches] + [len(lines)]
+    chunks     = []
+
+    for idx, start in enumerate(boundaries[:-1]):
+        end   = boundaries[idx + 1]
+        block = lines[start:end]
+        if len(block) > CHUNK_LINES * 2:
+            chunks.extend(_line_chunks(block, rel_path, language, symbols, start))
+        elif block:
+            ct = "\n".join(block).strip()
+            if ct:
+                chunks.append(_make_chunk(rel_path, language, symbols, ct, start))
+    return chunks
+
+
+def _line_chunks(lines, rel_path, language, symbols, line_offset=0) -> list:
+    chunks = []
+    i = 0
+    while i < len(lines):
+        text = "\n".join(lines[i: i + CHUNK_LINES]).strip()
+        if text:
+            chunks.append(_make_chunk(rel_path, language, symbols, text, line_offset + i))
+        i += CHUNK_LINES - CHUNK_OVERLAP
+    return chunks
+
+
+def _make_chunk(rel_path, language, symbols, text, line) -> dict:
+    chunk_id = hashlib.md5(f"{rel_path}:{line}".encode()).hexdigest()
+    return {
+        "id":       chunk_id,
+        "content":  f"# File: {rel_path}\n\n{text}",
+        "file":     rel_path,
+        "language": language,
+        "line":     line,
+        "symbols":  symbols,
+    }
+
+
+def _extract_symbols(text: str, language: str) -> str:
+    patterns = {
+        "py":   r"(?:def|class)\s+(\w+)",
+        "js":   r"(?:function|class)\s+(\w+)",
+        "ts":   r"(?:function|class|interface|type)\s+(\w+)",
+        "java": r"(?:class|interface)\s+(\w+)",
+        "kt":   r"(?:fun|class|object|interface)\s+(\w+)",
+        "swift":r"(?:func|class|struct|protocol)\s+(\w+)",
+        "go":   r"(?:func|type)\s+(\w+)",
+        "rs":   r"(?:fn|struct|enum|trait|impl)\s+(\w+)",
+    }
+    pat = patterns.get(language)
+    if not pat:
+        return ""
+    return " ".join(re.findall(pat, text, re.MULTILINE)[:50])
+
+
+def _file_hash(fp: Path) -> str:
+    return hashlib.md5(fp.read_bytes()).hexdigest()
+
+
+def _load_hashes() -> dict:
+    try:
+        if HASH_STORE.exists():
+            return json.loads(HASH_STORE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_hashes(hashes: dict) -> None:
+    try:
+        HASH_STORE.parent.mkdir(parents=True, exist_ok=True)
+        HASH_STORE.write_text(json.dumps(hashes))
+    except Exception as e:
+        logging.warning(f"Could not save hashes: {e}")
+
+
+def _load_json(path: Path) -> dict:
+    try:
+        if path.exists():
+            return json.loads(path.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_json(path: Path, data: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2))
+    except Exception as e:
+        logging.warning(f"Could not save {path.name}: {e}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python3 indexer.py <path-to-codebase>")
+        sys.exit(1)
+
+    for event in index_codebase_stream(sys.argv[1]):
+        t = event["type"]
+        if t == "scan":
+            reused = event.get("unchanged", 0)
+            suffix = f" ({event['new']} new, {reused} reused)" if reused else ""
+            print(f"📂  Found {event['files']} source files{suffix}")
+        elif t == "chunks":
+            print(f"⚙️   {event['total']} chunks to embed")
+        elif t == "embed":
+            print(f"\r   Embedding {event['done']}/{event['total']} ({event['pct']}%)",
+                  end="", flush=True)
+        elif t == "store" and event["done"] == event["total"]:
+            print(f"\n   Stored {event['done']} chunks")
+        elif t == "mapping":
+            print(f"🗺   {event['message']}")
+        elif t == "done":
+            reused = event.get("reused", 0)
+            suffix = f" ({event['new']} new, {reused} reused)" if reused else ""
+            pmap   = event.get("map", {})
+            print(f"✅  Done — {event['indexed']} files{suffix} · {event['chunks']} chunks")
+            if pmap:
+                print(f"    Language: {pmap.get('language')} · Domain: {pmap.get('domain')}")
+                print(f"    Entry: {pmap.get('entry_point')} · Stack: {pmap.get('stack')}")
+        elif t == "error":
+            print(f"❌  {event['message']}")
