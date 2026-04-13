@@ -20,32 +20,45 @@ from pathlib import Path
 # ── Paths ─────────────────────────────────────────────────────────────────────
 APP_DIR   = Path(__file__).parent.resolve()
 DATA_DIR  = Path.home() / "Documents" / "AndesCode"
-MODEL_NAME= "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"
 LOCK_FILE = DATA_DIR / ".running"
 LOG_FILE  = DATA_DIR / "app.log"
 
+# ── HuggingFace model source ──────────────────────────────────────────────────
+MODEL_REPO           = "lmstudio-community/gemma-4-26B-A4B-it-GGUF"
+MODEL_NAME_PREFERRED = "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"
+# Quant preference order — first match found in the repo is used if preferred is missing
+QUANT_PREFERENCE = [
+    "Q4_K_XL", "Q4_K_L", "Q4_K_M", "Q4_K_S", "Q4_K",
+    "Q5_K_M", "Q5_K_S", "Q8_0",
+]
+MODEL_SIZE_GB  = 16.0   # approximate
+
 def _resolve_model_path() -> tuple[Path, Path]:
     """
-    Find the best model directory.
+    Find the best model directory and existing model file.
     Priority:
       1. models/ next to app.py (developer setup, existing installs)
       2. ~/Documents/AndesCode/models/ (app bundle / standard install)
+    Within the directory, looks for any .gguf file if the preferred name
+    is not present — supports previously downloaded files with different names.
     Returns (model_dir, model_path).
     """
-    local = APP_DIR / "models" / MODEL_NAME
-    if local.exists() or (APP_DIR / "models").exists():
-        return APP_DIR / "models", local
-    return DATA_DIR / "models", DATA_DIR / "models" / MODEL_NAME
+    for model_dir in [APP_DIR / "models", DATA_DIR / "models"]:
+        if not model_dir.exists():
+            continue
+        # Exact preferred name first
+        preferred = model_dir / MODEL_NAME_PREFERRED
+        if preferred.exists():
+            return model_dir, preferred
+        # Any .gguf in the directory (previously downloaded with a different name)
+        existing = sorted(model_dir.glob("*.gguf"))
+        if existing:
+            return model_dir, existing[0]
+    # Default: use data dir with preferred name (will be downloaded there)
+    return DATA_DIR / "models", DATA_DIR / "models" / MODEL_NAME_PREFERRED
 
 MODEL_DIR, MODEL_PATH = _resolve_model_path()
-
-# HuggingFace model source
-MODEL_REPO   = "lmstudio-community/gemma-4-26B-A4B-it-GGUF"
-MODEL_HF_URL = (
-    "https://huggingface.co/lmstudio-community/gemma-4-26B-A4B-it-GGUF"
-    "/resolve/main/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"
-)
-MODEL_SIZE_GB  = 16.0   # approximate
+MODEL_NAME = MODEL_PATH.name   # actual filename (may differ from preferred after scan)
 MIN_DISK_GB    = 20.0
 MIN_PYTHON_VER = (3, 10)
 
@@ -495,14 +508,77 @@ def _install_requirements(acceleration: str = "cpu"):
 def _check_model_integrity(path: Path) -> bool:
     """Quick sanity check — just verify file size is reasonable (>10GB)."""
     try:
-        return path.stat().st_size > 10 * 1024**3
-    except Exception:
+        size = path.stat().st_size
+        log.info(f"[integrity] {path.name} — {size / 1024**3:.2f}GB")
+        return size > 10 * 1024**3
+    except Exception as e:
+        log.error(f"[integrity] check failed: {e}")
         return False
 
 
+def _resolve_download_url() -> tuple[str, str]:
+    """
+    Resolve the actual CDN download URL and final filename for the model.
+
+    Strategy:
+      1. List all .gguf files in the repo via huggingface_hub.
+      2. Check if the preferred filename exists — use it if so.
+      3. Otherwise pick the best available quant from QUANT_PREFERENCE.
+      4. Return (url, filename) so the caller can set MODEL_PATH correctly.
+    """
+    from huggingface_hub import list_repo_files, hf_hub_url
+
+    log.info(f"[download] listing files in repo: {MODEL_REPO}")
+    try:
+        all_files = list(list_repo_files(MODEL_REPO))
+        gguf_files = [f for f in all_files if f.endswith(".gguf")]
+        log.info(f"[download] repo contains {len(gguf_files)} .gguf files: {gguf_files}")
+    except Exception as e:
+        log.error(f"[download] could not list repo files: {e}")
+        raise RuntimeError(
+            f"Could not fetch file list from Hugging Face.\n"
+            f"Check your internet connection and try again.\n"
+            f"Repo: https://huggingface.co/{MODEL_REPO}\n"
+            f"Detail: {e}"
+        )
+
+    if not gguf_files:
+        raise RuntimeError(
+            f"No .gguf files found in {MODEL_REPO}.\n"
+            f"The repository may have been moved or renamed.\n"
+            f"Check: https://huggingface.co/{MODEL_REPO}"
+        )
+
+    # Preferred filename exact match
+    if MODEL_NAME_PREFERRED in gguf_files:
+        chosen = MODEL_NAME_PREFERRED
+        log.info(f"[download] preferred filename found: {chosen}")
+    else:
+        log.warning(f"[download] preferred file '{MODEL_NAME_PREFERRED}' not in repo — scanning for best quant")
+        chosen = None
+        for quant in QUANT_PREFERENCE:
+            match = next((f for f in gguf_files if quant.upper() in f.upper()), None)
+            if match:
+                chosen = match
+                log.info(f"[download] selected by quant preference '{quant}': {chosen}")
+                break
+        if not chosen:
+            # Last resort: largest file (most likely the best quality)
+            chosen = gguf_files[0]
+            log.warning(f"[download] no quant preference matched — using first file: {chosen}")
+
+    url = hf_hub_url(repo_id=MODEL_REPO, filename=chosen)
+    log.info(f"[download] resolved URL: {url}")
+    return url, chosen
+
+
 def _download_model():
+    global MODEL_PATH, MODEL_NAME
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     partial = MODEL_PATH.with_suffix(".gguf.partial")
+
+    log.info(f"[download] target path: {MODEL_PATH.name}")
+    log.info(f"[download] model dir: {'app-local' if 'Documents' not in str(MODEL_DIR) else 'data-dir'}")
 
     # Check disk space before starting
     _check_disk_space()
@@ -511,15 +587,19 @@ def _download_model():
     resume_pos = 0
     if partial.exists():
         resume_pos = partial.stat().st_size
+        log.info(f"[download] partial file found — resuming from {resume_pos / 1024**3:.2f}GB")
         set_status("download", "Resuming download...", 20,
                    f"Resuming from {resume_pos / 1024**3:.1f}GB")
+    else:
+        log.info("[download] no partial file — starting fresh download")
 
     headers = {}
     if resume_pos > 0:
         headers["Range"] = f"bytes={resume_pos}-"
 
+    # ── SSL context ───────────────────────────────────────────────────────────
     # macOS Python ships without system SSL certs.
-    # Fix: try certifi first, then run Apple's cert installer, then fallback.
+    # Try certifi first, then Apple cert installer, then fallback to no-verify.
     import ssl as _ssl
     import platform as _platform
     ctx = None
@@ -527,39 +607,82 @@ def _download_model():
     try:
         import certifi
         ctx = _ssl.create_default_context(cafile=certifi.where())
+        log.info("[download] SSL: using certifi cert bundle")
     except ImportError:
-        pass
+        log.warning("[download] SSL: certifi not found")
 
     if ctx is None and _platform.system() == "Darwin":
-        # Try to run Apple's certificate installer silently
         try:
             import glob
-            matches = glob.glob(
-                "/Applications/Python*/Install Certificates.command"
-            )
+            matches = glob.glob("/Applications/Python*/Install Certificates.command")
             if matches:
-                subprocess.run(["bash", matches[0]],
-                               capture_output=True, timeout=30)
+                log.info(f"[download] SSL: running Apple cert installer: {matches[0]}")
+                subprocess.run(["bash", matches[0]], capture_output=True, timeout=30)
                 ctx = _ssl.create_default_context()
-        except Exception:
-            pass
+                log.info("[download] SSL: Apple cert installer succeeded")
+            else:
+                log.warning("[download] SSL: Apple cert installer not found")
+        except Exception as e:
+            log.warning(f"[download] SSL: Apple cert installer failed: {e}")
 
     if ctx is None:
-        # Final fallback — disable verification for HuggingFace download
+        log.warning("[download] SSL: falling back to unverified context (no cert bundle available)")
         ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode    = _ssl.CERT_NONE
 
+    # ── Resolve URL + actual filename ────────────────────────────────────────
+    download_url, resolved_name = _resolve_download_url()
+    if resolved_name != MODEL_PATH.name:
+        log.info(f"[download] filename changed: {MODEL_PATH.name} → {resolved_name}")
+        MODEL_PATH = MODEL_DIR / resolved_name
+        MODEL_NAME = resolved_name
+        set_status("download",
+                   f"Downloading model ({MODEL_SIZE_GB:.0f}GB)...", 20,
+                   f"Using: {resolved_name}")
+
+    # ── Open connection ───────────────────────────────────────────────────────
+    log.info(f"[download] opening connection (resume_pos={resume_pos})")
     try:
-        req = urllib.request.Request(MODEL_HF_URL, headers={
+        req = urllib.request.Request(download_url, headers={
             **headers,
             "User-Agent": "AndesCode/1.0",
         })
         response = urllib.request.urlopen(req, timeout=30, context=ctx)
-    except Exception as e:
+        log.info(f"[download] connection established — HTTP {response.status}")
+    except urllib.error.HTTPError as e:
+        log.error(f"[download] HTTP {e.code} from server — URL may be incorrect or requires auth")
+        log.error(f"[download] failed URL: {download_url}")
+        if e.code == 404:
+            raise RuntimeError(
+                f"Model file not found on Hugging Face (HTTP 404).\n"
+                f"This is unexpected — the file was resolved from the repo listing.\n"
+                f"The CDN URL may have expired. Please try again.\n"
+                f"File: {MODEL_NAME} | Repo: {MODEL_REPO}"
+            )
+        elif e.code == 401 or e.code == 403:
+            raise RuntimeError(
+                f"Access denied (HTTP {e.code}).\n"
+                f"This model may require a Hugging Face account and license agreement.\n"
+                f"Visit https://huggingface.co/{MODEL_REPO} to accept the license,\n"
+                f"then set HF_TOKEN=your_token in .env and restart."
+            )
+        else:
+            raise RuntimeError(
+                f"Download server returned HTTP {e.code}.\n"
+                f"Check your internet connection and try again."
+            )
+    except urllib.error.URLError as e:
+        log.error(f"[download] network error: {e.reason}")
         raise RuntimeError(
-            f"Could not connect to download server.\n"
-            f"Check your internet connection and try again.\n{e}"
+            f"Could not reach the download server.\n"
+            f"Check your internet connection and try again.\n"
+            f"Detail: {e.reason}"
+        )
+    except Exception as e:
+        log.exception(f"[download] unexpected connection error")
+        raise RuntimeError(
+            f"Unexpected error opening download connection.\n{e}"
         )
 
     total_size   = int(response.headers.get("Content-Length", 0)) + resume_pos
@@ -567,6 +690,8 @@ def _download_model():
     chunk_size   = 1024 * 1024   # 1MB chunks
     t_start      = time.time()
     t_last_update= 0
+
+    log.info(f"[download] total size: {total_size / 1024**3:.2f}GB")
 
     try:
         mode = "ab" if resume_pos > 0 else "wb"
@@ -601,22 +726,28 @@ def _download_model():
 
     except Exception as e:
         # Partial file is preserved — next run will resume
+        log.error(f"[download] transfer interrupted at {downloaded / 1024**3:.2f}GB: {e}")
         raise RuntimeError(
             f"Download interrupted: {e}\n"
             f"Progress saved — reopen the app to resume."
         )
 
+    log.info(f"[download] transfer complete — {downloaded / 1024**3:.2f}GB received")
+
     # Rename partial → final
     partial.rename(MODEL_PATH)
+    log.info(f"[download] renamed partial → {MODEL_PATH.name}")
 
     # Integrity check
     if not _check_model_integrity(MODEL_PATH):
         MODEL_PATH.unlink(missing_ok=True)
+        log.error("[download] integrity check failed — file too small, deleting")
         raise RuntimeError(
             "Downloaded file appears corrupted (too small). "
             "Delete the models folder and try again."
         )
 
+    log.info("[download] integrity check passed")
     set_status("download", "Model downloaded", 90)
 
 
@@ -702,6 +833,7 @@ def _run_setup():
     try:
         # Step 1: Python version
         set_status("python", "Checking Python version...", 2)
+        log.info(f"[setup] Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
         _check_python()
         set_status("python", "Python OK", 4)
 
@@ -729,16 +861,22 @@ def _run_setup():
 
         # Step 4: Dependencies (pass acceleration hint for llama-cpp-python)
         set_status("deps", "Checking dependencies...", 11)
+        log.info(f"[setup] installing deps with acceleration={hw['acceleration']}")
         _install_requirements(hw["acceleration"])
 
         # Step 4: Model
+        log.info(f"[setup] model path: {MODEL_PATH.name} | exists: {MODEL_PATH.exists()}")
         if MODEL_PATH.exists() and _check_model_integrity(MODEL_PATH):
-            set_status("model", "Model found", 90,
-                       f"{MODEL_PATH.stat().st_size / 1024**3:.1f}GB")
+            size_gb = MODEL_PATH.stat().st_size / 1024**3
+            log.info(f"[setup] model already cached ({size_gb:.1f}GB) — skipping download")
+            set_status("model", "Model found", 90, f"{size_gb:.1f}GB")
         elif (MODEL_PATH.with_suffix(".gguf.partial")).exists():
+            partial_gb = MODEL_PATH.with_suffix(".gguf.partial").stat().st_size / 1024**3
+            log.info(f"[setup] partial model found ({partial_gb:.1f}GB) — resuming download")
             set_status("download", "Resuming model download...", 20)
             _download_model()
         else:
+            log.info(f"[setup] model not found — starting download from {MODEL_REPO}")
             set_status("download",
                        f"Downloading model ({MODEL_SIZE_GB:.0f}GB)...", 20,
                        "Only needed once — this will take a while")
@@ -770,7 +908,7 @@ def _run_setup():
             _status["port"] = PORT
 
     except Exception as e:
-        log.exception("Setup failed")
+        log.exception(f"[setup] FAILED at step — {e}")
         set_status("error", "Setup failed", None, "", str(e))
         with _status_lock:
             _status["error"] = str(e)
