@@ -25,6 +25,7 @@ from andes_cache.routing import (
 from andes_cache.source_of_truth import (
     config_priority_files,
     expected_authority_candidates,
+    rank_recovery_authoritative_paths,
     summarize_declared_permissions,
     annotate_sources,
     missing_manifest_notice,
@@ -1074,8 +1075,15 @@ def _retrieve_config_first(
             workspace.get("manifests", []),
             workspace.get("config_graph", {}).get("config_files", []),
         )
-        recovery_chunks = _recover_authoritative_files(
+        ranked_paths = rank_recovery_authoritative_paths(
+            intent,
+            query,
+            workspace.get("manifests", []),
+            workspace.get("config_graph", {}).get("config_files", []),
             recovery_candidates,
+        )
+        recovery_chunks = _recover_authoritative_files(
+            ranked_paths,
             intent=intent,
             n_results=n_results,
         )
@@ -1165,7 +1173,7 @@ def _recover_authoritative_files(candidates: list[str], intent: str, n_results: 
     scanned = 0
     max_candidates = min(max(24, n_results * 8), 80)
     for candidate in candidates[:max_candidates]:
-        file_chunks = _fetch_all_from_file(candidate, max_results=60)
+        file_chunks = _fetch_exact_file(candidate, max_results=60)
         if not file_chunks:
             continue
         scanned += 1
@@ -1178,6 +1186,58 @@ def _recover_authoritative_files(candidates: list[str], intent: str, n_results: 
         if scanned >= 8:
             break
     return recovered[:n_results]
+
+
+def _fetch_exact_file(path: str, max_results: int = 60) -> list:
+    """
+    Fetch indexed chunks for an exact relative path with a strict fallback to
+    basename search + exact-path filtering.
+    """
+    count = col.count()
+    if count == 0:
+        return []
+
+    try:
+        exact = col.get(where={"file": path}, limit=max_results)
+        if exact and exact.get("documents"):
+            return [
+                {
+                    "content": doc,
+                    "file": exact["metadatas"][i].get("file", ""),
+                    "language": exact["metadatas"][i].get("language", ""),
+                    "symbols": exact["metadatas"][i].get("symbols", ""),
+                    "score": 0.0,
+                    "_rank": 1.0,
+                    "full_file": True,
+                }
+                for i, doc in enumerate(exact["documents"])
+                if doc and exact["metadatas"][i].get("file", "") == path
+            ]
+    except Exception:
+        pass
+
+    try:
+        fallback = col.get(
+            where={"file": {"$contains": path.split("/")[-1]}},
+            limit=max_results * 3,
+        )
+        if not fallback or not fallback.get("documents"):
+            return []
+        return [
+            {
+                "content": doc,
+                "file": fallback["metadatas"][i].get("file", ""),
+                "language": fallback["metadatas"][i].get("language", ""),
+                "symbols": fallback["metadatas"][i].get("symbols", ""),
+                "score": 0.0,
+                "_rank": 1.0,
+                "full_file": True,
+            }
+            for i, doc in enumerate(fallback["documents"])
+            if doc and fallback["metadatas"][i].get("file", "") == path
+        ][:max_results]
+    except Exception:
+        return []
 
 
 def search_semantic_only(query: str, n_results: int = 5) -> list[dict]:

@@ -11,6 +11,7 @@ from andes_cache.routing import (
 from andes_cache.source_of_truth import (
     config_priority_files,
     expected_authority_candidates,
+    rank_recovery_authoritative_paths,
     summarize_declared_permissions,
     missing_manifest_notice,
     classify_source_type,
@@ -185,6 +186,99 @@ class TestSourceOfTruthBehavior(unittest.TestCase):
         self.assertIn("services/api/pyproject.toml", ordered)
         self.assertIn("frontend/package.json", ordered)
 
+    def test_recovery_ranking_prefers_hinted_module_path(self):
+        manifests = [
+            "services/payments/settings/config.yml",
+            "services/orders/settings/config.yml",
+            "services/payments/package.json",
+        ]
+        ranked = rank_recovery_authoritative_paths(
+            intent="declaration_or_configuration",
+            query="where is payments config declared",
+            manifests=manifests,
+            config_files=[],
+            candidate_hints=expected_authority_candidates(
+                "declaration_or_configuration",
+                "where is payments config declared",
+                manifests,
+                [],
+            ),
+        )
+        self.assertTrue(ranked)
+        self.assertEqual(ranked[0], "services/payments/settings/config.yml")
+
+    def test_recovery_ranking_prefers_exact_authoritative_file_over_generic_config(self):
+        manifests = ["android/app/src/main/AndroidManifest.xml", "android/settings/config.yml"]
+        ranked = rank_recovery_authoritative_paths(
+            intent="declaration_or_configuration",
+            query="what permissions are declared in android/app/src/main/AndroidManifest.xml",
+            manifests=manifests,
+            config_files=[],
+            candidate_hints=expected_authority_candidates(
+                "declaration_or_configuration",
+                "what permissions are declared in android/app/src/main/AndroidManifest.xml",
+                manifests,
+                [],
+            ),
+        )
+        self.assertTrue(ranked)
+        self.assertEqual(ranked[0], "android/app/src/main/AndroidManifest.xml")
+
+    def test_recovery_ranking_excludes_tests_samples_docs(self):
+        manifests = [
+            "docs/config/settings.yml",
+            "examples/service/package.json",
+            "tests/service/pyproject.toml",
+            "services/api/pyproject.toml",
+        ]
+        ranked = rank_recovery_authoritative_paths(
+            intent="dependency_or_build_inventory",
+            query="what dependencies are declared for api",
+            manifests=manifests,
+            config_files=[],
+            candidate_hints=expected_authority_candidates(
+                "dependency_or_build_inventory",
+                "what dependencies are declared for api",
+                manifests,
+                [],
+            ),
+        )
+        self.assertEqual(ranked, ["services/api/pyproject.toml"])
+
+    def test_dependency_recovery_ranking_avoids_unrelated_generic_config(self):
+        manifests = ["services/api/settings/config.yml", "services/api/package.json"]
+        ranked = rank_recovery_authoritative_paths(
+            intent="dependency_or_build_inventory",
+            query="what dependencies are declared for api service",
+            manifests=manifests,
+            config_files=[],
+            candidate_hints=expected_authority_candidates(
+                "dependency_or_build_inventory",
+                "what dependencies are declared for api service",
+                manifests,
+                [],
+            ),
+        )
+        self.assertTrue(ranked)
+        self.assertEqual(ranked[0], "services/api/package.json")
+
+    def test_manifest_query_ranking_does_not_prefer_random_settings(self):
+        manifests = ["mobile/AndroidManifest.xml", "mobile/settings/config.yml"]
+        ranked = rank_recovery_authoritative_paths(
+            intent="declaration_or_configuration",
+            query="list declared permissions in manifest",
+            manifests=manifests,
+            config_files=[],
+            candidate_hints=expected_authority_candidates(
+                "declaration_or_configuration",
+                "list declared permissions in manifest",
+                manifests,
+                [],
+            ),
+        )
+        self.assertTrue(ranked)
+        self.assertEqual(ranked[0], "mobile/AndroidManifest.xml")
+
 
 class TestRouteIsolationAndFastPath(unittest.TestCase):
     def test_retrieval_cache_route_isolation(self):
@@ -244,18 +338,24 @@ class TestRouteIsolationAndFastPath(unittest.TestCase):
     def test_authority_recovery_runs_only_after_empty_pass_one(self):
         src = Path("indexer.py").read_text()
         self.assertIn("if not collected:", src)
+        self.assertIn("ranked_paths = rank_recovery_authoritative_paths(", src)
         self.assertIn("recovery_candidates = expected_authority_candidates(", src)
         self.assertIn("recovery_chunks = _recover_authoritative_files(", src)
 
     def test_authority_recovery_is_filename_path_based_and_route_safe(self):
         src = Path("indexer.py").read_text()
         self.assertIn("def _recover_authoritative_files(", src)
-        self.assertIn("file_chunks = _fetch_all_from_file(candidate, max_results=60)", src)
+        self.assertIn("file_chunks = _fetch_exact_file(candidate, max_results=60)", src)
         start = src.find("def _recover_authoritative_files(")
         end = src.find("\ndef search_semantic_only(", start)
         self.assertGreater(start, -1)
         self.assertGreater(end, start)
         self.assertNotIn("search_semantic_only(query", src[start:end])
+
+    def test_recovery_uses_exact_path_fetch_guard(self):
+        src = Path("indexer.py").read_text()
+        self.assertIn("def _fetch_exact_file(path: str, max_results: int = 60)", src)
+        self.assertIn('exact = col.get(where={"file": path}, limit=max_results)', src)
 
     def test_limitation_message_mentions_indexed_source_of_truth_candidates(self):
         src = Path("indexer.py").read_text()

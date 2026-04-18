@@ -134,6 +134,67 @@ def expected_authority_candidates(intent: str, query: str, manifests: list[str],
     return ordered
 
 
+def rank_recovery_authoritative_paths(
+    intent: str,
+    query: str,
+    manifests: list[str],
+    config_files: list[str],
+    candidate_hints: list[str],
+) -> list[str]:
+    """
+    Rank concrete authoritative paths for recovery with deterministic priority:
+    exact path > basename > suffix/segment > substring.
+    """
+    q = (query or "").lower()
+    path_hints = sorted(set(_query_path_hints(q)))
+    normalized_candidate_hints = sorted({(h or "").lower().strip() for h in candidate_hints if (h or "").strip()})
+    authoritative_paths = [
+        p for p in (manifests + config_files) if p and _is_authoritative_candidate(p)
+    ]
+    if not authoritative_paths:
+        return []
+
+    scored = []
+    for path in sorted(set(authoritative_paths)):
+        p = path.lower()
+        base = p.rsplit("/", 1)[-1]
+        score = 0
+        source_type = classify_source_type(path)
+        candidate_factor = _candidate_match_factor(intent, q, source_type)
+
+        # Candidate hint matching priority.
+        for h in normalized_candidate_hints:
+            if p == h:
+                score += int(120 * candidate_factor)
+            elif base == h:
+                score += int(100 * candidate_factor)
+            elif p.endswith(f"/{h}") or f"/{h}/" in p:
+                score += int(70 * candidate_factor)
+            elif h in p:
+                score += int(20 * candidate_factor)
+
+        # Query/module path overlap (prefer hinted modules/services/subtrees).
+        for hint in path_hints:
+            if p == hint:
+                score += 110
+            elif base == hint:
+                score += 90
+            elif p.endswith(f"/{hint}") or f"/{hint}/" in p:
+                score += 55
+            elif hint in p:
+                score += 15
+
+        # Intent relevance weighting.
+        score += _intent_source_priority(intent, q, source_type, base)
+
+        # Prefer shallower paths if relevance ties.
+        depth_penalty = p.count("/")
+        scored.append((score, -depth_penalty, path))
+
+    scored.sort(reverse=True)
+    return [path for score, _, path in scored if score > 0]
+
+
 def summarize_declared_permissions(chunks: list[dict]) -> list[str]:
     perms = set()
     for c in chunks:
@@ -204,8 +265,9 @@ def _is_authoritative_candidate(path: str) -> bool:
     if not p:
         return False
     non_authoritative = (
-        "test/", "/test", "tests/", "/tests", "spec/", "specs/", "fixture", "fixtures",
-        "example", "examples", "sample", "samples", "mock", "/docs/",
+        "test/", "/test", "tests/", "/tests", "__tests__", "spec/", "specs/",
+        "fixture", "fixtures", "testdata", "example", "examples", "sample", "samples",
+        "mock", "mocks", "/docs/", "/doc/", "docs/", "doc/",
         ".env.example", ".env.sample",
     )
     return not any(tok in p for tok in non_authoritative)
@@ -231,3 +293,53 @@ def _rank_by_query_hints(paths: list[str], hints: list[str]) -> list[str]:
         return (hint_hits, -depth)
 
     return sorted(paths, key=score, reverse=True)
+
+
+def _intent_source_priority(intent: str, query: str, source_type: str, basename: str) -> int:
+    asks_dependency = any(k in query for k in ("dependenc", "library", "package", "build", "module"))
+    if intent == "dependency_or_build_inventory":
+        if source_type == "dependency_file":
+            return 70
+        if source_type == "build_file":
+            return 60
+        if source_type == "manifest":
+            return 20
+        return 0
+
+    asks_manifest = any(k in query for k in ("permission", "permissions", "manifest"))
+    asks_config = any(k in query for k in ("config", "configured", "settings", "env", "environment"))
+    if asks_manifest:
+        if source_type == "manifest":
+            return 80
+        if source_type in {"build_file", "dependency_file"}:
+            return 10
+        return 0
+    if asks_config:
+        if source_type == "config_file":
+            return 90
+        if source_type == "manifest":
+            return 35
+        if source_type in {"build_file", "dependency_file"}:
+            return 8 if not asks_dependency else 25
+        return 0
+    if basename in {"dockerfile", "docker-compose.yml"}:
+        return 25
+    if source_type in {"manifest", "config_file"}:
+        return 40
+    if source_type in {"build_file", "dependency_file"}:
+        return 35
+    return 0
+
+
+def _candidate_match_factor(intent: str, query: str, source_type: str) -> float:
+    asks_manifest = any(k in query for k in ("permission", "permissions", "manifest"))
+    asks_config = any(k in query for k in ("config", "configured", "settings", "env", "environment"))
+    asks_dependency = any(k in query for k in ("dependenc", "library", "package", "build", "module"))
+
+    if intent == "dependency_or_build_inventory":
+        return 1.0 if source_type in {"dependency_file", "build_file"} else 0.25
+    if asks_manifest:
+        return 1.0 if source_type == "manifest" else 0.2
+    if asks_config and not asks_dependency:
+        return 1.0 if source_type in {"config_file", "manifest"} else 0.2
+    return 1.0
