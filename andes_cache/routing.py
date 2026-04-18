@@ -21,6 +21,12 @@ def classify_query_intent_details(query: str) -> dict:
     q = (query or "").strip().lower()
     words = set(re.findall(r"\w+", q))
 
+    # Intent semantics:
+    # - "declared/configured" dependencies => dependency_or_build_inventory
+    # - "used at runtime / referenced in code" dependencies => runtime_usage_or_reference
+    # - "where is X configured" => declaration_or_configuration
+    # - "where is X defined" => symbol_lookup
+    # - "where is X used" => runtime_usage_or_reference
     patch_score = _score(
         q, words, {"fix", "patch", "edit", "change", "refactor", "bug", "implement"}
     )
@@ -74,9 +80,30 @@ def classify_query_intent_details(query: str) -> dict:
         words,
         {"architecture", "overview", "flow", "pipeline", "entry", "startup", "module"},
     )
+    explicit_runtime_request = bool(
+        re.search(
+            r"\b(used at runtime|needed at runtime|required at runtime|runtime usage|referenced in code|checked in code|where is .* used)\b",
+            q,
+        )
+    )
+    dependency_question = bool(re.search(r"\b(dependency|dependencies|library|libraries|package|packages)\b", q))
+    configured_question = bool(re.search(r"\b(configured|configuration|settings?|manifest|where is .* configured)\b", q))
 
     if patch_score > 0:
         intent = CODE_FIX_OR_PATCH
+    elif re.search(r"\b(where is .*defined|definition of)\b", q):
+        intent = SYMBOL_LOOKUP
+    elif re.search(r"\b(where is .*configured)\b", q):
+        intent = DECLARATION_OR_CONFIGURATION
+    elif re.search(r"\b(where is .*used)\b", q):
+        intent = RUNTIME_USAGE_OR_REFERENCE
+    elif dependency_question and explicit_runtime_request:
+        intent = RUNTIME_USAGE_OR_REFERENCE
+    elif re.search(r"\b(dependencies?|libraries?)\b.*\b(declared|configured)\b", q):
+        intent = DEPENDENCY_OR_BUILD_INVENTORY
+    elif re.search(r"\b(libraries?)\b.*\bused\b", q):
+        # "libraries are used" is intentionally treated as runtime/reference usage.
+        intent = RUNTIME_USAGE_OR_REFERENCE
     elif dep_score > 0 and dep_score >= decl_score:
         intent = DEPENDENCY_OR_BUILD_INVENTORY
     elif runtime_score > 0 and runtime_score > decl_score:
@@ -105,11 +132,17 @@ def classify_query_intent_details(query: str) -> dict:
         ambiguous = True
 
     retrieval_route = retrieval_route_for_intent(intent)
+    strict_authority_mode = intent in {
+        DECLARATION_OR_CONFIGURATION,
+        DEPENDENCY_OR_BUILD_INVENTORY,
+    }
     return {
         "intent": intent,
         "retrieval_route": retrieval_route,
         "ambiguous": ambiguous,
-        "allow_runtime_fallback": runtime_score > 0,
+        "allow_runtime_fallback": explicit_runtime_request,
+        "strict_authority_mode": strict_authority_mode,
+        "configured_question": configured_question,
     }
 
 

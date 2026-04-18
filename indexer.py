@@ -342,6 +342,7 @@ def search(query: str, n_results: int = 5) -> list[dict]:
             n_results=n_results,
             ambiguous=decision.get("ambiguous", False),
             allow_runtime_fallback=decision.get("allow_runtime_fallback", False),
+            strict_authority_mode=decision.get("strict_authority_mode", True),
         )
         if repo_fp and final:
             CACHE.retrieval_set(
@@ -1035,6 +1036,7 @@ def _retrieve_config_first(
     n_results: int = 5,
     ambiguous: bool = False,
     allow_runtime_fallback: bool = False,
+    strict_authority_mode: bool = True,
 ) -> list[dict]:
     """
     Deterministic source-of-truth retrieval path for config/declaration/dependency
@@ -1092,7 +1094,7 @@ def _retrieve_config_first(
                 "full_file": True,
                 "coverage": {"returned": 1, "total": 1, "partial": False},
             })
-            if allow_runtime_fallback and wants_runtime_usage(query):
+            if (not strict_authority_mode) and allow_runtime_fallback and wants_runtime_usage(query):
                 fallback = search_semantic_only(query, n_results=max(1, n_results - 1))
                 annotate_sources(fallback, source_type="source_code", authority_level="referenced")
                 return [explicit] + fallback
@@ -1119,7 +1121,12 @@ def _retrieve_config_first(
         "source_type": "inferred",
         "authority_level": "inferred",
     }
-    if not found_authoritative and allow_runtime_fallback and wants_runtime_usage(query):
+    if (
+        not strict_authority_mode
+        and not found_authoritative
+        and allow_runtime_fallback
+        and wants_runtime_usage(query)
+    ):
         fallback = search_semantic_only(query, n_results=max(1, n_results - 1))
         annotate_sources(fallback, source_type="source_code", authority_level="referenced")
         return [limitation] + fallback

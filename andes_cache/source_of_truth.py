@@ -91,7 +91,12 @@ def authority_level_for_source(intent: str, source_type: str) -> str:
 
 def wants_runtime_usage(query: str) -> bool:
     q = (query or "").lower()
-    return any(x in q for x in ("used", "usage", "called", "checked", "referenced", "runtime"))
+    return bool(
+        re.search(
+            r"\b(used at runtime|needed at runtime|required at runtime|runtime usage|referenced in code|checked in code|where is .* used)\b",
+            q,
+        )
+    )
 
 
 def missing_manifest_notice() -> dict:

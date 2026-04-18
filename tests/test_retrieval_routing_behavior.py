@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 from andes_cache.routing import (
     classify_query_intent,
@@ -13,6 +14,7 @@ from andes_cache.source_of_truth import (
     missing_manifest_notice,
     classify_source_type,
     authority_level_for_source,
+    wants_runtime_usage,
 )
 from andes_cache.manager import AndesCacheManager
 
@@ -27,8 +29,28 @@ class TestIntentClassification(unittest.TestCase):
     def test_dependency_query_routes_to_config(self):
         q = "what libraries/dependencies are used"
         intent = classify_query_intent(q)
-        self.assertEqual(intent, "dependency_or_build_inventory")
-        self.assertEqual(retrieval_route_for_intent(intent), "source_of_truth")
+        self.assertEqual(intent, "runtime_usage_or_reference")
+        self.assertEqual(retrieval_route_for_intent(intent), "runtime_usage")
+
+    def test_dependencies_declared_routes_to_source_of_truth(self):
+        d = classify_query_intent_details("what dependencies are declared")
+        self.assertEqual(d["intent"], "dependency_or_build_inventory")
+        self.assertEqual(d["retrieval_route"], "source_of_truth")
+
+    def test_dependencies_configured_routes_to_source_of_truth(self):
+        d = classify_query_intent_details("what dependencies are configured")
+        self.assertEqual(d["intent"], "dependency_or_build_inventory")
+        self.assertEqual(d["retrieval_route"], "source_of_truth")
+
+    def test_dependencies_used_at_runtime_routes_to_runtime(self):
+        d = classify_query_intent_details("what dependencies are used at runtime")
+        self.assertEqual(d["intent"], "runtime_usage_or_reference")
+        self.assertEqual(d["retrieval_route"], "runtime_usage")
+
+    def test_where_configured_routes_to_declaration(self):
+        d = classify_query_intent_details("where is auth configured")
+        self.assertEqual(d["intent"], "declaration_or_configuration")
+        self.assertEqual(d["retrieval_route"], "source_of_truth")
 
     def test_runtime_usage_query_routes_to_runtime(self):
         q = "where is auth token used"
@@ -38,15 +60,19 @@ class TestIntentClassification(unittest.TestCase):
 
     def test_ambiguous_dependency_query_marks_ambiguity(self):
         d = classify_query_intent_details("what dependencies are needed at runtime")
-        self.assertEqual(d["intent"], "dependency_or_build_inventory")
-        self.assertEqual(d["retrieval_route"], "source_of_truth")
-        self.assertTrue(d["ambiguous"])
+        self.assertEqual(d["intent"], "runtime_usage_or_reference")
+        self.assertEqual(d["retrieval_route"], "runtime_usage")
 
     def test_ambiguous_defined_query_prefers_symbol_lookup(self):
         d = classify_query_intent_details("where is auth defined")
         self.assertEqual(d["intent"], "symbol_lookup")
         self.assertEqual(d["retrieval_route"], "symbol_lookup")
         self.assertFalse(d["ambiguous"])
+
+    def test_libraries_used_is_intentionally_runtime(self):
+        d = classify_query_intent_details("what libraries are used")
+        self.assertEqual(d["intent"], "runtime_usage_or_reference")
+        self.assertEqual(d["retrieval_route"], "runtime_usage")
 
 
 class TestSourceOfTruthBehavior(unittest.TestCase):
@@ -67,6 +93,12 @@ class TestSourceOfTruthBehavior(unittest.TestCase):
         self.assertIn("no androidmanifest.xml", msg)
         self.assertIn("cannot be confirmed", msg)
         self.assertIn("inferences", msg)
+
+    def test_runtime_fallback_requires_explicit_runtime_wording(self):
+        self.assertFalse(wants_runtime_usage("what config does this service use"))
+        self.assertFalse(wants_runtime_usage("what dependencies are declared"))
+        self.assertTrue(wants_runtime_usage("what dependencies are used at runtime"))
+        self.assertTrue(wants_runtime_usage("where is auth used"))
 
     def test_dependency_files_are_prioritized(self):
         manifests = ["package.json", "app/build.gradle", "requirements.txt", "Dockerfile"]
@@ -168,6 +200,20 @@ class TestRouteIsolationAndFastPath(unittest.TestCase):
     def test_semantic_cache_blocked_for_declaration_route(self):
         self.assertFalse(semantic_cache_allowed("declaration_or_configuration", "source_of_truth"))
         self.assertTrue(semantic_cache_allowed("generic_semantic", "semantic"))
+
+    def test_route_before_cache_order_in_search_source(self):
+        src = Path("indexer.py").read_text()
+        classify_pos = src.find("decision = classify_query_intent_details(query)")
+        route_pos = src.find('retrieval_route = decision["retrieval_route"]')
+        cache_pos = src.find("CACHE.retrieval_get(")
+        self.assertGreater(classify_pos, -1)
+        self.assertGreater(route_pos, classify_pos)
+        self.assertGreater(cache_pos, route_pos)
+
+    def test_strict_authority_mode_prevents_runtime_append_for_decl_intents(self):
+        src = Path("indexer.py").read_text()
+        self.assertIn("strict_authority_mode=decision.get(\"strict_authority_mode\", True)", src)
+        self.assertIn("if (not strict_authority_mode) and allow_runtime_fallback and wants_runtime_usage(query):", src)
 
 
 if __name__ == "__main__":
