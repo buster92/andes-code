@@ -17,6 +17,14 @@ from typing import Generator
 import chromadb
 from sentence_transformers import SentenceTransformer
 
+from andes_cache import AndesCacheManager, RepoFingerprinter
+from andes_cache.versions import (
+    INDEX_VERSION,
+    PARSER_VERSION,
+    PROMPT_TEMPLATE_VERSION,
+    RETRIEVAL_POLICY_VERSION,
+)
+
 # ── Config ────────────────────────────────────────────────────────────────────
 EMBED_MODEL   = "all-MiniLM-L6-v2"
 CHROMA_PATH   = str(Path(__file__).parent / "index")
@@ -25,6 +33,9 @@ HASH_STORE    = Path(__file__).parent / "index" / ".file_hashes.json"
 PROJECT_MAP   = Path(__file__).parent / "index" / "project_map.json"
 SYMBOL_INDEX  = Path(__file__).parent / "index" / "symbol_index.json"
 WORKSPACE_INDEX = Path(__file__).parent / "index" / "workspace_index.json"
+CACHE_DIR = Path(__file__).parent / "index" / "cache"
+CACHE = AndesCacheManager(CACHE_DIR)
+CURRENT_REPO_FINGERPRINT = ""
 EMBED_BATCH   = 64
 CHROMA_BATCH  = 4096
 CHUNK_LINES   = 80
@@ -96,6 +107,7 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
     Index a codebase with incremental support. Yields SSE progress events.
     On completion builds project map + symbol index for smart retrieval.
     """
+    global col
     root_path = Path(root).resolve()
 
     if not root_path.exists():
@@ -103,15 +115,15 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
         return
 
     # ── Hash cache / project change detection ─────────────────────────────────
-    hashes          = _load_hashes()
+    hashes = _load_hashes()
     is_same_project = hashes.get("__root__") == str(root_path)
+    previous_repo_fp = hashes.get("__fingerprint__", "")
 
     if not is_same_project:
         try:
             chroma.delete_collection(COLLECTION)
         except Exception:
             pass
-        global col
         col    = chroma.get_or_create_collection(COLLECTION)
         hashes = {"__root__": str(root_path)}
         # Clear old maps
@@ -120,12 +132,15 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
                 f.unlink()
             except Exception:
                 pass
+        if previous_repo_fp:
+            CACHE.invalidate_repo(previous_repo_fp, include_workspace=True)
 
     yield {"type": "clear"}
 
     # ── Collect and diff ──────────────────────────────────────────────────────
     all_files = _collect_files(root_path)
     new_files, unchanged = [], []
+    changed_rel_paths = []
 
     for fp in all_files:
         key   = str(fp.relative_to(root_path))
@@ -134,6 +149,43 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
             unchanged.append(fp)
         else:
             new_files.append((fp, fhash))
+            changed_rel_paths.append(key)
+
+    known_files = {k for k in hashes.keys() if not k.startswith("__")}
+    current_files = {str(fp.relative_to(root_path)) for fp in all_files}
+    removed_paths = sorted(known_files - current_files)
+
+    # File deletions can leave stale vector records. Force a safe full rebuild.
+    if removed_paths:
+        try:
+            chroma.delete_collection(COLLECTION)
+        except Exception:
+            pass
+        col = chroma.get_or_create_collection(COLLECTION)
+        new_files = [(fp, _file_hash(fp)) for fp in all_files]
+        changed_rel_paths = [str(fp.relative_to(root_path)) for fp, _ in new_files] + removed_paths
+        unchanged = []
+
+    # Recompute repo fingerprint from the current filesystem snapshot.
+    next_hashes = {"__root__": str(root_path)}
+    new_rel_set = {str(p.relative_to(root_path)) for p, _ in new_files}
+    for fp in all_files:
+        rel = str(fp.relative_to(root_path))
+        if rel in new_rel_set:
+            continue
+        next_hashes[rel] = hashes.get(rel, _file_hash(fp))
+    for fp, fhash in new_files:
+        next_hashes[str(fp.relative_to(root_path))] = fhash
+
+    repo_fp = RepoFingerprinter.build(
+        root_path,
+        next_hashes,
+        index_version=INDEX_VERSION,
+        parser_version=PARSER_VERSION,
+        prompt_template_version=PROMPT_TEMPLATE_VERSION,
+        retrieval_policy_version=RETRIEVAL_POLICY_VERSION,
+    )
+    _set_repo_fingerprint(repo_fp)
 
     yield {
         "type": "scan", "files": len(all_files),
@@ -147,11 +199,13 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
     if not new_files and unchanged:
         # Nothing changed — still emit map event so UI can display it
         pmap = _load_project_map()
+        CACHE.flush_metrics()
         yield {
             "type": "done", "indexed": len(unchanged),
             "chunks": col.count(), "project": root_path.name,
             "new": 0, "reused": len(unchanged),
             "map": pmap,
+            "repo_fingerprint": repo_fp,
         }
         return
 
@@ -198,22 +252,35 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
         yield {"type": "store", "done": stored, "total": total_chunks,
                "pct": int(stored / total_chunks * 100)}
 
-    # ── Save hashes ───────────────────────────────────────────────────────────
+    # ── Save hashes and invalidate dependent cache layers ────────────────────
+    if previous_repo_fp and previous_repo_fp != repo_fp:
+        CACHE.invalidate_repo(previous_repo_fp, include_workspace=False)
+
     for fp, fhash in new_files:
         hashes[str(fp.relative_to(root_path))] = fhash
+    hashes["__root__"] = str(root_path)
+    hashes["__fingerprint__"] = repo_fp
     _save_hashes(hashes)
 
     # ── Build project intelligence ────────────────────────────────────────────
     yield {"type": "mapping", "message": "Building project map..."}
 
     all_indexed = [fp for fp, _ in new_files] + unchanged
-    workspace = build_workspace_index(root_path, all_indexed, all_chunks)
+    workspace = build_workspace_index(
+        root_path,
+        all_indexed,
+        all_chunks,
+        repo_fingerprint=repo_fp,
+        changed_paths=changed_rel_paths,
+    )
     pmap      = build_project_map(root_path, all_indexed, all_chunks, workspace)
     symidx    = build_symbol_index(all_chunks)
 
     _save_json(PROJECT_MAP, pmap)
     _save_json(SYMBOL_INDEX, symidx)
     _save_json(WORKSPACE_INDEX, workspace)
+    CACHE.workspace_set(repo_fp, "symbol_index", symidx)
+    CACHE.flush_metrics()
 
     yield {
         "type":    "done",
@@ -223,6 +290,7 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
         "new":     len(new_files),
         "reused":  len(unchanged),
         "map":     pmap,
+        "repo_fingerprint": repo_fp,
     }
 
 
@@ -239,6 +307,11 @@ def search(query: str, n_results: int = 5) -> list[dict]:
     count = col.count()
     if count == 0:
         return []
+    repo_fp = get_repo_fingerprint()
+    if repo_fp:
+        cached = CACHE.retrieval_get(repo_fp=repo_fp, query=query, index_version=INDEX_VERSION)
+        if cached:
+            return cached[:n_results]
 
     # ── Route 1: Filename detected ────────────────────────────────────────────
     file_match = re.search(
@@ -249,12 +322,18 @@ def search(query: str, n_results: int = 5) -> list[dict]:
         fname   = file_match.group(0).lower()
         results = _fetch_all_from_file(fname, n_results)
         if results:
-            return _add_coverage(results)
+            final = _add_coverage(results)
+            if repo_fp:
+                CACHE.retrieval_set(repo_fp=repo_fp, query=query, index_version=INDEX_VERSION, value=final)
+            return final
 
     # ── Route 1b: Structured workspace questions ─────────────────────────────
     structured = _structured_query_results(query)
     if structured:
-        return structured[:n_results]
+        final = structured[:n_results]
+        if repo_fp:
+            CACHE.retrieval_set(repo_fp=repo_fp, query=query, index_version=INDEX_VERSION, value=final)
+        return final
 
     # ── Route 2: Symbol name lookup ───────────────────────────────────────────
     symidx = _load_json(SYMBOL_INDEX)
@@ -303,7 +382,10 @@ def search(query: str, n_results: int = 5) -> list[dict]:
     ranked = _rerank(query, candidates)
 
     # Add coverage metadata — lets server tell model how much of each file it has
-    return _add_coverage(ranked[:n_results])
+    final = _add_coverage(ranked[:n_results])
+    if repo_fp:
+        CACHE.retrieval_set(repo_fp=repo_fp, query=query, index_version=INDEX_VERSION, value=final)
+    return final
 
 
 def get_chunks_for_file(filename: str) -> list[dict]:
@@ -467,14 +549,56 @@ def build_project_map(root_path: Path, files: list, chunks: list, workspace: dic
     }
 
 
-def build_workspace_index(root_path: Path, files: list, chunks: list) -> dict:
-    """Build structure-first workspace intelligence for dependency/config analysis."""
-    modules = _discover_modules(root_path, files)
-    manifests = _discover_manifests(root_path)
-    dependencies = _collect_declared_dependencies(root_path, manifests)
-    import_graph = _build_import_graph(files, root_path)
-    config_graph = _build_config_graph(root_path, manifests)
-    entry_points = _discover_entry_points(root_path, files)
+def build_workspace_index(
+    root_path: Path,
+    files: list,
+    chunks: list,
+    repo_fingerprint: str = "",
+    changed_paths: list[str] | None = None,
+) -> dict:
+    """
+    Build structure-first workspace intelligence for dependency/config analysis.
+
+    Workspace artifacts are cached independently so unchanged artifacts are reused.
+    """
+    changed_paths = changed_paths or []
+    repo_fp = repo_fingerprint or get_repo_fingerprint()
+
+    cached_manifests = CACHE.workspace_get(repo_fp, "manifests")
+    manifests = cached_manifests if cached_manifests is not None else _discover_manifests(root_path)
+    CACHE.workspace_set(repo_fp, "manifests", manifests)
+
+    cached_modules = CACHE.workspace_get(repo_fp, "module_graph")
+    modules = cached_modules if cached_modules is not None else _discover_modules(root_path, files)
+    CACHE.workspace_set(repo_fp, "module_graph", modules)
+
+    has_manifest_change = any(Path(p).name in MANIFEST_FILES for p in changed_paths)
+    has_code_change = any(Path(p).suffix in SUPPORTED_EXTENSIONS for p in changed_paths)
+
+    dependencies = CACHE.workspace_get(repo_fp, "dependency_inventory")
+    if dependencies is None or has_manifest_change:
+        dependencies = _collect_declared_dependencies(root_path, manifests)
+        CACHE.workspace_set(repo_fp, "dependency_inventory", dependencies)
+
+    import_graph = CACHE.workspace_get(repo_fp, "import_graph")
+    if import_graph is None or has_code_change:
+        import_graph = _build_import_graph(files, root_path)
+        CACHE.workspace_set(repo_fp, "import_graph", import_graph)
+
+    config_graph = CACHE.workspace_get(repo_fp, "config_graph")
+    if config_graph is None or has_manifest_change:
+        config_graph = _build_config_graph(root_path, manifests)
+        CACHE.workspace_set(repo_fp, "config_graph", config_graph)
+
+    entry_points = CACHE.workspace_get(repo_fp, "entry_points")
+    if entry_points is None or has_code_change:
+        entry_points = _discover_entry_points(root_path, files)
+        CACHE.workspace_set(repo_fp, "entry_points", entry_points)
+
+    file_to_module = CACHE.workspace_get(repo_fp, "file_to_module_map")
+    if file_to_module is None or has_code_change:
+        file_to_module = _build_file_to_module_map(root_path, files)
+        CACHE.workspace_set(repo_fp, "file_to_module_map", file_to_module)
 
     return {
         "project": root_path.name,
@@ -486,6 +610,7 @@ def build_workspace_index(root_path: Path, files: list, chunks: list) -> dict:
         "dependencies": dependencies,
         "import_graph": import_graph,
         "config_graph": config_graph,
+        "file_to_module_map": file_to_module,
     }
 
 
@@ -1053,6 +1178,29 @@ def _extract_symbols(text: str, language: str) -> str:
     if not pat:
         return ""
     return " ".join(re.findall(pat, text, re.MULTILINE)[:50])
+
+
+def _set_repo_fingerprint(fingerprint: str) -> None:
+    global CURRENT_REPO_FINGERPRINT
+    CURRENT_REPO_FINGERPRINT = fingerprint or ""
+
+
+def get_repo_fingerprint() -> str:
+    if CURRENT_REPO_FINGERPRINT:
+        return CURRENT_REPO_FINGERPRINT
+    hashes = _load_hashes()
+    return hashes.get("__fingerprint__", "")
+
+
+def _build_file_to_module_map(root_path: Path, files: list[Path]) -> dict:
+    mapping = {}
+    for fp in files:
+        rel = str(fp.relative_to(root_path))
+        if len(fp.relative_to(root_path).parts) == 1:
+            mapping[rel] = "root"
+        else:
+            mapping[rel] = fp.relative_to(root_path).parts[0]
+    return mapping
 
 
 def _file_hash(fp: Path) -> str:

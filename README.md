@@ -44,6 +44,7 @@ AndesCode is built for developers who work with client code under NDA, operate i
 - 🔍 **Codebase-aware** — indexes your project, builds a project map, injects relevant context automatically
 - 🗺️ **Project intelligence** — detects language, stack, entry points, domain, and key symbols on indexing
 - 🔎 **Smart retrieval** — two-step planning (model selects relevant files first), query routing by filename/symbol/intent, and 4-axis re-ranking
+- 🧱 **Multi-layer caching** — repo-fingerprint-scoped workspace/retrieval/neighborhood/prompt-prefix/patch-plan caches with strict invalidation
 - ⚠️ **Coverage warnings** — the model is told when it has a partial view of a file, so it never pretends to have context it doesn't
 - 🔒 **Local inference** — offline flags enforced at OS level before any library loads; your code never leaves the machine
 - ⚡ **Fast** — KV cache warm-up on startup, 30–40 tokens/second on Apple Silicon, streaming responses
@@ -100,8 +101,13 @@ Index your project
 Files are chunked with language-aware boundary detection
 Embeddings stored in ChromaDB (local)
 Project map built: language, stack, domain, entry points, symbol index
+Workspace intelligence cached to disk (schema-versioned, artifact-level reuse)
         ↓
 You ask a question in the AndesCode window
+        ↓
+Diagnosis + patch-plan stages run before final generation
+Safe descriptive queries can reuse scoped semantic cache
+Prompt built from deterministic sections for prefix/KV reuse
         ↓
 Step 1 — Planning: model scans your project map and identifies
          the most relevant files for your question
@@ -249,6 +255,9 @@ Check that indexing completed — you should see `✅ Done — X files`. For lar
 
 **How do I re-index after changing files?**  
 Run `python3 indexer.py /path/to/your/project` again. MD5 hashing ensures only changed files are re-processed — unchanged files are reused from the existing index instantly.
+
+**How do I inspect cache behavior?**  
+See `docs/cache-debugging.md` for cache layout, metrics, and invalidation troubleshooting. You can run `python benchmark_cache.py` for cold vs warm cache instrumentation.
 
 **Is there a hosted version?**  
 No. That would defeat the purpose.

@@ -24,6 +24,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from llama_cpp import Llama, LlamaCache
+from andes_cache import build_prompt_sections, serialize_prompt_sections
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_DIR       = Path(__file__).parent
@@ -311,8 +312,13 @@ def _build_context(messages: list, request_id: str) -> list:
       3. Retrieved code chunks with coverage metadata
     """
     if not INDEXER_READY:
-        system = _BASE_SYSTEM
-        return [{"role": "system", "content": system}] + [
+        sections = build_prompt_sections(
+            system_prefix=_BASE_SYSTEM,
+            workspace_prefix="",
+            retrieval_context="",
+            user_turn="",
+        )
+        return [{"role": "system", "content": serialize_prompt_sections(sections)}] + [
             m for m in messages if m.get("role") != "system"
         ]
 
@@ -325,23 +331,40 @@ def _build_context(messages: list, request_id: str) -> list:
     try:
         # ── Project map ───────────────────────────────────────────────────────
         pmap        = _indexer_module._load_project_map() if _indexer_module else {}
+        ws          = _indexer_module._load_workspace_index() if _indexer_module else {}
+        repo_fp     = _indexer_module.get_repo_fingerprint() if _indexer_module else ""
+        cache       = getattr(_indexer_module, "CACHE", None) if _indexer_module else None
         map_section = ""
         if pmap:
             from indexer import format_project_map_for_prompt
-            map_section = "\n\n" + format_project_map_for_prompt(pmap)
+            map_section = format_project_map_for_prompt(pmap)
+        workspace_signature = cache.workspace_signature(ws) if cache and ws else ""
 
         # ── Code retrieval ────────────────────────────────────────────────────
         chunks = search_codebase(query, n_results=CONTEXT_CHUNKS)
 
         if not chunks:
-            system = _BASE_SYSTEM + map_section
+            sections = build_prompt_sections(
+                system_prefix=_BASE_SYSTEM,
+                workspace_prefix=map_section,
+                retrieval_context="",
+                user_turn="",
+            )
+            if cache and repo_fp and workspace_signature:
+                prefix = cache.prompt_prefix_get(repo_fp=repo_fp, workspace_signature=workspace_signature)
+                if not prefix:
+                    prefix = serialize_prompt_sections(sections)
+                    cache.prompt_prefix_set(repo_fp=repo_fp, workspace_signature=workspace_signature, value=prefix)
+                system = prefix
+            else:
+                system = serialize_prompt_sections(sections)
             audit.info(f"CONTEXT {request_id} | chunks=0 | no relevant code found")
             return [{"role": "system", "content": system}] + [
                 m for m in messages if m.get("role") != "system"
             ]
 
         # ── Format code section with coverage warnings ────────────────────────
-        code_section = "\n\n## Retrieved Code\n\n"
+        code_section = "## Retrieved Code\n\n"
         files_used   = []
         ctx_char_budget = 18000
         ctx_chars_used  = 0
@@ -370,7 +393,20 @@ def _build_context(messages: list, request_id: str) -> list:
         if full_files:
             code_section += f"\n_Full file retrieved: {', '.join(set(full_files))}_\n"
 
-        system = _BASE_SYSTEM + map_section + code_section
+        sections = build_prompt_sections(
+            system_prefix=_BASE_SYSTEM,
+            workspace_prefix=map_section,
+            retrieval_context=code_section,
+            user_turn="",
+        )
+        if cache and repo_fp and workspace_signature and not code_section.strip():
+            prefix = cache.prompt_prefix_get(repo_fp=repo_fp, workspace_signature=workspace_signature)
+            if not prefix:
+                prefix = serialize_prompt_sections(sections)
+                cache.prompt_prefix_set(repo_fp=repo_fp, workspace_signature=workspace_signature, value=prefix)
+            system = prefix
+        else:
+            system = serialize_prompt_sections(sections)
 
         audit.info(
             f"CONTEXT {request_id} | chunks={len(chunks)} | "
@@ -439,12 +475,53 @@ def _plan_files(query: str, pmap: dict) -> list[str]:
                 found.append(line.split()[0])
         return found[:4]
     except Exception as e:
-        audit.warning(f"PLAN_FAIL {request_id} | {_safe(e)}")
+        audit.warning(f"PLAN_FAIL | {_safe(e)}")
         return []
 
 
+def _diagnose_query(query: str) -> dict:
+    """Deterministic diagnosis stage before planning/generation."""
+    q = (query or "").lower()
+    safe_semantic = bool(re.search(r"\b(explain|overview|architecture|what is|how does|where is)\b", q))
+    patch_intent = bool(re.search(r"\b(fix|patch|change|implement|refactor|bug)\b", q))
+    mode = "architecture" if safe_semantic else "bugfix"
+    return {
+        "mode": mode,
+        "safe_semantic": safe_semantic and not patch_intent,
+        "patch_intent": patch_intent,
+    }
+
+
+def _file_neighborhood(anchor_file: str, mode: str, workspace: dict, repo_fp: str) -> list[str]:
+    cache = getattr(_indexer_module, "CACHE", None)
+    if cache and repo_fp:
+        cached = cache.neighborhood_get(repo_fp=repo_fp, mode=mode, anchor_file=anchor_file)
+        if cached:
+            return cached
+
+    neighborhood = [anchor_file]
+    imports = workspace.get("import_graph", {})
+    file_to_module = workspace.get("file_to_module_map", {})
+    target_module = file_to_module.get(anchor_file)
+    for source, deps in imports.items():
+        if anchor_file in deps and source not in neighborhood:
+            neighborhood.append(source)
+    neighborhood.extend([d for d in imports.get(anchor_file, []) if d not in neighborhood])
+    if target_module:
+        for f, module in file_to_module.items():
+            if module == target_module and f not in neighborhood:
+                neighborhood.append(f)
+    stem = Path(anchor_file).stem
+    likely_tests = [f for f in file_to_module if stem in f and "test" in f.lower()]
+    neighborhood.extend([f for f in likely_tests if f not in neighborhood])
+    final = neighborhood[:8]
+    if cache and repo_fp:
+        cache.neighborhood_set(repo_fp=repo_fp, mode=mode, anchor_file=anchor_file, value=final)
+    return final
+
+
 def _build_context_from_plan(
-    messages: list, planned_files: list, request_id: str
+    messages: list, planned_files: list, request_id: str, diagnosis: dict | None = None
 ) -> tuple[list, list[str]]:
     """
     Step 2: Fetch all chunks from planned files + semantic search fallback.
@@ -458,16 +535,22 @@ def _build_context_from_plan(
     )
 
     pmap        = _indexer_module._load_project_map() if _indexer_module else {}
+    workspace   = _indexer_module._load_workspace_index() if _indexer_module else {}
     map_section = ""
     if pmap:
         from indexer import format_project_map_for_prompt
-        map_section = "\n\n" + format_project_map_for_prompt(pmap)
+        map_section = format_project_map_for_prompt(pmap)
+    repo_fp = _indexer_module.get_repo_fingerprint() if _indexer_module else ""
+    mode = (diagnosis or {}).get("mode", "bugfix")
 
     all_chunks  = []
     files_loaded = []
 
-    # Fetch full content from each planned file
+    # Fetch full content from planned files + deterministic neighborhood expansion.
+    expanded_files = []
     for fname in planned_files:
+        expanded_files.extend(_file_neighborhood(fname, mode, workspace, repo_fp))
+    for fname in expanded_files:
         try:
             file_chunks = _indexer_module.get_chunks_for_file(fname)
             if file_chunks:
@@ -491,7 +574,7 @@ def _build_context_from_plan(
         return messages, []
 
     # Build code section — cap total tokens (rough: 4 chars per token, stay under 2500 tokens)
-    code_section = "\n\n## Retrieved Code\n\n"
+    code_section = "## Retrieved Code\n\n"
     char_budget  = 18000   # ~4500 tokens of code context — safe within 8192 ctx
     chars_used   = 0
 
@@ -507,7 +590,13 @@ def _build_context_from_plan(
         code_section += chunk_text
         chars_used   += len(chunk_text)
 
-    system = _BASE_SYSTEM + map_section + code_section
+    sections = build_prompt_sections(
+        system_prefix=_BASE_SYSTEM,
+        workspace_prefix=map_section,
+        retrieval_context=code_section,
+        user_turn="",
+    )
+    system = serialize_prompt_sections(sections)
 
     audit.info(
         f"CONTEXT {request_id} | planned={planned_files} | "
@@ -525,127 +614,148 @@ def _build_context_from_plan(
 # ── Streaming ─────────────────────────────────────────────────────────────────
 
 async def _stream(messages: list, max_tokens: int, request_id: str, t_start: float):
-    think_open  = "<|channel>"
+    think_open = "<|channel>"
     think_close = "<channel|>"
-
-    # ── Step 1: Planning ──────────────────────────────────────────────────────
     yield _make_chunk("⚙️ _Analyzing request..._", request_id)
 
-    query = next(
-        (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
-    )
+    query = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
     pmap = _indexer_module._load_project_map() if _indexer_module else {}
-
+    diagnosis = _diagnose_query(query)
+    repo_fp = _indexer_module.get_repo_fingerprint() if _indexer_module else ""
+    cache = getattr(_indexer_module, "CACHE", None) if _indexer_module else None
+    retrieval_signature = f"{query}:{CONTEXT_CHUNKS}"
     planned_files = []
-    if INDEXER_READY and pmap and query:
-        import asyncio
-        loop          = asyncio.get_event_loop()
-        planned_files = await loop.run_in_executor(
-            None, lambda: _plan_files(query, pmap)
-        )
+    cached_semantic = False
+    final_text = ""
 
-    # ── Step 2: Fetch files ───────────────────────────────────────────────────
-    if planned_files:
-        short_names  = [f.split("/")[-1] for f in planned_files]
-        files_label  = ", ".join(short_names)
+    if cache and repo_fp and diagnosis.get("safe_semantic") and not diagnosis.get("patch_intent"):
+        semantic_hit = cache.semantic_get(
+            repo_fp=repo_fp,
+            query=query,
+            retrieval_signature=retrieval_signature,
+            safe_class="descriptive",
+        )
+        if semantic_hit:
+            cached_semantic = True
+            yield _make_chunk("\n🧩 _Semantic cache hit (safe descriptive answer)_\n\n", request_id)
+            final_text = semantic_hit
+            yield _make_chunk(final_text, request_id)
+
+    if not cached_semantic:
+        if INDEXER_READY and pmap and query:
+            import asyncio
+
+            loop = asyncio.get_event_loop()
+            if cache and repo_fp:
+                plan_cached = cache.patch_plan_get(repo_fp=repo_fp, query=query, target_signature="preplan")
+                if plan_cached:
+                    planned_files = plan_cached.get("planned_files", [])
+                    diagnosis = plan_cached.get("diagnosis", diagnosis)
+            if not planned_files:
+                planned_files = await loop.run_in_executor(None, lambda: _plan_files(query, pmap))
+                if cache and repo_fp:
+                    cache.patch_plan_set(
+                        repo_fp=repo_fp,
+                        query=query,
+                        target_signature="preplan",
+                        value={"diagnosis": diagnosis, "planned_files": planned_files},
+                    )
+
+        if planned_files:
+            short_names = [f.split("/")[-1] for f in planned_files]
+            yield _make_chunk(f"\n📂 _Reading: {', '.join(short_names)}_", request_id)
+            messages, _ = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: _build_context_from_plan(messages, planned_files, request_id, diagnosis)
+            )
+        else:
+            yield _make_chunk("\n📂 _Searching codebase..._", request_id)
+            messages = _build_context(messages, request_id)
+
+        t_context = time.perf_counter()
+        ctx_s = t_context - t_start
+        prompt = _messages_to_prompt(messages)
+        yield _make_chunk(f"\n🧠 _Thinking... (ready in {ctx_s:.1f}s)_\n\n", request_id)
+
+        buffer = ""
+        in_think = False
+        t_think_start = None
+        t_think_total = 0.0
+        t_first_token = None
+        token_count = 0
+        cleared = False
+
+        try:
+            for chunk in llm(prompt, max_tokens=max_tokens, stream=True, echo=False):
+                token = chunk["choices"][0]["text"]
+                buffer += token
+                if not in_think and think_open in buffer:
+                    before = buffer[:buffer.find(think_open)]
+                    buffer = buffer[buffer.find(think_open):]
+                    in_think = True
+                    t_think_start = time.perf_counter()
+                    if before.strip():
+                        if not cleared:
+                            yield _make_chunk("\n\n---\n\n", request_id)
+                            cleared = True
+                        if t_first_token is None:
+                            t_first_token = time.perf_counter()
+                        token_count += 1
+                        final_text += before
+                        yield _make_chunk(before, request_id)
+                    continue
+                if in_think:
+                    if think_close in buffer:
+                        after = buffer[buffer.find(think_close) + len(think_close):]
+                        buffer = after
+                        in_think = False
+                        t_think_total += time.perf_counter() - t_think_start
+                    continue
+                if len(buffer) > len(think_open) + 4:
+                    emit = _strip_thinking(buffer[:-len(think_open)])
+                    buffer = buffer[-len(think_open):]
+                    if emit:
+                        if not cleared:
+                            yield _make_chunk("\n\n---\n\n", request_id)
+                            cleared = True
+                        if t_first_token is None:
+                            t_first_token = time.perf_counter()
+                        token_count += 1
+                        final_text += emit
+                        yield _make_chunk(emit, request_id)
+        except Exception as e:
+            audit.warning(f"STREAM_FAIL {request_id} | {_safe(e)}")
+            yield _make_chunk(f"\n\n❌ Generation error: {e}", request_id)
+
+        if buffer and not in_think:
+            remainder = _strip_thinking(buffer)
+            if remainder:
+                if not cleared:
+                    yield _make_chunk("\n\n---\n\n", request_id)
+                final_text += remainder
+                yield _make_chunk(remainder, request_id)
+
+        t_done = time.perf_counter()
+        total_s = t_done - t_start
+        think_s = t_think_total
+        ttft_s = (t_first_token - t_start) if t_first_token else 0.0
         yield _make_chunk(
-            f"\n📂 _Reading: {files_label}_",
+            f"\n\n---\n⏱ context `{ctx_s:.1f}s` · think `{think_s:.1f}s` · first token `{ttft_s:.1f}s` · total `{total_s:.1f}s`",
             request_id,
         )
-        messages, files_loaded = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: _build_context_from_plan(messages, planned_files, request_id)
+        audit.info(
+            f"STREAM_DONE {request_id} | context={ctx_s:.1f}s | think={think_s:.1f}s | ttft={ttft_s:.1f}s | total={total_s:.1f}s | chunks={token_count}"
         )
-    else:
-        # Fallback to semantic search only
-        yield _make_chunk("\n📂 _Searching codebase..._", request_id)
-        messages = _build_context(messages, request_id)
 
-    t_context = time.perf_counter()
-    ctx_s     = t_context - t_start
-    prompt    = _messages_to_prompt(messages)
-
-    yield _make_chunk(f"\n🧠 _Thinking... (ready in {ctx_s:.1f}s)_\n\n", request_id)
-
-    buffer        = ""
-    in_think      = False
-    t_think_start = None
-    t_think_total = 0.0
-    t_first_token = None
-    token_count   = 0
-    cleared       = False
-
-    try:
-        for chunk in llm(prompt, max_tokens=max_tokens, stream=True, echo=False):
-            token  = chunk["choices"][0]["text"]
-            buffer += token
-
-            if not in_think and think_open in buffer:
-                before        = buffer[:buffer.find(think_open)]
-                buffer        = buffer[buffer.find(think_open):]
-                in_think      = True
-                t_think_start = time.perf_counter()
-                if before.strip():
-                    if not cleared:
-                        yield _make_chunk("\n\n---\n\n", request_id)
-                        cleared = True
-                    if t_first_token is None:
-                        t_first_token = time.perf_counter()
-                    token_count += 1
-                    yield _make_chunk(before, request_id)
-                continue
-
-            if in_think:
-                if think_close in buffer:
-                    after         = buffer[buffer.find(think_close) + len(think_close):]
-                    buffer        = after
-                    in_think      = False
-                    t_think_total += time.perf_counter() - t_think_start
-                continue
-
-            if len(buffer) > len(think_open) + 4:
-                emit   = buffer[:-len(think_open)]
-                buffer = buffer[-len(think_open):]
-                emit   = _strip_thinking(emit)
-                if emit:
-                    if not cleared:
-                        yield _make_chunk("\n\n---\n\n", request_id)
-                        cleared = True
-                    if t_first_token is None:
-                        t_first_token = time.perf_counter()
-                    token_count += 1
-                    yield _make_chunk(emit, request_id)
-
-    except Exception as e:
-        audit.warning(f"STREAM_FAIL {request_id} | {_safe(e)}")
-        yield _make_chunk(f"\n\n❌ Generation error: {e}", request_id)
-
-    if buffer and not in_think:
-        remainder = _strip_thinking(buffer)
-        if remainder:
-            if not cleared:
-                yield _make_chunk("\n\n---\n\n", request_id)
-            if t_first_token is None:
-                t_first_token = time.perf_counter()
-            token_count += 1
-            yield _make_chunk(remainder, request_id)
-
-    t_done  = time.perf_counter()
-    total_s = t_done - t_start
-    think_s = t_think_total
-    ttft_s  = (t_first_token - t_start) if t_first_token else 0.0
-
-    yield _make_chunk(
-        f"\n\n---\n"
-        f"⏱ context `{ctx_s:.1f}s` · think `{think_s:.1f}s` · "
-        f"first token `{ttft_s:.1f}s` · total `{total_s:.1f}s`",
-        request_id,
-    )
+    if cache and repo_fp and diagnosis.get("safe_semantic") and not diagnosis.get("patch_intent") and final_text.strip():
+        cache.semantic_set(
+            repo_fp=repo_fp,
+            query=query,
+            retrieval_signature=retrieval_signature,
+            safe_class="descriptive",
+            value=final_text.strip(),
+        )
+        cache.flush_metrics()
     yield "data: [DONE]\n\n"
-
-    audit.info(
-        f"STREAM_DONE {request_id} | context={ctx_s:.1f}s | think={think_s:.1f}s | "
-        f"ttft={ttft_s:.1f}s | total={total_s:.1f}s | chunks={token_count}"
-    )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
