@@ -24,6 +24,7 @@ from andes_cache.routing import (
 )
 from andes_cache.source_of_truth import (
     config_priority_files,
+    expected_authority_candidates,
     summarize_declared_permissions,
     annotate_sources,
     missing_manifest_notice,
@@ -1064,6 +1065,24 @@ def _retrieve_config_first(
         if len(collected) >= n_results:
             break
 
+    recovery_ran = False
+    if not collected:
+        recovery_ran = True
+        recovery_candidates = expected_authority_candidates(
+            intent,
+            query,
+            workspace.get("manifests", []),
+            workspace.get("config_graph", {}).get("config_files", []),
+        )
+        recovery_chunks = _recover_authoritative_files(
+            recovery_candidates,
+            intent=intent,
+            n_results=n_results,
+        )
+        if recovery_chunks:
+            collected.extend(recovery_chunks)
+            found_authoritative = True
+
     q = query.lower()
     asks_permissions = any(k in q for k in ("permission", "permissions", "declared", "manifest"))
     if asks_permissions:
@@ -1106,8 +1125,8 @@ def _retrieve_config_first(
     limitation = {
         "content": (
             "# Source-of-Truth Limitation\n"
-            "- No authoritative declaration/configuration files were retrieved.\n"
-            "- Declared/configured facts cannot be confirmed from source-of-truth artifacts.\n"
+            "- AndesCode could not find the required authoritative file in indexed source-of-truth candidates.\n"
+            "- Declared/configured facts cannot be confirmed from authoritative artifacts.\n"
             "- Ask for runtime usage/references explicitly to include inferred code behavior.\n"
             + ("- Query intent appears ambiguous; clarify whether you want declarations or runtime usage.\n" if ambiguous else "")
         ),
@@ -1124,6 +1143,7 @@ def _retrieve_config_first(
     if (
         not strict_authority_mode
         and not found_authoritative
+        and recovery_ran
         and allow_runtime_fallback
         and wants_runtime_usage(query)
     ):
@@ -1131,6 +1151,33 @@ def _retrieve_config_first(
         annotate_sources(fallback, source_type="source_code", authority_level="referenced")
         return [limitation] + fallback
     return [limitation]
+
+
+def _recover_authoritative_files(candidates: list[str], intent: str, n_results: int) -> list[dict]:
+    """
+    Strict authority recovery pass using deterministic filename/path matching only.
+    Never falls back to semantic/runtime source code retrieval.
+    """
+    if not candidates:
+        return []
+
+    recovered = []
+    scanned = 0
+    max_candidates = min(max(24, n_results * 8), 80)
+    for candidate in candidates[:max_candidates]:
+        file_chunks = _fetch_all_from_file(candidate, max_results=60)
+        if not file_chunks:
+            continue
+        scanned += 1
+        source_type = classify_source_type(candidate)
+        authority = authority_level_for_source(intent, source_type)
+        annotate_sources(file_chunks, source_type=source_type, authority_level=authority)
+        recovered.extend(file_chunks[:8])
+        if len(recovered) >= n_results:
+            break
+        if scanned >= 8:
+            break
+    return recovered[:n_results]
 
 
 def search_semantic_only(query: str, n_results: int = 5) -> list[dict]:

@@ -4,6 +4,31 @@ from __future__ import annotations
 
 import re
 
+AUTHORITATIVE_NAME_HINTS = [
+    "androidmanifest.xml",
+    "manifest",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts",
+    "package.json",
+    "pyproject.toml",
+    "requirements.txt",
+    "cargo.toml",
+    "go.mod",
+    "pom.xml",
+    "dockerfile",
+    "docker-compose.yml",
+    "package.swift",
+    "pipfile",
+    "poetry.lock",
+    ".env",
+    "config",
+    "settings",
+    "entitlements",
+    ".plist",
+]
+
 
 def config_priority_files(intent: str, query: str, manifests: list[str], config_files: list[str]) -> list[str]:
     q = (query or "").lower()
@@ -46,6 +71,66 @@ def config_priority_files(intent: str, query: str, manifests: list[str], config_
         if p and p not in seen:
             seen.add(p)
             ordered.append(p)
+    return ordered
+
+
+def expected_authority_candidates(intent: str, query: str, manifests: list[str], config_files: list[str]) -> list[str]:
+    """
+    Deterministic expansion for strict-authority recovery when primary retrieval
+    does not find authoritative files.
+    """
+    q = (query or "").lower()
+    authoritative_paths = [
+        p for p in (manifests + config_files) if p and _is_authoritative_candidate(p)
+    ]
+    candidates: list[str] = []
+
+    # Start from the normal deterministic ranking.
+    candidates.extend(config_priority_files(intent, query, manifests, config_files))
+
+    # Intent-focused, cross-ecosystem authoritative expansions.
+    intent_hints: list[str] = []
+    if intent == "dependency_or_build_inventory":
+        intent_hints.extend([
+            "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
+            "package.json", "pyproject.toml", "requirements.txt", "cargo.toml", "go.mod",
+            "pom.xml", "dockerfile", "docker-compose.yml", "package.swift", "pipfile", "poetry.lock",
+        ])
+    else:
+        intent_hints.extend([
+            "androidmanifest.xml", "manifest", "config", "settings", ".env", ".plist", "entitlements",
+            "docker-compose.yml", "dockerfile",
+        ])
+
+    # Query-focused expansions.
+    if any(k in q for k in ("permission", "permissions", "declared", "manifest")):
+        intent_hints.extend(["androidmanifest.xml", "manifest"])
+    if any(k in q for k in ("dependenc", "library", "package", "build", "module")):
+        intent_hints.extend([
+            "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
+            "package.json", "pyproject.toml", "requirements.txt", "cargo.toml", "go.mod", "pom.xml",
+        ])
+    if any(k in q for k in ("config", "configured", "setting", "environment", "env", "entitlement", "plist")):
+        intent_hints.extend(["config", "settings", ".env", ".plist", "entitlements"])
+
+    path_hints = sorted(set(_query_path_hints(q)))
+    for hint in path_hints:
+        if "." in hint or "/" in hint or "-" in hint:
+            intent_hints.append(hint)
+
+    for hint in AUTHORITATIVE_NAME_HINTS + intent_hints:
+        hint_l = hint.lower()
+        matched = [p for p in authoritative_paths if hint_l in p.lower()]
+        candidates.extend(_rank_by_query_hints(matched, path_hints))
+        if "/" not in hint and "." in hint:
+            candidates.append(hint)
+
+    seen = set()
+    ordered = []
+    for c in candidates:
+        if c and c not in seen:
+            seen.add(c)
+            ordered.append(c)
     return ordered
 
 

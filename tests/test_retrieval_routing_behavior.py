@@ -10,6 +10,7 @@ from andes_cache.routing import (
 )
 from andes_cache.source_of_truth import (
     config_priority_files,
+    expected_authority_candidates,
     summarize_declared_permissions,
     missing_manifest_notice,
     classify_source_type,
@@ -161,6 +162,29 @@ class TestSourceOfTruthBehavior(unittest.TestCase):
             "referenced",
         )
 
+    def test_expected_authority_candidates_expand_manifest_recovery(self):
+        manifests = ["mobile/app/src/main/AndroidManifest.xml", "service/package.json"]
+        ordered = expected_authority_candidates(
+            intent="declaration_or_configuration",
+            query="what permissions are declared in the manifest",
+            manifests=manifests,
+            config_files=[],
+        )
+        self.assertIn("mobile/app/src/main/AndroidManifest.xml", ordered)
+        self.assertIn("AndroidManifest.xml", ordered)
+
+    def test_expected_authority_candidates_expand_non_android_dependency_files(self):
+        manifests = ["services/api/pyproject.toml", "services/worker/requirements.txt", "frontend/package.json"]
+        ordered = expected_authority_candidates(
+            intent="dependency_or_build_inventory",
+            query="what dependencies are declared for worker",
+            manifests=manifests,
+            config_files=[],
+        )
+        self.assertIn("services/worker/requirements.txt", ordered)
+        self.assertIn("services/api/pyproject.toml", ordered)
+        self.assertIn("frontend/package.json", ordered)
+
 
 class TestRouteIsolationAndFastPath(unittest.TestCase):
     def test_retrieval_cache_route_isolation(self):
@@ -216,6 +240,29 @@ class TestRouteIsolationAndFastPath(unittest.TestCase):
         src = Path("indexer.py").read_text()
         self.assertIn("strict_authority_mode=decision.get(\"strict_authority_mode\", True)", src)
         self.assertIn("if (not strict_authority_mode) and allow_runtime_fallback and wants_runtime_usage(query):", src)
+
+    def test_authority_recovery_runs_only_after_empty_pass_one(self):
+        src = Path("indexer.py").read_text()
+        self.assertIn("if not collected:", src)
+        self.assertIn("recovery_candidates = expected_authority_candidates(", src)
+        self.assertIn("recovery_chunks = _recover_authoritative_files(", src)
+
+    def test_authority_recovery_is_filename_path_based_and_route_safe(self):
+        src = Path("indexer.py").read_text()
+        self.assertIn("def _recover_authoritative_files(", src)
+        self.assertIn("file_chunks = _fetch_all_from_file(candidate, max_results=60)", src)
+        start = src.find("def _recover_authoritative_files(")
+        end = src.find("\ndef search_semantic_only(", start)
+        self.assertGreater(start, -1)
+        self.assertGreater(end, start)
+        self.assertNotIn("search_semantic_only(query", src[start:end])
+
+    def test_limitation_message_mentions_indexed_source_of_truth_candidates(self):
+        src = Path("indexer.py").read_text()
+        self.assertIn(
+            "AndesCode could not find the required authoritative file in indexed source-of-truth candidates.",
+            src,
+        )
 
 
 if __name__ == "__main__":
