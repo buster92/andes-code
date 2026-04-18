@@ -324,6 +324,21 @@ class TestIndexer(unittest.TestCase):
         (Path(self.tmpdir) / "README.md").write_text(
             "# Test project\nThis is a test."
         )
+        (Path(self.tmpdir) / "requirements.txt").write_text(
+            "fastapi==0.111.0\npydantic>=2.0\n"
+        )
+        (Path(self.tmpdir) / "package.json").write_text(
+            json.dumps({
+                "name": "tmp-test",
+                "dependencies": {"react": "^18.2.0", "axios": "^1.7.0"},
+                "devDependencies": {"typescript": "^5.0.0"},
+            })
+        )
+        (Path(self.tmpdir) / "api.py").write_text(
+            "from fastapi import FastAPI\n"
+            "from auth import login\n"
+            "app = FastAPI()\n"
+        )
 
     def tearDown(self):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
@@ -382,6 +397,29 @@ class TestIndexer(unittest.TestCase):
         self.assertIn("indexed", r)
         self.assertGreater(r["indexed"], 0)
         print(f"  ✅ API index: {r}")
+
+    def test_project_map_contains_workspace_summary(self):
+        """Project map should include workspace/manifests/package manager info."""
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from indexer import index_codebase
+        result = index_codebase(self.tmpdir)
+        pmap = result.get("map", {})
+        ws = pmap.get("workspace", {})
+        self.assertGreater(len(ws.get("manifests", [])), 0)
+        self.assertGreater(len(ws.get("package_managers", [])), 0)
+        self.assertGreater(len(ws.get("repo_types", [])), 0)
+        print(f"  ✅ workspace summary: {ws}")
+
+    def test_workspace_dependency_query_is_structure_first(self):
+        """Dependency questions should return structured workspace facts."""
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from indexer import index_codebase, search
+        index_codebase(self.tmpdir)
+        results = search("What libraries and dependencies does this repo use?", n_results=2)
+        self.assertGreater(len(results), 0)
+        self.assertTrue(any(r["file"] == "__workspace_index__" for r in results))
+        self.assertTrue(any("Declared Dependencies" in r["content"] for r in results))
+        print("  ✅ dependency query routed to workspace index")
 
 
 class TestPerformance(unittest.TestCase):
