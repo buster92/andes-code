@@ -18,6 +18,17 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 
 from andes_cache import AndesCacheManager, RepoFingerprinter
+from andes_cache.routing import (
+    classify_query_intent,
+    retrieval_route_for_intent,
+    DEPENDENCY_INVENTORY,
+)
+from andes_cache.source_of_truth import (
+    config_priority_files,
+    summarize_declared_permissions,
+    annotate_sources,
+    missing_manifest_notice,
+)
 from andes_cache.versions import (
     INDEX_VERSION,
     PARSER_VERSION,
@@ -307,11 +318,32 @@ def search(query: str, n_results: int = 5) -> list[dict]:
     count = col.count()
     if count == 0:
         return []
+    intent = classify_query_intent(query)
+    retrieval_route = retrieval_route_for_intent(intent)
     repo_fp = get_repo_fingerprint()
     if repo_fp:
-        cached = CACHE.retrieval_get(repo_fp=repo_fp, query=query, index_version=INDEX_VERSION)
+        cached = CACHE.retrieval_get(
+            repo_fp=repo_fp,
+            query=query,
+            index_version=INDEX_VERSION,
+            intent=intent,
+            retrieval_route=retrieval_route,
+        )
         if cached:
             return cached[:n_results]
+
+    if retrieval_route == "config_first":
+        final = _retrieve_config_first(query, intent, n_results=n_results)
+        if repo_fp and final:
+            CACHE.retrieval_set(
+                repo_fp=repo_fp,
+                query=query,
+                index_version=INDEX_VERSION,
+                value=final,
+                intent=intent,
+                retrieval_route=retrieval_route,
+            )
+        return final
 
     # ── Route 1: Filename detected ────────────────────────────────────────────
     file_match = re.search(
@@ -323,8 +355,16 @@ def search(query: str, n_results: int = 5) -> list[dict]:
         results = _fetch_all_from_file(fname, n_results)
         if results:
             final = _add_coverage(results)
+            final = annotate_sources(final, source_type="source_code", authority_level="referenced")
             if repo_fp:
-                CACHE.retrieval_set(repo_fp=repo_fp, query=query, index_version=INDEX_VERSION, value=final)
+                CACHE.retrieval_set(
+                    repo_fp=repo_fp,
+                    query=query,
+                    index_version=INDEX_VERSION,
+                    value=final,
+                    intent=intent,
+                    retrieval_route=retrieval_route,
+                )
             return final
 
     # ── Route 1b: Structured workspace questions ─────────────────────────────
@@ -332,7 +372,14 @@ def search(query: str, n_results: int = 5) -> list[dict]:
     if structured:
         final = structured[:n_results]
         if repo_fp:
-            CACHE.retrieval_set(repo_fp=repo_fp, query=query, index_version=INDEX_VERSION, value=final)
+            CACHE.retrieval_set(
+                repo_fp=repo_fp,
+                query=query,
+                index_version=INDEX_VERSION,
+                value=final,
+                intent=intent,
+                retrieval_route=retrieval_route,
+            )
         return final
 
     # ── Route 2: Symbol name lookup ───────────────────────────────────────────
@@ -383,8 +430,16 @@ def search(query: str, n_results: int = 5) -> list[dict]:
 
     # Add coverage metadata — lets server tell model how much of each file it has
     final = _add_coverage(ranked[:n_results])
+    final = annotate_sources(final, source_type="source_code", authority_level="referenced")
     if repo_fp:
-        CACHE.retrieval_set(repo_fp=repo_fp, query=query, index_version=INDEX_VERSION, value=final)
+        CACHE.retrieval_set(
+            repo_fp=repo_fp,
+            query=query,
+            index_version=INDEX_VERSION,
+            value=final,
+            intent=intent,
+            retrieval_route=retrieval_route,
+        )
     return final
 
 
@@ -962,6 +1017,99 @@ def _build_config_graph(root_path: Path, manifests: list[str]) -> dict:
         "capabilities": sorted(capabilities),
         "config_files": config_files,
     }
+
+
+def _retrieve_config_first(query: str, intent: str, n_results: int = 5) -> list[dict]:
+    """
+    Deterministic source-of-truth retrieval path for config/declaration/dependency
+    questions. Pull config/manifests first, then fallback to inferred source code.
+    """
+    workspace = _load_workspace_index()
+    priority_files = config_priority_files(
+        intent,
+        query,
+        workspace.get("manifests", []),
+        workspace.get("config_graph", {}).get("config_files", []),
+    )
+
+    collected = []
+    for fname in priority_files:
+        file_chunks = _fetch_all_from_file(fname, max_results=40)
+        if not file_chunks:
+            continue
+        source_type = "manifest" if fname.endswith("AndroidManifest.xml") else "build_file"
+        if any(token in fname for token in (".env", "config", "settings", "docker-compose")):
+            source_type = "config_file"
+        annotate_sources(file_chunks, source_type=source_type, authority_level="declared")
+        collected.extend(file_chunks[:6])
+        if len(collected) >= n_results:
+            break
+
+    q = query.lower()
+    asks_permissions = any(k in q for k in ("permission", "permissions", "declared", "manifest"))
+    if asks_permissions:
+        permissions = summarize_declared_permissions(collected)
+        if permissions:
+            summary = {
+                "content": "# Manifest Declarations\n"
+                + "\n".join([f"- declared permission: {p}" for p in permissions]),
+                "file": "AndroidManifest.xml",
+                "language": "xml",
+                "symbols": "",
+                "score": 0.0,
+                "_rank": 1.0,
+                "full_file": True,
+                "coverage": {"returned": 1, "total": 1, "partial": False},
+                "source_type": "manifest",
+                "authority_level": "declared",
+            }
+            return [summary] + collected[: max(0, n_results - 1)]
+
+        # Explicit missing-manifest declaration path
+        if not any(c.get("file", "").endswith("AndroidManifest.xml") for c in collected):
+            explicit = missing_manifest_notice()
+            explicit.update({
+                "symbols": "",
+                "score": 0.0,
+                "_rank": 1.0,
+                "full_file": True,
+                "coverage": {"returned": 1, "total": 1, "partial": False},
+            })
+            fallback = search_semantic_only(query, n_results=max(1, n_results - 1))
+            annotate_sources(fallback, source_type="source_code", authority_level="referenced")
+            return [explicit] + fallback
+
+    if collected:
+        return collected[:n_results]
+
+    # Fallback only after source-of-truth path fails.
+    fallback = search_semantic_only(query, n_results=n_results)
+    annotate_sources(fallback, source_type="inferred", authority_level="inferred")
+    return fallback
+
+
+def search_semantic_only(query: str, n_results: int = 5) -> list[dict]:
+    """Semantic retrieval path without config-first routing."""
+    count = col.count()
+    if count == 0:
+        return []
+
+    embedding = embedder.encode(query).tolist()
+    fetch = min(n_results * 6, count)
+    results = col.query(query_embeddings=[embedding], n_results=fetch)
+
+    candidates = [
+        {
+            "content": doc,
+            "file": results["metadatas"][0][i].get("file", ""),
+            "language": results["metadatas"][0][i].get("language", ""),
+            "symbols": results["metadatas"][0][i].get("symbols", ""),
+            "score": results["distances"][0][i],
+        }
+        for i, doc in enumerate(results["documents"][0])
+    ]
+    ranked = _rerank(query, candidates)
+    return _add_coverage(ranked[:n_results])
 
 def _fetch_all_from_file(filename: str, max_results: int = 20) -> list:
     """Retrieve all indexed chunks for a given filename."""

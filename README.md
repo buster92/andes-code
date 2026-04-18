@@ -45,6 +45,7 @@ AndesCode is built for developers who work with client code under NDA, operate i
 - 🗺️ **Project intelligence** — detects language, stack, entry points, domain, and key symbols on indexing
 - 🔎 **Smart retrieval** — two-step planning (model selects relevant files first), query routing by filename/symbol/intent, and 4-axis re-ranking
 - 🧱 **Multi-layer caching** — repo-fingerprint-scoped workspace/retrieval/neighborhood/prompt-prefix/patch-plan caches with strict invalidation
+- 📌 **Deterministic routing for repo questions** — config/dependency/manifest questions use a source-of-truth config-first path before inferred code usage
 - ⚠️ **Coverage warnings** — the model is told when it has a partial view of a file, so it never pretends to have context it doesn't
 - 🔒 **Local inference** — offline flags enforced at OS level before any library loads; your code never leaves the machine
 - ⚡ **Fast** — KV cache warm-up on startup, 30–40 tokens/second on Apple Silicon, streaming responses
@@ -108,6 +109,7 @@ You ask a question in the AndesCode window
 Diagnosis + patch-plan stages run before final generation
 Safe descriptive queries can reuse scoped semantic cache
 Prompt built from deterministic sections for prefix/KV reuse
+Config/dependency questions take a fast path (skip patch-planning flow)
         ↓
 Step 1 — Planning: model scans your project map and identifies
          the most relevant files for your question

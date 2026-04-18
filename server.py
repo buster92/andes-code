@@ -25,6 +25,13 @@ from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from llama_cpp import Llama, LlamaCache
 from andes_cache import build_prompt_sections, serialize_prompt_sections
+from andes_cache.routing import (
+    classify_query_intent,
+    retrieval_route_for_intent,
+    is_fast_path_intent,
+    semantic_cache_allowed,
+    orchestration_plan,
+)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_DIR       = Path(__file__).parent
@@ -365,6 +372,7 @@ def _build_context(messages: list, request_id: str) -> list:
 
         # ── Format code section with coverage warnings ────────────────────────
         code_section = "## Retrieved Code\n\n"
+        source_instruction = ""
         files_used   = []
         ctx_char_budget = 18000
         ctx_chars_used  = 0
@@ -387,6 +395,13 @@ def _build_context(messages: list, request_id: str) -> list:
                 break
             code_section  += chunk_txt
             ctx_chars_used += len(chunk_txt)
+            if c.get("source_type") in {"manifest", "build_file", "config_file"}:
+                source_instruction = (
+                    "## Source-of-Truth Guidance\n"
+                    "- Prefer declared/config/build sources before code references.\n"
+                    "- Distinguish declared vs referenced vs inferred facts.\n"
+                    "- If source-of-truth files are missing, state that explicitly.\n\n"
+                )
 
         # Full-file indicator
         full_files = [c["file"] for c in chunks if c.get("full_file")]
@@ -396,7 +411,7 @@ def _build_context(messages: list, request_id: str) -> list:
         sections = build_prompt_sections(
             system_prefix=_BASE_SYSTEM,
             workspace_prefix=map_section,
-            retrieval_context=code_section,
+            retrieval_context=source_instruction + code_section,
             user_turn="",
         )
         if cache and repo_fp and workspace_signature and not code_section.strip():
@@ -479,15 +494,13 @@ def _plan_files(query: str, pmap: dict) -> list[str]:
         return []
 
 
-def _diagnose_query(query: str) -> dict:
+def _diagnose_query(query: str, intent: str) -> dict:
     """Deterministic diagnosis stage before planning/generation."""
-    q = (query or "").lower()
-    safe_semantic = bool(re.search(r"\b(explain|overview|architecture|what is|how does|where is)\b", q))
-    patch_intent = bool(re.search(r"\b(fix|patch|change|implement|refactor|bug)\b", q))
-    mode = "architecture" if safe_semantic else "bugfix"
+    mode = "architecture" if intent == "architecture_overview" else "bugfix"
+    patch_intent = intent == "code_fix_patch"
     return {
         "mode": mode,
-        "safe_semantic": safe_semantic and not patch_intent,
+        "safe_semantic": semantic_cache_allowed(intent, retrieval_route_for_intent(intent)),
         "patch_intent": patch_intent,
     }
 
@@ -620,15 +633,18 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
 
     query = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
     pmap = _indexer_module._load_project_map() if _indexer_module else {}
-    diagnosis = _diagnose_query(query)
+    intent = classify_query_intent(query)
+    retrieval_route = retrieval_route_for_intent(intent)
+    orchestration = orchestration_plan(intent)
+    diagnosis = _diagnose_query(query, intent)
     repo_fp = _indexer_module.get_repo_fingerprint() if _indexer_module else ""
     cache = getattr(_indexer_module, "CACHE", None) if _indexer_module else None
-    retrieval_signature = f"{query}:{CONTEXT_CHUNKS}"
+    retrieval_signature = f"{retrieval_route}:{intent}:{query}:{CONTEXT_CHUNKS}"
     planned_files = []
     cached_semantic = False
     final_text = ""
 
-    if cache and repo_fp and diagnosis.get("safe_semantic") and not diagnosis.get("patch_intent"):
+    if cache and repo_fp and semantic_cache_allowed(intent, retrieval_route):
         semantic_hit = cache.semantic_get(
             repo_fp=repo_fp,
             query=query,
@@ -642,7 +658,7 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
             yield _make_chunk(final_text, request_id)
 
     if not cached_semantic:
-        if INDEXER_READY and pmap and query:
+        if INDEXER_READY and pmap and query and not orchestration["skip_patch_plan"]:
             import asyncio
 
             loop = asyncio.get_event_loop()
@@ -661,14 +677,15 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                         value={"diagnosis": diagnosis, "planned_files": planned_files},
                     )
 
-        if planned_files:
+        if planned_files and not orchestration["skip_neighborhood"]:
             short_names = [f.split("/")[-1] for f in planned_files]
             yield _make_chunk(f"\n📂 _Reading: {', '.join(short_names)}_", request_id)
             messages, _ = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: _build_context_from_plan(messages, planned_files, request_id, diagnosis)
             )
         else:
-            yield _make_chunk("\n📂 _Searching codebase..._", request_id)
+            status = "Loading source-of-truth config..." if is_fast_path_intent(intent) else "Searching codebase..."
+            yield _make_chunk(f"\n📂 _{status}_", request_id)
             messages = _build_context(messages, request_id)
 
         t_context = time.perf_counter()
@@ -746,7 +763,7 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
             f"STREAM_DONE {request_id} | context={ctx_s:.1f}s | think={think_s:.1f}s | ttft={ttft_s:.1f}s | total={total_s:.1f}s | chunks={token_count}"
         )
 
-    if cache and repo_fp and diagnosis.get("safe_semantic") and not diagnosis.get("patch_intent") and final_text.strip():
+    if cache and repo_fp and semantic_cache_allowed(intent, retrieval_route) and final_text.strip():
         cache.semantic_set(
             repo_fp=repo_fp,
             query=query,

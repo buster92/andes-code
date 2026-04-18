@@ -24,6 +24,7 @@ AndesCode now uses a **multi-layer cache** designed for repository-aware coding 
      - normalized query
      - retrieval policy version
      - index version
+   - Keys are route-aware (`intent` + `retrieval_route`) so config-first and semantic paths never collide.
    - Never reused across repo fingerprints.
 
 3. **File-neighborhood cache**
@@ -70,3 +71,4 @@ Fingerprint payload includes:
 - Keys are deterministic and explicit (no fuzzy key matching).
 - Repo fingerprint boundary prevents cross-repo leakage.
 - Semantic cache is never used for patch-producing intents.
+- Config/dependency intents run a fast deterministic path (source-of-truth first, no patch-plan orchestration).

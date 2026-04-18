@@ -58,12 +58,22 @@ class AndesCacheManager:
         return removed
 
     # Retrieval layer
-    def retrieval_get(self, *, repo_fp: str, query: str, index_version: str):
+    def retrieval_get(
+        self,
+        *,
+        repo_fp: str,
+        query: str,
+        index_version: str,
+        intent: str = "unknown",
+        retrieval_route: str = "unknown",
+    ):
         nquery = normalize_query(query)
         key = build_key(
             "ret",
             repo_fp=repo_fp,
             query=nquery,
+            intent=intent,
+            retrieval_route=retrieval_route,
             retrieval_policy_version=RETRIEVAL_POLICY_VERSION,
             index_version=index_version,
         )
@@ -74,12 +84,23 @@ class AndesCacheManager:
             self.metrics.hit(CacheLayers.RETRIEVAL)
         return value
 
-    def retrieval_set(self, *, repo_fp: str, query: str, index_version: str, value):
+    def retrieval_set(
+        self,
+        *,
+        repo_fp: str,
+        query: str,
+        index_version: str,
+        value,
+        intent: str = "unknown",
+        retrieval_route: str = "unknown",
+    ):
         nquery = normalize_query(query)
         key = build_key(
             "ret",
             repo_fp=repo_fp,
             query=nquery,
+            intent=intent,
+            retrieval_route=retrieval_route,
             retrieval_policy_version=RETRIEVAL_POLICY_VERSION,
             index_version=index_version,
         )
@@ -87,7 +108,12 @@ class AndesCacheManager:
             CacheLayers.RETRIEVAL,
             key,
             value,
-            metadata={"repo_fp": repo_fp, "query": nquery},
+            metadata={
+                "repo_fp": repo_fp,
+                "query": nquery,
+                "intent": intent,
+                "retrieval_route": retrieval_route,
+            },
         )
 
     # File neighborhood

@@ -8,6 +8,13 @@ from .versions import (
     RETRIEVAL_POLICY_VERSION,
     PROMPT_TEMPLATE_VERSION,
 )
+from .routing import (
+    classify_query_intent,
+    retrieval_route_for_intent,
+    is_fast_path_intent,
+    semantic_cache_allowed,
+    orchestration_plan,
+)
 
 __all__ = [
     "RepoFingerprinter",
@@ -20,4 +27,9 @@ __all__ = [
     "PARSER_VERSION",
     "RETRIEVAL_POLICY_VERSION",
     "PROMPT_TEMPLATE_VERSION",
+    "classify_query_intent",
+    "retrieval_route_for_intent",
+    "is_fast_path_intent",
+    "semantic_cache_allowed",
+    "orchestration_plan",
 ]

@@ -4,6 +4,7 @@
 
 ```bash
 python -m unittest tests/test_cache_layers.py -v
+python -m unittest tests/test_retrieval_routing_behavior.py -v
 ```
 
 Covers:
