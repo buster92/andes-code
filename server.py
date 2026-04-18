@@ -497,7 +497,7 @@ def _plan_files(query: str, pmap: dict) -> list[str]:
 def _diagnose_query(query: str, intent: str) -> dict:
     """Deterministic diagnosis stage before planning/generation."""
     mode = "architecture" if intent == "architecture_overview" else "bugfix"
-    patch_intent = intent == "code_fix_patch"
+    patch_intent = intent == "code_fix_or_patch"
     return {
         "mode": mode,
         "safe_semantic": semantic_cache_allowed(intent, retrieval_route_for_intent(intent)),

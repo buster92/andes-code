@@ -13,11 +13,12 @@ def config_priority_files(intent: str, query: str, manifests: list[str], config_
         preferred.extend([m for m in manifests if m.endswith("AndroidManifest.xml")])
         preferred.append("AndroidManifest.xml")
 
-    if intent == "dependency_inventory":
+    if intent == "dependency_or_build_inventory":
         dep_files = [
             "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
             "package.json", "requirements.txt", "pyproject.toml", "Cargo.toml",
-            "go.mod", "pom.xml", "poetry.lock", "Pipfile",
+            "go.mod", "pom.xml", "poetry.lock", "Pipfile", "Dockerfile", "docker-compose.yml",
+            "Package.swift", ".entitlements", ".plist",
         ]
         for df in dep_files:
             preferred.extend([m for m in manifests if m.endswith(df)])
@@ -57,6 +58,24 @@ def annotate_sources(chunks: list[dict], source_type: str, authority_level: str)
         c.setdefault("source_type", source_type)
         c.setdefault("authority_level", authority_level)
     return chunks
+
+
+def classify_source_type(path: str) -> str:
+    p = (path or "").lower()
+    if "manifest" in p:
+        return "manifest"
+    if any(x in p for x in ("gradle", "pom.xml", "dockerfile", "compose", "package.swift")):
+        return "build_file"
+    if any(x in p for x in ("requirements", "pyproject", "cargo.toml", "go.mod", "package.json", "pipfile", "poetry.lock")):
+        return "dependency_file"
+    if any(x in p for x in ("config", ".env", "entitlements", ".plist", "settings")):
+        return "config_file"
+    return "source_code"
+
+
+def wants_runtime_usage(query: str) -> bool:
+    q = (query or "").lower()
+    return any(x in q for x in ("used", "usage", "called", "checked", "referenced", "runtime"))
 
 
 def missing_manifest_notice() -> dict:

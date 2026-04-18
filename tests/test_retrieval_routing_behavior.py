@@ -17,14 +17,20 @@ class TestIntentClassification(unittest.TestCase):
     def test_permissions_query_routes_to_config(self):
         q = "list the permissions declared"
         intent = classify_query_intent(q)
-        self.assertEqual(intent, "config_declaration")
-        self.assertEqual(retrieval_route_for_intent(intent), "config_first")
+        self.assertEqual(intent, "declaration_or_configuration")
+        self.assertEqual(retrieval_route_for_intent(intent), "source_of_truth")
 
     def test_dependency_query_routes_to_config(self):
         q = "what libraries/dependencies are used"
         intent = classify_query_intent(q)
-        self.assertEqual(intent, "dependency_inventory")
-        self.assertEqual(retrieval_route_for_intent(intent), "config_first")
+        self.assertEqual(intent, "dependency_or_build_inventory")
+        self.assertEqual(retrieval_route_for_intent(intent), "source_of_truth")
+
+    def test_runtime_usage_query_routes_to_runtime(self):
+        q = "where is auth token used"
+        intent = classify_query_intent(q)
+        self.assertEqual(intent, "runtime_usage_or_reference")
+        self.assertEqual(retrieval_route_for_intent(intent), "runtime_usage")
 
 
 class TestSourceOfTruthBehavior(unittest.TestCase):
@@ -47,15 +53,20 @@ class TestSourceOfTruthBehavior(unittest.TestCase):
         self.assertIn("inferences", msg)
 
     def test_dependency_files_are_prioritized(self):
-        manifests = ["package.json", "app/build.gradle", "requirements.txt"]
+        manifests = ["package.json", "app/build.gradle", "requirements.txt", "Dockerfile"]
         ordered = config_priority_files(
-            intent="dependency_inventory",
+            intent="dependency_or_build_inventory",
             query="what dependencies are declared",
             manifests=manifests,
             config_files=[],
         )
         self.assertTrue(ordered.index("app/build.gradle") < ordered.index("requirements.txt"))
         self.assertIn("package.json", ordered)
+        self.assertIn("Dockerfile", ordered)
+
+    def test_declaration_without_authoritative_file_requires_limitation(self):
+        msg = missing_manifest_notice()["content"]
+        self.assertIn("Decla", msg)
 
 
 class TestRouteIsolationAndFastPath(unittest.TestCase):
@@ -71,9 +82,9 @@ class TestRouteIsolationAndFastPath(unittest.TestCase):
                 repo_fp="fp",
                 query="where is x configured",
                 index_version="v1",
-                intent="config_declaration",
-                retrieval_route="config_first",
-                value=[{"route": "config_first"}],
+                intent="declaration_or_configuration",
+                retrieval_route="source_of_truth",
+                value=[{"route": "source_of_truth"}],
             )
             self.assertIsNone(
                 mgr.retrieval_get(
@@ -88,7 +99,7 @@ class TestRouteIsolationAndFastPath(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_fast_path_skips_patch_plan(self):
-        plan = orchestration_plan("config_declaration")
+        plan = orchestration_plan("declaration_or_configuration")
         self.assertTrue(plan["skip_patch_plan"])
         self.assertTrue(plan["skip_patch_diagnosis"])
         self.assertTrue(plan["skip_neighborhood"])

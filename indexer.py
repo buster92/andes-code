@@ -21,13 +21,17 @@ from andes_cache import AndesCacheManager, RepoFingerprinter
 from andes_cache.routing import (
     classify_query_intent,
     retrieval_route_for_intent,
-    DEPENDENCY_INVENTORY,
+    DECLARATION_OR_CONFIGURATION,
+    DEPENDENCY_OR_BUILD_INVENTORY,
+    RUNTIME_USAGE_OR_REFERENCE,
 )
 from andes_cache.source_of_truth import (
     config_priority_files,
     summarize_declared_permissions,
     annotate_sources,
     missing_manifest_notice,
+    classify_source_type,
+    wants_runtime_usage,
 )
 from andes_cache.versions import (
     INDEX_VERSION,
@@ -332,7 +336,7 @@ def search(query: str, n_results: int = 5) -> list[dict]:
         if cached:
             return cached[:n_results]
 
-    if retrieval_route == "config_first":
+    if retrieval_route == "source_of_truth":
         final = _retrieve_config_first(query, intent, n_results=n_results)
         if repo_fp and final:
             CACHE.retrieval_set(
@@ -430,7 +434,8 @@ def search(query: str, n_results: int = 5) -> list[dict]:
 
     # Add coverage metadata — lets server tell model how much of each file it has
     final = _add_coverage(ranked[:n_results])
-    final = annotate_sources(final, source_type="source_code", authority_level="referenced")
+    authority = "referenced" if intent == RUNTIME_USAGE_OR_REFERENCE else "inferred"
+    final = annotate_sources(final, source_type="source_code", authority_level=authority)
     if repo_fp:
         CACHE.retrieval_set(
             repo_fp=repo_fp,
@@ -1033,14 +1038,15 @@ def _retrieve_config_first(query: str, intent: str, n_results: int = 5) -> list[
     )
 
     collected = []
+    found_authoritative = False
     for fname in priority_files:
         file_chunks = _fetch_all_from_file(fname, max_results=40)
         if not file_chunks:
             continue
-        source_type = "manifest" if fname.endswith("AndroidManifest.xml") else "build_file"
-        if any(token in fname for token in (".env", "config", "settings", "docker-compose")):
-            source_type = "config_file"
-        annotate_sources(file_chunks, source_type=source_type, authority_level="declared")
+        found_authoritative = True
+        source_type = classify_source_type(fname)
+        authority = "declared" if intent == DEPENDENCY_OR_BUILD_INVENTORY else "configured"
+        annotate_sources(file_chunks, source_type=source_type, authority_level=authority)
         collected.extend(file_chunks[:6])
         if len(collected) >= n_results:
             break
@@ -1075,17 +1081,37 @@ def _retrieve_config_first(query: str, intent: str, n_results: int = 5) -> list[
                 "full_file": True,
                 "coverage": {"returned": 1, "total": 1, "partial": False},
             })
-            fallback = search_semantic_only(query, n_results=max(1, n_results - 1))
-            annotate_sources(fallback, source_type="source_code", authority_level="referenced")
-            return [explicit] + fallback
+            if wants_runtime_usage(query):
+                fallback = search_semantic_only(query, n_results=max(1, n_results - 1))
+                annotate_sources(fallback, source_type="source_code", authority_level="referenced")
+                return [explicit] + fallback
+            return [explicit]
 
     if collected:
         return collected[:n_results]
 
-    # Fallback only after source-of-truth path fails.
-    fallback = search_semantic_only(query, n_results=n_results)
-    annotate_sources(fallback, source_type="inferred", authority_level="inferred")
-    return fallback
+    limitation = {
+        "content": (
+            "# Source-of-Truth Limitation\n"
+            "- No authoritative declaration/configuration files were retrieved.\n"
+            "- Declared/configured facts cannot be confirmed from source-of-truth artifacts.\n"
+            "- Ask for runtime usage/references explicitly to include inferred code behavior."
+        ),
+        "file": "__source_of_truth_missing__",
+        "language": "meta",
+        "symbols": "",
+        "score": 0.0,
+        "_rank": 1.0,
+        "full_file": True,
+        "coverage": {"returned": 1, "total": 1, "partial": False},
+        "source_type": "inferred",
+        "authority_level": "inferred",
+    }
+    if not found_authoritative and wants_runtime_usage(query):
+        fallback = search_semantic_only(query, n_results=max(1, n_results - 1))
+        annotate_sources(fallback, source_type="source_code", authority_level="referenced")
+        return [limitation] + fallback
+    return [limitation]
 
 
 def search_semantic_only(query: str, n_results: int = 5) -> list[dict]:
