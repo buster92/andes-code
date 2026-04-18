@@ -87,7 +87,6 @@ def classify_query_intent_details(query: str) -> dict:
         )
     )
     dependency_question = bool(re.search(r"\b(dependency|dependencies|library|libraries|package|packages)\b", q))
-    configured_question = bool(re.search(r"\b(configured|configuration|settings?|manifest|where is .* configured)\b", q))
 
     if patch_score > 0:
         intent = CODE_FIX_OR_PATCH
@@ -142,7 +141,6 @@ def classify_query_intent_details(query: str) -> dict:
         "ambiguous": ambiguous,
         "allow_runtime_fallback": explicit_runtime_request,
         "strict_authority_mode": strict_authority_mode,
-        "configured_question": configured_question,
     }
 
 

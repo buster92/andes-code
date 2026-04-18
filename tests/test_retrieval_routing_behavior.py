@@ -202,6 +202,8 @@ class TestRouteIsolationAndFastPath(unittest.TestCase):
         self.assertTrue(semantic_cache_allowed("generic_semantic", "semantic"))
 
     def test_route_before_cache_order_in_search_source(self):
+        # Lightweight guardrail: importing indexer in unit tests initializes heavyweight
+        # embedding/chroma components, so we enforce this invariant via source-order check.
         src = Path("indexer.py").read_text()
         classify_pos = src.find("decision = classify_query_intent_details(query)")
         route_pos = src.find('retrieval_route = decision["retrieval_route"]')
