@@ -27,6 +27,7 @@ from llama_cpp import Llama, LlamaCache
 from andes_cache import build_prompt_sections, serialize_prompt_sections
 from andes_cache.routing import (
     classify_query_intent,
+    classify_query_intent_details,
     retrieval_route_for_intent,
     is_fast_path_intent,
     semantic_cache_allowed,
@@ -633,8 +634,9 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
 
     query = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
     pmap = _indexer_module._load_project_map() if _indexer_module else {}
-    intent = classify_query_intent(query)
-    retrieval_route = retrieval_route_for_intent(intent)
+    decision = classify_query_intent_details(query)
+    intent = decision["intent"]
+    retrieval_route = decision["retrieval_route"]
     orchestration = orchestration_plan(intent)
     diagnosis = _diagnose_query(query, intent)
     repo_fp = _indexer_module.get_repo_fingerprint() if _indexer_module else ""

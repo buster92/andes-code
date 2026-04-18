@@ -7,10 +7,14 @@ import re
 
 def config_priority_files(intent: str, query: str, manifests: list[str], config_files: list[str]) -> list[str]:
     q = (query or "").lower()
-    preferred = []
+    preferred: list[str] = []
+    authoritative_paths = [
+        p for p in (manifests + config_files) if p and _is_authoritative_candidate(p)
+    ]
+    query_hints = _query_path_hints(q)
 
     if any(k in q for k in ("permission", "permissions", "declared", "manifest")):
-        preferred.extend([m for m in manifests if m.endswith("AndroidManifest.xml")])
+        preferred.extend([m for m in authoritative_paths if m.endswith("AndroidManifest.xml")])
         preferred.append("AndroidManifest.xml")
 
     if intent == "dependency_or_build_inventory":
@@ -21,7 +25,8 @@ def config_priority_files(intent: str, query: str, manifests: list[str], config_
             "Package.swift", ".entitlements", ".plist",
         ]
         for df in dep_files:
-            preferred.extend([m for m in manifests if m.endswith(df)])
+            matched = [m for m in authoritative_paths if m.endswith(df)]
+            preferred.extend(_rank_by_query_hints(matched, query_hints))
             preferred.append(df)
     else:
         cfg_files = [
@@ -30,9 +35,10 @@ def config_priority_files(intent: str, query: str, manifests: list[str], config_
             "package.json", "pyproject.toml",
         ]
         for cf in cfg_files:
-            preferred.extend([m for m in manifests if m.endswith(cf)])
+            matched = [m for m in authoritative_paths if m.endswith(cf)]
+            preferred.extend(_rank_by_query_hints(matched, query_hints))
             preferred.append(cf)
-        preferred.extend(config_files)
+        preferred.extend(_rank_by_query_hints(authoritative_paths, query_hints))
 
     seen = set()
     ordered = []
@@ -73,6 +79,16 @@ def classify_source_type(path: str) -> str:
     return "source_code"
 
 
+def authority_level_for_source(intent: str, source_type: str) -> str:
+    if source_type in {"manifest", "config_file"}:
+        return "configured"
+    if source_type in {"build_file", "dependency_file"}:
+        return "declared" if intent == "dependency_or_build_inventory" else "configured"
+    if source_type == "source_code":
+        return "referenced"
+    return "inferred"
+
+
 def wants_runtime_usage(query: str) -> bool:
     q = (query or "").lower()
     return any(x in q for x in ("used", "usage", "called", "checked", "referenced", "runtime"))
@@ -91,3 +107,37 @@ def missing_manifest_notice() -> dict:
         "source_type": "inferred",
         "authority_level": "inferred",
     }
+
+
+def _is_authoritative_candidate(path: str) -> bool:
+    p = (path or "").lower()
+    if not p:
+        return False
+    non_authoritative = (
+        "test/", "/test", "tests/", "/tests", "spec/", "specs/", "fixture", "fixtures",
+        "example", "examples", "sample", "samples", "mock", "/docs/",
+        ".env.example", ".env.sample",
+    )
+    return not any(tok in p for tok in non_authoritative)
+
+
+def _query_path_hints(query: str) -> list[str]:
+    hints = []
+    for tok in re.findall(r"[a-z0-9_\-\.]+", query):
+        if len(tok) < 3:
+            continue
+        if tok in {"what", "where", "declared", "configured", "dependencies", "config"}:
+            continue
+        hints.append(tok)
+    return hints
+
+
+def _rank_by_query_hints(paths: list[str], hints: list[str]) -> list[str]:
+    def score(path: str) -> tuple[int, int]:
+        p = path.lower()
+        hint_hits = sum(1 for h in hints if h in p)
+        # Prefer less nested files for repo-level questions.
+        depth = p.count("/")
+        return (hint_hits, -depth)
+
+    return sorted(paths, key=score, reverse=True)

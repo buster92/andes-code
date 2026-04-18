@@ -19,10 +19,7 @@ from sentence_transformers import SentenceTransformer
 
 from andes_cache import AndesCacheManager, RepoFingerprinter
 from andes_cache.routing import (
-    classify_query_intent,
-    retrieval_route_for_intent,
-    DECLARATION_OR_CONFIGURATION,
-    DEPENDENCY_OR_BUILD_INVENTORY,
+    classify_query_intent_details,
     RUNTIME_USAGE_OR_REFERENCE,
 )
 from andes_cache.source_of_truth import (
@@ -31,6 +28,7 @@ from andes_cache.source_of_truth import (
     annotate_sources,
     missing_manifest_notice,
     classify_source_type,
+    authority_level_for_source,
     wants_runtime_usage,
 )
 from andes_cache.versions import (
@@ -322,8 +320,9 @@ def search(query: str, n_results: int = 5) -> list[dict]:
     count = col.count()
     if count == 0:
         return []
-    intent = classify_query_intent(query)
-    retrieval_route = retrieval_route_for_intent(intent)
+    decision = classify_query_intent_details(query)
+    intent = decision["intent"]
+    retrieval_route = decision["retrieval_route"]
     repo_fp = get_repo_fingerprint()
     if repo_fp:
         cached = CACHE.retrieval_get(
@@ -337,7 +336,13 @@ def search(query: str, n_results: int = 5) -> list[dict]:
             return cached[:n_results]
 
     if retrieval_route == "source_of_truth":
-        final = _retrieve_config_first(query, intent, n_results=n_results)
+        final = _retrieve_config_first(
+            query,
+            intent,
+            n_results=n_results,
+            ambiguous=decision.get("ambiguous", False),
+            allow_runtime_fallback=decision.get("allow_runtime_fallback", False),
+        )
         if repo_fp and final:
             CACHE.retrieval_set(
                 repo_fp=repo_fp,
@@ -1024,7 +1029,13 @@ def _build_config_graph(root_path: Path, manifests: list[str]) -> dict:
     }
 
 
-def _retrieve_config_first(query: str, intent: str, n_results: int = 5) -> list[dict]:
+def _retrieve_config_first(
+    query: str,
+    intent: str,
+    n_results: int = 5,
+    ambiguous: bool = False,
+    allow_runtime_fallback: bool = False,
+) -> list[dict]:
     """
     Deterministic source-of-truth retrieval path for config/declaration/dependency
     questions. Pull config/manifests first, then fallback to inferred source code.
@@ -1045,7 +1056,7 @@ def _retrieve_config_first(query: str, intent: str, n_results: int = 5) -> list[
             continue
         found_authoritative = True
         source_type = classify_source_type(fname)
-        authority = "declared" if intent == DEPENDENCY_OR_BUILD_INVENTORY else "configured"
+        authority = authority_level_for_source(intent, source_type)
         annotate_sources(file_chunks, source_type=source_type, authority_level=authority)
         collected.extend(file_chunks[:6])
         if len(collected) >= n_results:
@@ -1081,7 +1092,7 @@ def _retrieve_config_first(query: str, intent: str, n_results: int = 5) -> list[
                 "full_file": True,
                 "coverage": {"returned": 1, "total": 1, "partial": False},
             })
-            if wants_runtime_usage(query):
+            if allow_runtime_fallback and wants_runtime_usage(query):
                 fallback = search_semantic_only(query, n_results=max(1, n_results - 1))
                 annotate_sources(fallback, source_type="source_code", authority_level="referenced")
                 return [explicit] + fallback
@@ -1095,7 +1106,8 @@ def _retrieve_config_first(query: str, intent: str, n_results: int = 5) -> list[
             "# Source-of-Truth Limitation\n"
             "- No authoritative declaration/configuration files were retrieved.\n"
             "- Declared/configured facts cannot be confirmed from source-of-truth artifacts.\n"
-            "- Ask for runtime usage/references explicitly to include inferred code behavior."
+            "- Ask for runtime usage/references explicitly to include inferred code behavior.\n"
+            + ("- Query intent appears ambiguous; clarify whether you want declarations or runtime usage.\n" if ambiguous else "")
         ),
         "file": "__source_of_truth_missing__",
         "language": "meta",
@@ -1107,7 +1119,7 @@ def _retrieve_config_first(query: str, intent: str, n_results: int = 5) -> list[
         "source_type": "inferred",
         "authority_level": "inferred",
     }
-    if not found_authoritative and wants_runtime_usage(query):
+    if not found_authoritative and allow_runtime_fallback and wants_runtime_usage(query):
         fallback = search_semantic_only(query, n_results=max(1, n_results - 1))
         annotate_sources(fallback, source_type="source_code", authority_level="referenced")
         return [limitation] + fallback
