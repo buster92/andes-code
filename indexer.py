@@ -41,6 +41,7 @@ from andes_cache.integrity import (
     validate_authoritative_integrity,
     repair_authoritative_integrity,
     select_healthy_authoritative_path,
+    prune_missing_on_disk_hashes,
 )
 from andes_cache.versions import (
     INDEX_VERSION,
@@ -1338,8 +1339,17 @@ def _retrieve_config_first(
         if repaired_attempt.get("overall_status") == INTEGRITY_HEALTHY:
             selected_healthy_path = priority_files[0]
     if debug_payload is not None:
+        latest_attempt = integrity_attempts[-1] if integrity_attempts else {}
+        latest_files = latest_attempt.get("files", [])
+        failing_paths = latest_attempt.get("failing_files", [])
+        reason_codes = sorted({reason for f in latest_files for reason in f.get("reasons", [])})
         debug_payload["source_of_truth"]["integrity"] = {
             "selected_healthy_path": selected_healthy_path,
+            "overall_status": latest_attempt.get("overall_status", ""),
+            "failing_paths": failing_paths,
+            "reason_codes": reason_codes,
+            "repair_ran": bool(latest_attempt.get("repair_ran", False)),
+            "repair_succeeded": bool(latest_attempt.get("repair_succeeded", False)),
             "attempts": integrity_attempts,
         }
     if not selected_healthy_path:
@@ -2002,49 +2012,96 @@ def _expected_chunk_count_for_file(root_path: Path, rel_path: str) -> int | None
 def _repair_index_paths(root_path: Path, rel_paths: list[str]) -> bool:
     if not rel_paths:
         return True
-    repair_chunks = []
     hashes = _load_hashes()
     next_hashes = dict(hashes)
+    sorted_paths = sorted(set(rel_paths))
+    prepared_paths = []
 
-    for rel in sorted(set(rel_paths)):
+    for rel in sorted_paths:
         fp = root_path / rel
-        try:
-            col.delete(where={"file": rel})
-        except Exception as e:
-            logging.warning(f"Integrity repair could not clear stale vectors for {rel}: {e}")
-        if not fp.exists() or not fp.is_file():
+        previous = col.get(
+            where={"file": rel},
+            include=["embeddings", "documents", "metadatas"],
+        )
+        previous_ids = list(previous.get("ids") or [])
+        previous_embeddings = list(previous.get("embeddings") or [])
+        previous_documents = list(previous.get("documents") or [])
+        previous_metadatas = list(previous.get("metadatas") or [])
+        missing_on_disk = not fp.exists() or not fp.is_file()
+        if missing_on_disk:
+            prepared_paths.append(
+                {
+                    "path": rel,
+                    "missing_on_disk": True,
+                    "previous_ids": previous_ids,
+                    "previous_embeddings": previous_embeddings,
+                    "previous_documents": previous_documents,
+                    "previous_metadatas": previous_metadatas,
+                    "new_ids": [],
+                    "new_embeddings": [],
+                    "new_documents": [],
+                    "new_metadatas": [],
+                }
+            )
+            next_hashes.pop(rel, None)
             continue
         try:
             chunks = _chunk_file(fp, root_path)
         except Exception as e:
             logging.warning(f"Integrity repair skipped {rel}: {e}")
-            continue
-        repair_chunks.extend(chunks)
+            return False
+        new_ids = [c["id"] for c in chunks]
+        new_documents = [c["content"] for c in chunks]
+        new_metadatas = [
+            {"file": c["file"], "language": c["language"], "line": c["line"], "symbols": c.get("symbols", "")}
+            for c in chunks
+        ]
+        new_embeddings = []
+        for start in range(0, len(chunks), EMBED_BATCH):
+            batch = chunks[start: start + EMBED_BATCH]
+            if not batch:
+                continue
+            embedded = embedder.encode([c["content"] for c in batch], show_progress_bar=False).tolist()
+            new_embeddings.extend(embedded)
+        prepared_paths.append(
+            {
+                "path": rel,
+                "missing_on_disk": False,
+                "previous_ids": previous_ids,
+                "previous_embeddings": previous_embeddings,
+                "previous_documents": previous_documents,
+                "previous_metadatas": previous_metadatas,
+                "new_ids": new_ids,
+                "new_embeddings": new_embeddings,
+                "new_documents": new_documents,
+                "new_metadatas": new_metadatas,
+            }
+        )
         try:
             next_hashes[rel] = _file_hash(fp)
         except Exception:
             pass
 
-    if not repair_chunks:
-        return False
+    if not prepared_paths:
+        return True
 
     try:
-        embeddings = []
-        for start in range(0, len(repair_chunks), EMBED_BATCH):
-            batch = repair_chunks[start: start + EMBED_BATCH]
-            embeddings.extend(embedder.encode([c["content"] for c in batch], show_progress_bar=False).tolist())
-        for start in range(0, len(repair_chunks), CHROMA_BATCH):
-            bc = repair_chunks[start: start + CHROMA_BATCH]
-            bv = embeddings[start: start + CHROMA_BATCH]
-            col.upsert(
-                ids=[c["id"] for c in bc],
-                embeddings=bv,
-                documents=[c["content"] for c in bc],
-                metadatas=[
-                    {"file": c["file"], "language": c["language"], "line": c["line"], "symbols": c.get("symbols", "")}
-                    for c in bc
-                ],
-            )
+        applied_paths = []
+        for prepared in prepared_paths:
+            rel = prepared["path"]
+            if prepared["new_ids"]:
+                for start in range(0, len(prepared["new_ids"]), CHROMA_BATCH):
+                    col.upsert(
+                        ids=prepared["new_ids"][start: start + CHROMA_BATCH],
+                        embeddings=prepared["new_embeddings"][start: start + CHROMA_BATCH],
+                        documents=prepared["new_documents"][start: start + CHROMA_BATCH],
+                        metadatas=prepared["new_metadatas"][start: start + CHROMA_BATCH],
+                    )
+            stale_ids = sorted(set(prepared["previous_ids"]) - set(prepared["new_ids"]))
+            if stale_ids:
+                col.delete(ids=stale_ids)
+            applied_paths.append(prepared)
+
         next_hashes["__root__"] = str(root_path)
         if "__fingerprint__" not in next_hashes:
             next_hashes["__fingerprint__"] = get_repo_fingerprint()
@@ -2052,6 +2109,23 @@ def _repair_index_paths(root_path: Path, rel_paths: list[str]) -> bool:
         return True
     except Exception as e:
         logging.warning(f"Targeted integrity repair failed: {e}")
+        for prepared in reversed(applied_paths):
+            try:
+                if prepared["new_ids"]:
+                    col.delete(ids=prepared["new_ids"])
+            except Exception as rollback_err:
+                logging.warning(f"Integrity rollback failed while clearing new vectors for {prepared['path']}: {rollback_err}")
+            try:
+                if prepared["previous_ids"]:
+                    for start in range(0, len(prepared["previous_ids"]), CHROMA_BATCH):
+                        col.upsert(
+                            ids=prepared["previous_ids"][start: start + CHROMA_BATCH],
+                            embeddings=prepared["previous_embeddings"][start: start + CHROMA_BATCH],
+                            documents=prepared["previous_documents"][start: start + CHROMA_BATCH],
+                            metadatas=prepared["previous_metadatas"][start: start + CHROMA_BATCH],
+                        )
+            except Exception as rollback_err:
+                logging.warning(f"Integrity rollback failed while restoring previous vectors for {prepared['path']}: {rollback_err}")
         return False
 
 
@@ -2076,6 +2150,11 @@ def _validate_and_repair_authoritative_integrity(root_path: Path, candidate_path
         expected_chunk_count_lookup=lambda p: _expected_chunk_count_for_file(root_path, p),
         candidate_paths=candidate_paths,
     )
+    cleaned_hash_state, missing_paths = prune_missing_on_disk_hashes(hash_state, report)
+    if missing_paths:
+        _save_hashes(cleaned_hash_state)
+        hash_state = cleaned_hash_state
+
     if report.overall_status == INTEGRITY_HEALTHY:
         _save_json(INTEGRITY_STATE, report.to_dict())
         return report.to_dict()
