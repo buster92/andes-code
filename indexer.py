@@ -1324,6 +1324,7 @@ def _retrieve_config_first(
             hash_state=_load_hashes(),
             fetch_exact_file=_fetch_exact_file,
             file_hash_lookup=lambda rp: _file_hash(root_path_for_integrity / rp) if (root_path_for_integrity / rp).exists() else None,
+            file_exists_lookup=lambda rp: (root_path_for_integrity / rp).exists() and (root_path_for_integrity / rp).is_file(),
             expected_chunk_count_lookup=lambda rp: _expected_chunk_count_for_file(root_path_for_integrity, rp),
             candidate_paths=[p],
         ),
@@ -2142,11 +2143,16 @@ def _validate_and_repair_authoritative_integrity(root_path: Path, candidate_path
         except Exception:
             return None
 
+    def _file_exists_lookup(rel_path: str) -> bool:
+        fp = root_path / rel_path
+        return fp.exists() and fp.is_file()
+
     report = validate_authoritative_integrity(
         workspace=workspace,
         hash_state=hash_state,
         fetch_exact_file=_fetch_exact_file,
         file_hash_lookup=_file_hash_lookup,
+        file_exists_lookup=_file_exists_lookup,
         expected_chunk_count_lookup=lambda p: _expected_chunk_count_for_file(root_path, p),
         candidate_paths=candidate_paths,
     )
@@ -2167,6 +2173,7 @@ def _validate_and_repair_authoritative_integrity(root_path: Path, candidate_path
             hash_state=_load_hashes(),
             fetch_exact_file=_fetch_exact_file,
             file_hash_lookup=_file_hash_lookup,
+            file_exists_lookup=_file_exists_lookup,
             expected_chunk_count_lookup=lambda p: _expected_chunk_count_for_file(root_path, p),
             candidate_paths=paths,
         ),

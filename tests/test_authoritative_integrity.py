@@ -82,9 +82,23 @@ class TestAuthoritativeIntegrity(unittest.TestCase):
             hash_state={"deleted/build.gradle": "h"},
             fetch_exact_file=lambda _p, _m: [],
             file_hash_lookup=lambda _p: None,
+            file_exists_lookup=lambda _p: False,
         )
         self.assertEqual(report.overall_status, INTEGRITY_STALE)
         self.assertIn(REASON_MISSING_ON_DISK, report.files[0].reasons)
+
+    def test_hash_lookup_failure_is_not_treated_as_missing_when_file_exists(self):
+        workspace = {"manifests": ["app/build.gradle"], "config_graph": {"config_files": []}}
+        report = validate_authoritative_integrity(
+            workspace=workspace,
+            hash_state={"app/build.gradle": "h"},
+            fetch_exact_file=lambda _p, _m: [{"content": "plugins {}", "line": 0, "file": "app/build.gradle"}],
+            file_hash_lookup=lambda _p: None,
+            file_exists_lookup=lambda _p: True,
+            expected_chunk_count_lookup=lambda _p: 1,
+        )
+        self.assertEqual(report.overall_status, INTEGRITY_HEALTHY)
+        self.assertNotIn(REASON_MISSING_ON_DISK, report.files[0].reasons)
 
     def test_repair_failure_marks_reason_code_and_keeps_status(self):
         workspace = {"manifests": ["package.json"], "config_graph": {"config_files": []}}
@@ -160,6 +174,7 @@ class TestAuthoritativeIntegrity(unittest.TestCase):
             hash_state={"old/package.json": "old-hash"},
             fetch_exact_file=lambda p, _m: fetch_map.get(p, []),
             file_hash_lookup=lambda p: None if p == "old/package.json" else "new-hash",
+            file_exists_lookup=lambda p: p != "old/package.json",
             expected_chunk_count_lookup=lambda _p: 1,
         )
         by_path = {f.path: f for f in report.files}

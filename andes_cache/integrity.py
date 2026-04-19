@@ -95,6 +95,7 @@ def validate_authoritative_integrity(
     hash_state: dict,
     fetch_exact_file: Callable[[str, int], list[dict]],
     file_hash_lookup: Callable[[str], str | None] | None = None,
+    file_exists_lookup: Callable[[str], bool] | None = None,
     expected_chunk_count_lookup: Callable[[str], int | None] | None = None,
     candidate_paths: list[str] | None = None,
     max_files: int = 24,
@@ -110,11 +111,13 @@ def validate_authoritative_integrity(
         if not embedded:
             reasons.append(REASON_DISCOVERED_NOT_EMBEDDED)
 
+        if file_exists_lookup and not file_exists_lookup(path):
+            reasons.append(REASON_MISSING_ON_DISK)
         if file_hash_lookup:
             current_hash = file_hash_lookup(path)
-            if current_hash is None:
+            if current_hash is None and not file_exists_lookup:
                 reasons.append(REASON_MISSING_ON_DISK)
-            elif embedded and current_hash != embedded_hash:
+            elif embedded and current_hash is not None and current_hash != embedded_hash:
                 reasons.append(REASON_WORKSPACE_HASH_MISMATCH)
 
         chunks = fetch_exact_file(path, 120)
