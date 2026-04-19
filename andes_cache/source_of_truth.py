@@ -29,49 +29,23 @@ AUTHORITATIVE_NAME_HINTS = [
     ".plist",
 ]
 
+PRIMARY_PATH_POSITIVE_TOKENS = {
+    "app", "apps", "service", "services", "package", "packages", "core", "api",
+    "src", "main",
+}
+PRIMARY_PATH_NEGATIVE_TOKENS = {
+    "test", "tests", "androidtest", "debug", "spec", "specs", "mock", "mocks",
+    "fixture", "fixtures", "example", "examples", "sample", "samples",
+    "node_modules", "dist", "build", "generated", "out", ".gradle",
+}
+_BROAD_QUERY_WORDS = {"repo", "repository", "project", "app", "application", "overall", "global"}
+
 
 def config_priority_files(intent: str, query: str, manifests: list[str], config_files: list[str]) -> list[str]:
-    q = (query or "").lower()
-    preferred: list[str] = []
     authoritative_paths = [
         p for p in (manifests + config_files) if p and _is_authoritative_candidate(p)
     ]
-    query_hints = _query_path_hints(q)
-
-    if any(k in q for k in ("permission", "permissions", "declared", "manifest")):
-        preferred.extend([m for m in authoritative_paths if m.endswith("AndroidManifest.xml")])
-        preferred.append("AndroidManifest.xml")
-
-    if intent == "dependency_or_build_inventory":
-        dep_files = [
-            "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
-            "package.json", "requirements.txt", "pyproject.toml", "Cargo.toml",
-            "go.mod", "pom.xml", "poetry.lock", "Pipfile", "Dockerfile", "docker-compose.yml",
-            "Package.swift", ".entitlements", ".plist",
-        ]
-        for df in dep_files:
-            matched = [m for m in authoritative_paths if m.endswith(df)]
-            preferred.extend(_rank_by_query_hints(matched, query_hints))
-            preferred.append(df)
-    else:
-        cfg_files = [
-            "AndroidManifest.xml", "build.gradle", "build.gradle.kts",
-            "settings.gradle", "settings.gradle.kts", ".env", "docker-compose.yml",
-            "package.json", "pyproject.toml",
-        ]
-        for cf in cfg_files:
-            matched = [m for m in authoritative_paths if m.endswith(cf)]
-            preferred.extend(_rank_by_query_hints(matched, query_hints))
-            preferred.append(cf)
-        preferred.extend(_rank_by_query_hints(authoritative_paths, query_hints))
-
-    seen = set()
-    ordered = []
-    for p in preferred:
-        if p and p not in seen:
-            seen.add(p)
-            ordered.append(p)
-    return ordered
+    return rank_authoritative_paths(authoritative_paths, query, intent)
 
 
 def expected_authority_candidates(intent: str, query: str, manifests: list[str], config_files: list[str]) -> list[str]:
@@ -145,54 +119,84 @@ def rank_recovery_authoritative_paths(
     Rank concrete authoritative paths for recovery with deterministic priority:
     exact path > basename > suffix/segment > substring.
     """
-    q = (query or "").lower()
-    path_hints = sorted(set(_query_path_hints(q)))
-    normalized_candidate_hints = sorted({(h or "").lower().strip() for h in candidate_hints if (h or "").strip()})
     authoritative_paths = [
         p for p in (manifests + config_files) if p and _is_authoritative_candidate(p)
     ]
     if not authoritative_paths:
         return []
 
-    scored = []
-    for path in sorted(set(authoritative_paths)):
+    normalized_candidate_hints = sorted({(h or "").lower().strip() for h in candidate_hints if (h or "").strip()})
+    ranked = rank_authoritative_paths(authoritative_paths, query, intent)
+    if not normalized_candidate_hints:
+        return ranked
+
+    with_hint_scores = []
+    for path in ranked:
         p = path.lower()
         base = p.rsplit("/", 1)[-1]
-        score = 0
         source_type = classify_source_type(path)
-        candidate_factor = _candidate_match_factor(intent, q, source_type)
-
-        # Candidate hint matching priority.
+        candidate_factor = _candidate_match_factor(intent, (query or "").lower(), source_type)
+        score = 0
         for h in normalized_candidate_hints:
             if p == h:
                 score += int(120 * candidate_factor)
             elif base == h:
-                score += int(100 * candidate_factor)
+                score += int(85 * candidate_factor)
             elif p.endswith(f"/{h}") or f"/{h}/" in p:
-                score += int(70 * candidate_factor)
+                score += int(45 * candidate_factor)
             elif h in p:
-                score += int(20 * candidate_factor)
+                score += int(15 * candidate_factor)
+        with_hint_scores.append((score, path))
+    with_hint_scores.sort(key=lambda t: (t[0], -t[1].count("/"), t[1]), reverse=True)
+    return [p for _, p in with_hint_scores if _ > 0] or ranked
 
-        # Query/module path overlap (prefer hinted modules/services/subtrees).
-        for hint in path_hints:
-            if p == hint:
-                score += 110
-            elif base == hint:
-                score += 90
-            elif p.endswith(f"/{hint}") or f"/{hint}/" in p:
-                score += 55
-            elif hint in p:
-                score += 15
 
-        # Intent relevance weighting.
-        score += _intent_source_priority(intent, q, source_type, base)
+def score_authoritative_path(path: str, query: str, intent: str) -> int:
+    q = (query or "").lower()
+    path_l = (path or "").lower()
+    base = path_l.rsplit("/", 1)[-1]
+    tokens = _path_tokens(path_l)
+    hint_tokens = set(_query_path_hints(q))
+    broad_query = _is_broad_query(q, hint_tokens)
 
-        # Prefer shallower paths if relevance ties.
-        depth_penalty = p.count("/")
-        scored.append((score, -depth_penalty, path))
+    score = 0
+    source_type = classify_source_type(path_l)
+    score += _intent_source_priority(intent, q, source_type, base)
+    score += 18 * sum(1 for t in tokens if t in PRIMARY_PATH_POSITIVE_TOKENS)
+    score -= 35 * sum(1 for t in tokens if t in PRIMARY_PATH_NEGATIVE_TOKENS)
 
-    scored.sort(reverse=True)
-    return [path for score, _, path in scored if score > 0]
+    if "/src/main/" in path_l:
+        score += 70
+    if "/app/" in path_l or path_l.startswith("app/"):
+        score += 38
+    if "/services/" in path_l or "/packages/" in path_l or "/apps/" in path_l:
+        score += 26
+
+    query_hits = sum(1 for tok in hint_tokens if tok in tokens or tok in base)
+    score += query_hits * 42
+
+    if broad_query:
+        depth = path_l.count("/")
+        score += max(0, 36 - (depth * 4))
+        if base in {"settings.gradle", "settings.gradle.kts", "pyproject.toml", "package.json"} and depth <= 2:
+            score += 32
+    else:
+        score += min(20, path_l.count("/") * 2)
+    return score
+
+
+def rank_authoritative_paths(paths: list[str], query: str, intent: str) -> list[str]:
+    scored: list[tuple[int, int, str]] = []
+    for p in sorted(set(paths)):
+        score = score_authoritative_path(p, query, intent)
+        scored.append((score, -p.count("/"), p))
+    scored.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
+    return [p for s, _, p in scored if s > 0]
+
+
+def select_best_authoritative_path(paths: list[str], query: str, intent: str) -> str:
+    ranked = rank_authoritative_paths(paths, query, intent)
+    return ranked[0] if ranked else ""
 
 
 def summarize_declared_permissions(chunks: list[dict]) -> list[str]:
@@ -278,10 +282,23 @@ def _query_path_hints(query: str) -> list[str]:
     for tok in re.findall(r"[a-z0-9_\-\.]+", query):
         if len(tok) < 3:
             continue
-        if tok in {"what", "where", "declared", "configured", "dependencies", "config"}:
+        if tok in {"what", "where", "declared", "configured", "dependencies", "config", "used"}:
             continue
         hints.append(tok)
     return hints
+
+
+def _path_tokens(path: str) -> list[str]:
+    return [tok for tok in re.split(r"[^a-z0-9]+", path.lower()) if tok]
+
+
+def _is_broad_query(query: str, hint_tokens: set[str]) -> bool:
+    if any(w in query for w in _BROAD_QUERY_WORDS):
+        return True
+    specific_markers = {"service", "module", "package", "feature", "payments", "orders", "auth", "chat", "worker"}
+    if any(m in query for m in specific_markers):
+        return False
+    return len(hint_tokens) <= 2
 
 
 def _rank_by_query_hints(paths: list[str], hints: list[str]) -> list[str]:
@@ -320,7 +337,7 @@ def _intent_source_priority(intent: str, query: str, source_type: str, basename:
         if source_type == "manifest":
             return 35
         if source_type in {"build_file", "dependency_file"}:
-            return 8 if not asks_dependency else 25
+            return -20 if not asks_dependency else 25
         return 0
     if basename in {"dockerfile", "docker-compose.yml"}:
         return 25

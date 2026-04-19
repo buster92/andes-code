@@ -12,6 +12,8 @@ from andes_cache.source_of_truth import (
     config_priority_files,
     expected_authority_candidates,
     rank_recovery_authoritative_paths,
+    rank_authoritative_paths,
+    select_best_authoritative_path,
     summarize_declared_permissions,
     missing_manifest_notice,
     classify_source_type,
@@ -114,6 +116,46 @@ class TestSourceOfTruthBehavior(unittest.TestCase):
         self.assertIn("package.json", ordered)
         self.assertIn("Dockerfile", ordered)
 
+    def test_broad_android_manifest_prefers_app_main_over_debug_and_tests(self):
+        manifests = [
+            "mobile/app/src/main/AndroidManifest.xml",
+            "mobile/app/src/debug/AndroidManifest.xml",
+            "mobile/lib/src/main/AndroidManifest.xml",
+            "mobile/app/src/androidTest/AndroidManifest.xml",
+        ]
+        ordered = rank_authoritative_paths(
+            manifests,
+            query="what permissions are used in the app",
+            intent="declaration_or_configuration",
+        )
+        self.assertEqual(ordered[0], "mobile/app/src/main/AndroidManifest.xml")
+
+    def test_module_specific_package_json_prefers_named_service(self):
+        paths = [
+            "services/payments/package.json",
+            "services/orders/package.json",
+            "packages/common/package.json",
+        ]
+        best = select_best_authoritative_path(
+            paths,
+            query="what dependencies does payments declare",
+            intent="dependency_or_build_inventory",
+        )
+        self.assertEqual(best, "services/payments/package.json")
+
+    def test_repo_wide_gradle_question_prefers_root_settings_file(self):
+        paths = [
+            "settings.gradle.kts",
+            "apps/mobile/build.gradle.kts",
+            "services/api/build.gradle.kts",
+        ]
+        best = select_best_authoritative_path(
+            paths,
+            query="what dependencies are declared repo-wide",
+            intent="dependency_or_build_inventory",
+        )
+        self.assertEqual(best, "settings.gradle.kts")
+
     def test_non_authoritative_candidates_are_filtered(self):
         manifests = [
             "service/build.gradle",
@@ -172,7 +214,7 @@ class TestSourceOfTruthBehavior(unittest.TestCase):
             config_files=[],
         )
         self.assertIn("mobile/app/src/main/AndroidManifest.xml", ordered)
-        self.assertIn("AndroidManifest.xml", ordered)
+        self.assertIn("androidmanifest.xml", ordered)
 
     def test_expected_authority_candidates_expand_non_android_dependency_files(self):
         manifests = ["services/api/pyproject.toml", "services/worker/requirements.txt", "frontend/package.json"]
@@ -356,6 +398,17 @@ class TestRouteIsolationAndFastPath(unittest.TestCase):
         src = Path("indexer.py").read_text()
         self.assertIn("def _fetch_exact_file(path: str, max_results: int = 60)", src)
         self.assertIn('exact = col.get(where={"file": path}, limit=max_results)', src)
+        self.assertIn('if doc and fallback["metadatas"][i].get("file", "") == path', src)
+
+    def test_exact_path_retrieval_keeps_line_metadata_and_ordering(self):
+        src = Path("indexer.py").read_text()
+        self.assertIn('"line": exact["metadatas"][i].get("line", 0)', src)
+        self.assertIn('chunks.sort(key=lambda c: int(c.get("line", 0) or 0))', src)
+
+    def test_fetch_all_from_file_avoids_mixing_duplicate_basenames(self):
+        src = Path("indexer.py").read_text()
+        self.assertIn("selected_path = select_best_authoritative_path(", src)
+        self.assertIn("chunks = candidates_by_file[selected_path]", src)
 
     def test_limitation_message_mentions_indexed_source_of_truth_candidates(self):
         src = Path("indexer.py").read_text()
