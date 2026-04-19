@@ -261,6 +261,14 @@ Run `python3 indexer.py /path/to/your/project` again. MD5 hashing ensures only c
 **How do I inspect cache behavior?**  
 See `docs/cache-debugging.md` for cache layout, metrics, and invalidation troubleshooting. You can run `python benchmark_cache.py` for cold vs warm cache instrumentation.
 
+**How do I enable structured retrieval debug mode?**  
+Debug mode is off by default. You can enable it via:
+- Environment variable: `ANDESCODE_DEBUG_MODE=1`
+- API flag: include `"debug_mode": true` in `/chat/completions` or `/v1/debug/explain`
+- Function parameter: `search(query, debug_mode=True)` in `indexer.py`
+
+When enabled, AndesCode emits a deterministic debug payload with intent, source-of-truth selection, retrieval/ranking decisions, and failure signals. The web UI shows it in a collapsible panel.
+
 **Is there a hosted version?**  
 No. That would defeat the purpose.
 
