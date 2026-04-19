@@ -1038,6 +1038,7 @@
           </div>
         </div>
         <div class="index-status" id="indexStatus"></div>
+        <div class="index-status" id="autoIndexStatus" style="font-size:10px;color:var(--text-dim);"></div>
         <div id="currentProject" style="display:none;margin-top:4px;">
           <div style="display:flex;align-items:center;justify-content:space-between;padding:7px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);">
             <span style="font-family:var(--font-mono);font-size:11px;color:var(--success);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" id="projectName"></span>
@@ -1213,6 +1214,21 @@ async function checkStatus() {
       }
     } else {
       text.textContent = 'online · not indexed';
+    }
+
+    const auto = d.auto_index || {};
+    const autoLine = document.getElementById('autoIndexStatus');
+    if (autoLine) {
+      const rootName = (auto.indexed_root || '').split('/').filter(Boolean).pop();
+      if (auto.watcher_enabled && auto.indexed_root) {
+        const pending = auto.pending_change_count || 0;
+        const state = auto.auto_index_in_progress ? 'indexing in background' : (auto.watcher_status || 'watching');
+        autoLine.textContent = `Auto-index: ${state}${rootName ? ` · ${rootName}` : ''}${pending ? ` · pending ${pending}` : ''}`;
+      } else if (auto.watcher_enabled) {
+        autoLine.textContent = 'Auto-index: idle';
+      } else {
+        autoLine.textContent = 'Auto-index: disabled';
+      }
     }
   } catch {
     dot.className    = 'status-dot error';
@@ -1504,6 +1520,11 @@ async function clearIndex() {
   input.disabled    = true;
   input.placeholder = 'Index a project first ⬆';
   btn.disabled      = true;
+  try {
+    await fetch(`${API}/v1/index/clear`, { method: 'POST' });
+  } catch (_) {}
+  const autoLine = document.getElementById('autoIndexStatus');
+  if (autoLine) autoLine.textContent = 'Auto-index: idle';
 
   showToast('Index cleared — select a new project to index', 'success');
 }
