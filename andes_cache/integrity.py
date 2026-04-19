@@ -109,6 +109,7 @@ def validate_authoritative_integrity(
     max_files: int = 24,
     validate_expected_chunks: bool = True,
 ) -> IntegrityReport:
+    """Legacy compatibility wrapper that maps boolean validation to mode-based validation."""
     mode = IntegrityValidationMode.NORMAL if validate_expected_chunks else IntegrityValidationMode.STARTUP_CHEAP
     return validate_authoritative_integrity_for_mode(
         mode=mode,
@@ -207,7 +208,8 @@ def lightweight_integrity_probe(
     - skips expensive expected-chunk recomputation
     - does not trigger repair
     """
-    report = validate_authoritative_integrity(
+    report = validate_authoritative_integrity_for_mode(
+        mode=IntegrityValidationMode.STARTUP_CHEAP,
         workspace=workspace,
         hash_state=hash_state,
         fetch_exact_file=fetch_exact_file,
@@ -216,7 +218,6 @@ def lightweight_integrity_probe(
         expected_chunk_count_lookup=None,
         candidate_paths=candidate_paths,
         max_files=max_files,
-        validate_expected_chunks=False,
     )
     warning_active = report.overall_status != INTEGRITY_HEALTHY
     failing = [f.path for f in report.files if f.status != INTEGRITY_HEALTHY]
