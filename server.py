@@ -162,6 +162,11 @@ def _load_indexer() -> bool:
         return False
 
 _load_indexer()
+if INDEXER_READY and _indexer_module:
+    try:
+        _indexer_module.run_startup_integrity_probe()
+    except Exception as e:
+        _print(f"  [2/4] ⚠  Integrity startup probe unavailable: {e}")
 _print(f"  [2/4] ✓ Embedding model ready" if INDEXER_READY
        else f"  [2/4] ⚠  Indexer unavailable")
 
@@ -326,8 +331,14 @@ def root():
         except Exception:
             pass
     auto_state = _auto_index_manager.status() if _auto_index_manager else {}
+    integrity_probe = {}
     with _auto_status_lock:
         auto_message = _auto_status_message
+    if INDEXER_READY and _indexer_module:
+        try:
+            integrity_probe = _indexer_module.get_startup_integrity_probe()
+        except Exception:
+            integrity_probe = {}
     return {
         "status":    "running",
         "product":   "AndesCode",
@@ -337,15 +348,22 @@ def root():
         "cache":     f"{CACHE_SIZE_GB:.0f}GB",
         "auto_index": auto_state,
         "auto_index_message": auto_message,
+        "integrity_probe": integrity_probe,
     }
 
 
 @app.get("/v1/index/state")
 def index_state():
     state = _auto_index_manager.status() if _auto_index_manager else {}
+    integrity_probe = {}
     with _auto_status_lock:
         message = _auto_status_message
-    return {**state, "status_message": message}
+    if INDEXER_READY and _indexer_module:
+        try:
+            integrity_probe = _indexer_module.get_startup_integrity_probe()
+        except Exception:
+            integrity_probe = {}
+    return {**state, "status_message": message, "integrity_probe": integrity_probe}
 
 
 @app.get("/v1/models")

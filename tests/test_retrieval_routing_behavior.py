@@ -21,6 +21,13 @@ from andes_cache.source_of_truth import (
     wants_runtime_usage,
 )
 from andes_cache.manager import AndesCacheManager
+from andes_cache.integrity import (
+    INTEGRITY_HEALTHY,
+    INTEGRITY_STALE,
+    FileIntegrityStatus,
+    IntegrityReport,
+    select_healthy_authoritative_path,
+)
 
 
 class TestIntentClassification(unittest.TestCase):
@@ -318,6 +325,60 @@ class TestSourceOfTruthBehavior(unittest.TestCase):
         )
         self.assertTrue(ranked)
         self.assertEqual(ranked[0], "services/api/package.json")
+
+    def test_android_multimodule_healthy_app_manifest_wins_after_integrity_gating(self):
+        paths = [
+            "android/app/src/main/AndroidManifest.xml",
+            "android/lib/src/main/AndroidManifest.xml",
+        ]
+        ranked = rank_authoritative_paths(
+            paths,
+            query="what permissions are declared for the app",
+            intent="declaration_or_configuration",
+        )
+
+        def validate(path: str):
+            if path == "android/app/src/main/AndroidManifest.xml":
+                return IntegrityReport(
+                    overall_status=INTEGRITY_HEALTHY,
+                    files=[FileIntegrityStatus(path=path, status=INTEGRITY_HEALTHY, reasons=[])],
+                )
+            return IntegrityReport(
+                overall_status=INTEGRITY_STALE,
+                files=[FileIntegrityStatus(path=path, status=INTEGRITY_STALE, reasons=["workspace_hash_mismatch"])],
+            )
+
+        selected, _attempts = select_healthy_authoritative_path(ranked, validate_path_fn=validate)
+        self.assertEqual(selected, "android/app/src/main/AndroidManifest.xml")
+
+    def test_android_multimodule_stale_lower_rank_does_not_block_app_build_file(self):
+        paths = [
+            "android/app/build.gradle.kts",
+            "android/feature/chat/build.gradle.kts",
+            "android/libs/common/build.gradle.kts",
+        ]
+        ranked = rank_authoritative_paths(
+            paths,
+            query="what dependencies are declared for app module",
+            intent="dependency_or_build_inventory",
+        )
+        calls = []
+
+        def validate(path: str):
+            calls.append(path)
+            if path == "android/app/build.gradle.kts":
+                return IntegrityReport(
+                    overall_status=INTEGRITY_HEALTHY,
+                    files=[FileIntegrityStatus(path=path, status=INTEGRITY_HEALTHY, reasons=[])],
+                )
+            return IntegrityReport(
+                overall_status=INTEGRITY_STALE,
+                files=[FileIntegrityStatus(path=path, status=INTEGRITY_STALE, reasons=["missing_on_disk"])],
+            )
+
+        selected, _attempts = select_healthy_authoritative_path(ranked, validate_path_fn=validate)
+        self.assertEqual(selected, "android/app/build.gradle.kts")
+        self.assertEqual(calls, ["android/app/build.gradle.kts"])
 
     def test_manifest_query_ranking_does_not_prefer_random_settings(self):
         manifests = ["mobile/AndroidManifest.xml", "mobile/settings/config.yml"]

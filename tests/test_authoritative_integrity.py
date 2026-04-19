@@ -11,6 +11,7 @@ from andes_cache.integrity import (
     REASON_REPAIR_FAILED,
     validate_authoritative_integrity,
     repair_authoritative_integrity,
+    lightweight_integrity_probe,
     prune_missing_on_disk_hashes,
     select_healthy_authoritative_path,
     IntegrityReport,
@@ -197,6 +198,20 @@ class TestAuthoritativeIntegrity(unittest.TestCase):
             sorted([REASON_EMBEDDED_NOT_RETRIEVABLE, REASON_MISSING_ON_DISK]),
         )
 
+    def test_lightweight_probe_surfaces_warning_without_expected_chunk_lookup(self):
+        workspace = {"manifests": ["app/build.gradle"], "config_graph": {"config_files": []}}
+
+        probe = lightweight_integrity_probe(
+            workspace=workspace,
+            hash_state={"app/build.gradle": "h"},
+            fetch_exact_file=lambda _p, _m: [],
+            file_hash_lookup=lambda _p: "h",
+            file_exists_lookup=lambda _p: True,
+        )
+
+        self.assertTrue(probe["warning_active"])
+        self.assertIn("results may be partial", probe["warning_message"].lower())
+
     def test_missing_file_cleanup_prunes_stale_hash_entry(self):
         report = IntegrityReport(
             overall_status=INTEGRITY_STALE,
@@ -279,6 +294,27 @@ class TestIntegrationGuardrails(unittest.TestCase):
             expected_chunk_count_lookup=lambda _p: 1,
         )
         self.assertEqual(report.overall_status, INTEGRITY_HEALTHY)
+
+    def test_incremental_delete_add_updates_integrity_deterministically(self):
+        workspace = {
+            "manifests": ["android/app/src/main/AndroidManifest.xml", "android/lib/src/main/AndroidManifest.xml"],
+            "config_graph": {"config_files": []},
+        }
+        fetch_map = {
+            "android/app/src/main/AndroidManifest.xml": [{"content": "<manifest/>", "line": 0, "file": "android/app/src/main/AndroidManifest.xml"}],
+            "android/lib/src/main/AndroidManifest.xml": [],
+        }
+        report = validate_authoritative_integrity(
+            workspace=workspace,
+            hash_state={"android/lib/src/main/AndroidManifest.xml": "old"},
+            fetch_exact_file=lambda p, _m: fetch_map.get(p, []),
+            file_hash_lookup=lambda p: None if p.endswith("lib/src/main/AndroidManifest.xml") else "new",
+            file_exists_lookup=lambda p: not p.endswith("lib/src/main/AndroidManifest.xml"),
+        )
+        by_path = {f.path: f for f in report.files}
+        self.assertEqual(by_path["android/app/src/main/AndroidManifest.xml"].status, INTEGRITY_STALE)
+        self.assertEqual(by_path["android/lib/src/main/AndroidManifest.xml"].status, INTEGRITY_STALE)
+        self.assertIn(REASON_MISSING_ON_DISK, by_path["android/lib/src/main/AndroidManifest.xml"].reasons)
 
 
 if __name__ == "__main__":
