@@ -91,6 +91,37 @@ class TestFileEditEngine(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual("File missing on disk", result.error)
 
+    def test_failure_when_old_content_is_ambiguous(self):
+        self.file_path.write_text(
+            "def greet():\n    return 'hello'\n\ndef greet_again():\n    return 'hello'\n",
+            encoding="utf-8",
+        )
+        self._write_hash_store(self.file_path)
+
+        edit = EditOperation(
+            file_path="src/main.py",
+            old_content="return 'hello'",
+            new_content="return 'updated'",
+        )
+        result = self.engine.apply_edit_operation(edit)
+
+        self.assertFalse(result.success)
+        self.assertEqual("old_content is ambiguous (multiple exact matches)", result.error)
+
+    def test_failure_when_path_escapes_repository_root(self):
+        outside = self.tmp / "outside.py"
+        outside.write_text("print('x')\n", encoding="utf-8")
+
+        edit = EditOperation(
+            file_path="../outside.py",
+            old_content="print('x')",
+            new_content="print('y')",
+        )
+        result = self.engine.apply_edit_operation(edit)
+
+        self.assertFalse(result.success)
+        self.assertEqual("Path escapes repository root", result.error)
+
 
 class TestDiffPreview(unittest.TestCase):
     def test_generates_unified_diff(self):

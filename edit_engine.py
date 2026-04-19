@@ -60,7 +60,25 @@ class FileEditEngine:
         hashes = self._load_hashes()
         root_path = self._repo_root(hashes)
         target_path = self._resolve_target_path(root_path, edit.file_path)
+        if target_path is None:
+            return self._fail(
+                edit.file_path,
+                exists=False,
+                indexed=False,
+                hash_match=False,
+                content_match=False,
+                message="Path escapes repository root",
+            )
         rel_path = self._relative_to_root(root_path, target_path)
+        if rel_path is None:
+            return self._fail(
+                edit.file_path,
+                exists=False,
+                indexed=False,
+                hash_match=False,
+                content_match=False,
+                message="Path escapes repository root",
+            )
 
         logging.info("[edit-apply] file=%s step=exists", rel_path)
         if not target_path.exists() or not target_path.is_file():
@@ -110,7 +128,7 @@ class FileEditEngine:
 
         if not self._reindex_file(root_path, rel_path):
             logging.error("[edit-apply] file=%s step=reindex status=failed", rel_path)
-            return ApplyResult(success=False, error="Edit applied but single-file re-index failed")
+            return ApplyResult(success=False, error="Edit applied but re-index failed — index may be inconsistent")
 
         logging.info("[edit-apply] file=%s status=success", rel_path)
         return ApplyResult(success=True, error=None)
@@ -142,14 +160,24 @@ class FileEditEngine:
             return Path(root).resolve()
         return Path.cwd().resolve()
 
-    def _resolve_target_path(self, root_path: Path, file_path: str) -> Path:
+    def _resolve_target_path(self, root_path: Path, file_path: str) -> Path | None:
         path = Path(file_path)
         if path.is_absolute():
-            return path.resolve()
-        return (root_path / path).resolve()
+            resolved = path.resolve()
+        else:
+            resolved = (root_path / path).resolve()
 
-    def _relative_to_root(self, root_path: Path, file_path: Path) -> str:
-        return str(file_path.relative_to(root_path))
+        try:
+            resolved.relative_to(root_path)
+            return resolved
+        except ValueError:
+            return None
+
+    def _relative_to_root(self, root_path: Path, file_path: Path) -> str | None:
+        try:
+            return str(file_path.relative_to(root_path))
+        except ValueError:
+            return None
 
     def _file_hash(self, path: Path) -> str:
         return hashlib.md5(path.read_bytes()).hexdigest()
