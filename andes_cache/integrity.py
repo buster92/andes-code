@@ -11,6 +11,7 @@ INTEGRITY_HEALTHY = "healthy"
 INTEGRITY_DEGRADED = "degraded"
 INTEGRITY_STALE = "stale"
 INTEGRITY_REPAIRING = "repairing"
+INTEGRITY_WARNING_PARTIAL_RESULTS = "Index incomplete — results may be partial"
 
 REASON_DISCOVERED_NOT_EMBEDDED = "discovered_not_embedded"
 REASON_EMBEDDED_NOT_RETRIEVABLE = "embedded_not_retrievable"
@@ -99,6 +100,7 @@ def validate_authoritative_integrity(
     expected_chunk_count_lookup: Callable[[str], int | None] | None = None,
     candidate_paths: list[str] | None = None,
     max_files: int = 24,
+    validate_expected_chunks: bool = True,
 ) -> IntegrityReport:
     paths = candidate_paths or authoritative_paths_from_workspace(workspace)
     statuses: list[FileIntegrityStatus] = []
@@ -122,7 +124,9 @@ def validate_authoritative_integrity(
 
         chunks = fetch_exact_file(path, 120)
         retrievable = bool(chunks)
-        expected_chunks = expected_chunk_count_lookup(path) if expected_chunk_count_lookup else None
+        expected_chunks = None
+        if validate_expected_chunks and expected_chunk_count_lookup:
+            expected_chunks = expected_chunk_count_lookup(path)
 
         ok_chunks, chunk_reasons = _assess_chunks(chunks, expected_chunks)
         if not ok_chunks and embedded:
@@ -152,6 +156,46 @@ def validate_authoritative_integrity(
         overall = INTEGRITY_DEGRADED
 
     return IntegrityReport(overall_status=overall, files=statuses)
+
+
+def lightweight_integrity_probe(
+    workspace: dict,
+    hash_state: dict,
+    fetch_exact_file: Callable[[str, int], list[dict]],
+    file_hash_lookup: Callable[[str], str | None] | None = None,
+    file_exists_lookup: Callable[[str], bool] | None = None,
+    candidate_paths: list[str] | None = None,
+    max_files: int = 6,
+) -> dict:
+    """
+    Cheap startup/open-time integrity signal.
+    - validates only a short ranked subset
+    - skips expensive expected-chunk recomputation
+    - does not trigger repair
+    """
+    report = validate_authoritative_integrity(
+        workspace=workspace,
+        hash_state=hash_state,
+        fetch_exact_file=fetch_exact_file,
+        file_hash_lookup=file_hash_lookup,
+        file_exists_lookup=file_exists_lookup,
+        expected_chunk_count_lookup=None,
+        candidate_paths=candidate_paths,
+        max_files=max_files,
+        validate_expected_chunks=False,
+    )
+    warning_active = report.overall_status != INTEGRITY_HEALTHY
+    failing = [f.path for f in report.files if f.status != INTEGRITY_HEALTHY]
+    reason_codes = sorted({r for f in report.files for r in f.reasons})
+    return {
+        "overall_status": report.overall_status,
+        "warning_active": warning_active,
+        "warning_message": INTEGRITY_WARNING_PARTIAL_RESULTS if warning_active else "",
+        "failing_paths": failing,
+        "reason_codes": reason_codes,
+        "checked_paths": [f.path for f in report.files],
+        "probe_mode": "lightweight",
+    }
 
 
 

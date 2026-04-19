@@ -42,6 +42,7 @@ from andes_cache.integrity import (
     repair_authoritative_integrity,
     select_healthy_authoritative_path,
     prune_missing_on_disk_hashes,
+    lightweight_integrity_probe,
 )
 from andes_cache.versions import (
     INDEX_VERSION,
@@ -71,9 +72,11 @@ SYMBOL_INDEX  = Path(__file__).parent / "index" / "symbol_index.json"
 WORKSPACE_INDEX = Path(__file__).parent / "index" / "workspace_index.json"
 INDEX_STATE = Path(__file__).parent / "index" / "index_state.json"
 INTEGRITY_STATE = Path(__file__).parent / "index" / "integrity_state.json"
+CHUNK_COUNT_STATE = Path(__file__).parent / "index" / "chunk_count_state.json"
 CACHE_DIR = Path(__file__).parent / "index" / "cache"
 CACHE = AndesCacheManager(CACHE_DIR)
 CURRENT_REPO_FINGERPRINT = ""
+STARTUP_INTEGRITY_PROBE: dict = {}
 EMBED_BATCH   = 64
 CHROMA_BATCH  = 4096
 CHUNK_LINES   = 80
@@ -236,6 +239,7 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
                 pass
         if previous_repo_fp:
             CACHE.invalidate_repo(previous_repo_fp, include_workspace=True)
+        _save_chunk_count_state({})
     elif decision["decision"] == DECISION_REBUILD_WORKSPACE_ONLY:
         for reason in decision["reasons"]:
             logging.info(reason)
@@ -317,6 +321,11 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
         # Nothing changed — still emit map event so UI can display it
         pmap = _load_project_map()
         _save_hashes(next_hashes | {"__root__": str(root_path), "__fingerprint__": repo_fp})
+        if removed_paths:
+            chunk_counts = _load_chunk_count_state()
+            for rel in removed_paths:
+                chunk_counts.pop(rel, None)
+            _save_chunk_count_state(chunk_counts)
         _validate_and_repair_authoritative_integrity(root_path)
         _save_index_state(_with_timestamp(current_state, "last_reused_at"))
         CACHE.flush_metrics()
@@ -380,6 +389,11 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
     for fp, fhash in new_files:
         hashes[str(fp.relative_to(root_path))] = fhash
     _save_hashes(next_hashes | {"__root__": str(root_path), "__fingerprint__": repo_fp})
+    chunk_counts = _load_chunk_count_state()
+    for rel in removed_paths:
+        chunk_counts.pop(rel, None)
+    chunk_counts.update({path: count for path, count in _chunk_counts_by_path(all_chunks).items()})
+    _save_chunk_count_state(chunk_counts)
 
     # ── Build project intelligence ────────────────────────────────────────────
     yield {"type": "mapping", "message": "Building project map..."}
@@ -1305,7 +1319,9 @@ def _retrieve_config_first(
         workspace.get("manifests", []),
         workspace.get("config_graph", {}).get("config_files", []),
     )
+    root_path_for_integrity = _repo_root_path_from_hashes()
     if debug_payload is not None:
+        startup_probe = get_startup_integrity_probe() or run_startup_integrity_probe(root_path_for_integrity)
         debug_payload["source_of_truth"]["priority_files"] = priority_files
         debug_payload["source_of_truth"]["ranked_paths_with_scores"] = [
             {"path": p, "score": score_authoritative_path(p, query, intent)}
@@ -1314,9 +1330,8 @@ def _retrieve_config_first(
         debug_payload["source_of_truth"]["selection_reason"] = ""
         debug_payload["source_of_truth"]["exact_path_used"] = ""
         debug_payload["source_of_truth"]["fallback_used"] = False
-        debug_payload["source_of_truth"]["integrity"] = {}
+        debug_payload["source_of_truth"]["integrity"] = {"startup_probe": startup_probe}
 
-    root_path_for_integrity = _repo_root_path_from_hashes()
     selected_healthy_path, integrity_attempts = select_healthy_authoritative_path(
         priority_files,
         validate_path_fn=lambda p: validate_authoritative_integrity(
@@ -1710,6 +1725,15 @@ def _add_coverage(chunks: list) -> list:
     return chunks
 
 
+def _chunk_counts_by_path(chunks: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    for chunk in chunks:
+        path = chunk.get("file", "")
+        if path:
+            counts[path] += 1
+    return dict(counts)
+
+
 def _camel_tokens(s: str) -> set:
     """Split camelCase/PascalCase/snake_case into component words."""
     parts = re.sub(r"([A-Z][a-z]+|[A-Z]+(?=[A-Z]|$))", r"_\1", s).lower()
@@ -2001,6 +2025,16 @@ def _repo_root_path_from_hashes() -> Path:
 
 
 def _expected_chunk_count_for_file(root_path: Path, rel_path: str) -> int | None:
+    cached = _load_chunk_count_state()
+    if rel_path in cached:
+        try:
+            return int(cached[rel_path])
+        except Exception:
+            pass
+    return None
+
+
+def _expected_chunk_count_for_file_deep(root_path: Path, rel_path: str) -> int | None:
     fp = root_path / rel_path
     if not fp.exists() or not fp.is_file():
         return None
@@ -2088,6 +2122,7 @@ def _repair_index_paths(root_path: Path, rel_paths: list[str]) -> bool:
 
     try:
         applied_paths = []
+        chunk_counts = _load_chunk_count_state()
         for prepared in prepared_paths:
             rel = prepared["path"]
             if prepared["new_ids"]:
@@ -2101,12 +2136,17 @@ def _repair_index_paths(root_path: Path, rel_paths: list[str]) -> bool:
             stale_ids = sorted(set(prepared["previous_ids"]) - set(prepared["new_ids"]))
             if stale_ids:
                 col.delete(ids=stale_ids)
+            if prepared["missing_on_disk"]:
+                chunk_counts.pop(rel, None)
+            else:
+                chunk_counts[rel] = len(prepared["new_ids"])
             applied_paths.append(prepared)
 
         next_hashes["__root__"] = str(root_path)
         if "__fingerprint__" not in next_hashes:
             next_hashes["__fingerprint__"] = get_repo_fingerprint()
         _save_hashes(next_hashes)
+        _save_chunk_count_state(chunk_counts)
         return True
     except Exception as e:
         logging.warning(f"Targeted integrity repair failed: {e}")
@@ -2128,6 +2168,28 @@ def _repair_index_paths(root_path: Path, rel_paths: list[str]) -> bool:
             except Exception as rollback_err:
                 logging.warning(f"Integrity rollback failed while restoring previous vectors for {prepared['path']}: {rollback_err}")
         return False
+
+
+def run_startup_integrity_probe(root_path: Path | None = None, max_files: int = 6) -> dict:
+    global STARTUP_INTEGRITY_PROBE
+    root_path = root_path or _repo_root_path_from_hashes()
+    workspace = _load_workspace_index()
+    hash_state = _load_hashes()
+
+    probe = lightweight_integrity_probe(
+        workspace=workspace,
+        hash_state=hash_state,
+        fetch_exact_file=_fetch_exact_file,
+        file_hash_lookup=lambda rel: _file_hash(root_path / rel) if (root_path / rel).exists() else None,
+        file_exists_lookup=lambda rel: (root_path / rel).exists() and (root_path / rel).is_file(),
+        max_files=max_files,
+    )
+    STARTUP_INTEGRITY_PROBE = probe
+    return probe
+
+
+def get_startup_integrity_probe() -> dict:
+    return dict(STARTUP_INTEGRITY_PROBE)
 
 
 def _validate_and_repair_authoritative_integrity(root_path: Path, candidate_paths: list[str] | None = None) -> dict:
@@ -2163,6 +2225,7 @@ def _validate_and_repair_authoritative_integrity(root_path: Path, candidate_path
 
     if report.overall_status == INTEGRITY_HEALTHY:
         _save_json(INTEGRITY_STATE, report.to_dict())
+        run_startup_integrity_probe(root_path=root_path)
         return report.to_dict()
 
     repaired = repair_authoritative_integrity(
@@ -2174,11 +2237,12 @@ def _validate_and_repair_authoritative_integrity(root_path: Path, candidate_path
             fetch_exact_file=_fetch_exact_file,
             file_hash_lookup=_file_hash_lookup,
             file_exists_lookup=_file_exists_lookup,
-            expected_chunk_count_lookup=lambda p: _expected_chunk_count_for_file(root_path, p),
+            expected_chunk_count_lookup=lambda p: _expected_chunk_count_for_file_deep(root_path, p),
             candidate_paths=paths,
         ),
     )
     _save_json(INTEGRITY_STATE, repaired.to_dict())
+    run_startup_integrity_probe(root_path=root_path)
     return repaired.to_dict()
 
 
@@ -2188,6 +2252,31 @@ def _save_hashes(hashes: dict) -> None:
         HASH_STORE.write_text(json.dumps(hashes))
     except Exception as e:
         logging.warning(f"Could not save hashes: {e}")
+
+
+def _load_chunk_count_state() -> dict:
+    try:
+        if CHUNK_COUNT_STATE.exists():
+            data = json.loads(CHUNK_COUNT_STATE.read_text())
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_chunk_count_state(state: dict[str, int]) -> None:
+    try:
+        CHUNK_COUNT_STATE.parent.mkdir(parents=True, exist_ok=True)
+        cleaned = {}
+        for path, count in state.items():
+            try:
+                cleaned[path] = int(count)
+            except Exception:
+                continue
+        CHUNK_COUNT_STATE.write_text(json.dumps(cleaned))
+    except Exception as e:
+        logging.warning(f"Could not save chunk count state: {e}")
 
 
 def _load_index_state() -> dict:

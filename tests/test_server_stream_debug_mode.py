@@ -147,6 +147,22 @@ class TestServerStreamingDebugMode(unittest.TestCase):
         self.assertTrue(debug_events)
         self.assertIn('"orchestration_path": "planned_context"', debug_events[-1])
 
+    def test_root_and_index_state_include_integrity_probe(self):
+        server = self.server
+        server.INDEXER_READY = True
+        server._indexer_module = types.SimpleNamespace(
+            col=types.SimpleNamespace(count=lambda: 3),
+            get_startup_integrity_probe=lambda: {
+                "warning_active": True,
+                "warning_message": "Index incomplete — results may be partial",
+            },
+        )
+        root = server.root()
+        state = server.index_state()
+        self.assertIn("integrity_probe", root)
+        self.assertTrue(root["integrity_probe"]["warning_active"])
+        self.assertIn("integrity_probe", state)
+
 
 if __name__ == "__main__":
     unittest.main()
