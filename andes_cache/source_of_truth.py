@@ -158,7 +158,7 @@ def score_authoritative_path(path: str, query: str, intent: str) -> int:
     base = path_l.rsplit("/", 1)[-1]
     tokens = _path_tokens(path_l)
     hint_tokens = set(_query_path_hints(q))
-    broad_query = _is_broad_query(q, hint_tokens)
+    broad_query = _is_broad_query(q, hint_tokens, set(tokens))
 
     score = 0
     source_type = classify_source_type(path_l)
@@ -293,7 +293,7 @@ def _path_tokens(path: str) -> list[str]:
     return [tok for tok in re.split(r"[^a-z0-9]+", path.lower()) if tok]
 
 
-def _is_broad_query(query: str, hint_tokens: set[str]) -> bool:
+def _is_broad_query(query: str, hint_tokens: set[str], discovered_path_tokens: set[str] | None = None) -> bool:
     q = query.lower()
     if any(w in q for w in _BROAD_QUERY_WORDS):
         return True
@@ -306,6 +306,12 @@ def _is_broad_query(query: str, hint_tokens: set[str]) -> bool:
     if "/" in q or "\\" in q:
         return False
     if any("." in tok for tok in hint_tokens):
+        return False
+
+    # Strong overlap between query hints and discovered path tokens implies specificity.
+    path_tokens = discovered_path_tokens or set()
+    overlap = len([h for h in hint_tokens if h in path_tokens])
+    if overlap >= 2 and overlap >= max(1, len(hint_tokens) // 2):
         return False
 
     # If query provides many specific hints, treat as focused.
