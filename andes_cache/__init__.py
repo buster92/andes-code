@@ -7,6 +7,10 @@ from .versions import (
     PARSER_VERSION,
     RETRIEVAL_POLICY_VERSION,
     PROMPT_TEMPLATE_VERSION,
+    WORKSPACE_SCHEMA_VERSION,
+    WORKSPACE_EXTRACTION_VERSION,
+    SOURCE_OF_TRUTH_VERSION,
+    MODULE_DETECTION_VERSION,
 )
 from .routing import (
     classify_query_intent,
@@ -27,6 +31,10 @@ __all__ = [
     "PARSER_VERSION",
     "RETRIEVAL_POLICY_VERSION",
     "PROMPT_TEMPLATE_VERSION",
+    "WORKSPACE_SCHEMA_VERSION",
+    "WORKSPACE_EXTRACTION_VERSION",
+    "SOURCE_OF_TRUTH_VERSION",
+    "MODULE_DETECTION_VERSION",
     "classify_query_intent",
     "retrieval_route_for_intent",
     "is_fast_path_intent",

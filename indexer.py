@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import sys
+from datetime import datetime, timezone
 from collections import defaultdict
 from pathlib import Path
 from typing import Generator
@@ -35,9 +36,13 @@ from andes_cache.source_of_truth import (
 )
 from andes_cache.versions import (
     INDEX_VERSION,
+    MODULE_DETECTION_VERSION,
     PARSER_VERSION,
     PROMPT_TEMPLATE_VERSION,
     RETRIEVAL_POLICY_VERSION,
+    SOURCE_OF_TRUTH_VERSION,
+    WORKSPACE_EXTRACTION_VERSION,
+    WORKSPACE_SCHEMA_VERSION,
 )
 from andes_cache.debug import (
     resolve_debug_mode,
@@ -55,6 +60,7 @@ HASH_STORE    = Path(__file__).parent / "index" / ".file_hashes.json"
 PROJECT_MAP   = Path(__file__).parent / "index" / "project_map.json"
 SYMBOL_INDEX  = Path(__file__).parent / "index" / "symbol_index.json"
 WORKSPACE_INDEX = Path(__file__).parent / "index" / "workspace_index.json"
+INDEX_STATE = Path(__file__).parent / "index" / "index_state.json"
 CACHE_DIR = Path(__file__).parent / "index" / "cache"
 CACHE = AndesCacheManager(CACHE_DIR)
 CURRENT_REPO_FINGERPRINT = ""
@@ -62,6 +68,11 @@ EMBED_BATCH   = 64
 CHROMA_BATCH  = 4096
 CHUNK_LINES   = 80
 CHUNK_OVERLAP = 15
+
+DECISION_REUSE_ALL = "reuse_all"
+DECISION_REBUILD_WORKSPACE_ONLY = "rebuild_workspace_only"
+DECISION_INCREMENTAL_REINDEX = "incremental_reindex"
+DECISION_FULL_REBUILD = "full_rebuild"
 
 # ── Language boundary patterns ────────────────────────────────────────────────
 _BOUNDARY = {
@@ -136,30 +147,9 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
         yield {"type": "error", "message": f"Path not found: {root_path}"}
         return
 
-    # ── Hash cache / project change detection ─────────────────────────────────
-    hashes = _load_hashes()
-    is_same_project = hashes.get("__root__") == str(root_path)
-    previous_repo_fp = hashes.get("__fingerprint__", "")
-
-    if not is_same_project:
-        try:
-            chroma.delete_collection(COLLECTION)
-        except Exception:
-            pass
-        col    = chroma.get_or_create_collection(COLLECTION)
-        hashes = {"__root__": str(root_path)}
-        # Clear old maps
-        for f in [PROJECT_MAP, SYMBOL_INDEX, WORKSPACE_INDEX]:
-            try:
-                f.unlink()
-            except Exception:
-                pass
-        if previous_repo_fp:
-            CACHE.invalidate_repo(previous_repo_fp, include_workspace=True)
-
-    yield {"type": "clear"}
-
     # ── Collect and diff ──────────────────────────────────────────────────────
+    hashes = _load_hashes()
+    previous_repo_fp = hashes.get("__fingerprint__", "")
     all_files = _collect_files(root_path)
     new_files, unchanged = [], []
     changed_rel_paths = []
@@ -177,16 +167,7 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
     current_files = {str(fp.relative_to(root_path)) for fp in all_files}
     removed_paths = sorted(known_files - current_files)
 
-    # File deletions can leave stale vector records. Force a safe full rebuild.
-    if removed_paths:
-        try:
-            chroma.delete_collection(COLLECTION)
-        except Exception:
-            pass
-        col = chroma.get_or_create_collection(COLLECTION)
-        new_files = [(fp, _file_hash(fp)) for fp in all_files]
-        changed_rel_paths = [str(fp.relative_to(root_path)) for fp, _ in new_files] + removed_paths
-        unchanged = []
+    repo_changed = bool(new_files or removed_paths)
 
     # Recompute repo fingerprint from the current filesystem snapshot.
     next_hashes = {"__root__": str(root_path)}
@@ -208,6 +189,53 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
         retrieval_policy_version=RETRIEVAL_POLICY_VERSION,
     )
     _set_repo_fingerprint(repo_fp)
+    current_state = _build_current_index_state(root_path, repo_fp)
+    stored_state = _load_index_state()
+    decision = evaluate_index_state(current_state, stored_state, repo_changed=repo_changed)
+    if removed_paths and decision["decision"] != DECISION_FULL_REBUILD:
+        decision = {
+            "decision": DECISION_FULL_REBUILD,
+            "reasons": ["Detected removed files; performing full rebuild to avoid stale vectors"],
+        }
+
+    if decision["decision"] == DECISION_FULL_REBUILD:
+        for reason in decision["reasons"]:
+            logging.info(reason)
+            yield {"type": "decision", "level": DECISION_FULL_REBUILD, "message": reason}
+        yield {"type": "clear"}
+        try:
+            chroma.delete_collection(COLLECTION)
+        except Exception:
+            pass
+        col = chroma.get_or_create_collection(COLLECTION)
+        hashes = {"__root__": str(root_path)}
+        new_files = [(fp, _file_hash(fp)) for fp in all_files]
+        changed_rel_paths = [str(fp.relative_to(root_path)) for fp, _ in new_files] + removed_paths
+        unchanged = []
+        for f in [PROJECT_MAP, SYMBOL_INDEX, WORKSPACE_INDEX]:
+            try:
+                f.unlink()
+            except Exception:
+                pass
+        if previous_repo_fp:
+            CACHE.invalidate_repo(previous_repo_fp, include_workspace=True)
+    elif decision["decision"] == DECISION_REBUILD_WORKSPACE_ONLY:
+        for reason in decision["reasons"]:
+            logging.info(reason)
+            yield {"type": "decision", "level": DECISION_REBUILD_WORKSPACE_ONLY, "message": reason}
+        yield {"type": "clear"}
+        CACHE.invalidate_workspace_for_repo(repo_fp)
+        CACHE.invalidate_repo(repo_fp, include_workspace=False)
+    elif decision["decision"] == DECISION_INCREMENTAL_REINDEX:
+        for reason in decision["reasons"]:
+            logging.info(reason)
+            yield {"type": "decision", "level": DECISION_INCREMENTAL_REINDEX, "message": reason}
+        yield {"type": "clear"}
+    else:
+        for reason in decision["reasons"]:
+            logging.info(reason)
+            yield {"type": "decision", "level": DECISION_REUSE_ALL, "message": reason}
+        yield {"type": "clear"}
 
     yield {
         "type": "scan", "files": len(all_files),
@@ -218,9 +246,55 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
         yield {"type": "error", "message": "No source files found in that directory"}
         return
 
+    if decision["decision"] == DECISION_REBUILD_WORKSPACE_ONLY:
+        yield {"type": "mapping", "message": "Rebuilding workspace metadata only..."}
+        # Use the full current filesystem snapshot, not just "unchanged" files.
+        # Older index logic may have produced an incomplete indexed set; workspace-only
+        # rebuilds must apply current detection/extraction logic to all files without
+        # forcing re-embedding or vector-store writes.
+        all_indexed = all_files
+        workspace_chunks = []
+        for fp in all_indexed:
+            try:
+                workspace_chunks.extend(_chunk_file(fp, root_path))
+            except Exception as e:
+                logging.warning(f"Skipped {fp} while rebuilding workspace metadata: {e}")
+        workspace = build_workspace_index(
+            root_path,
+            all_indexed,
+            workspace_chunks,
+            repo_fingerprint=repo_fp,
+            changed_paths=changed_rel_paths,
+            force_refresh=True,
+        )
+        pmap = build_project_map(root_path, all_indexed, workspace_chunks, workspace)
+        symidx = build_symbol_index(workspace_chunks)
+        _save_json(PROJECT_MAP, pmap)
+        _save_json(SYMBOL_INDEX, symidx)
+        _save_json(WORKSPACE_INDEX, workspace)
+        CACHE.workspace_set(repo_fp, "symbol_index", symidx)
+        _save_hashes(next_hashes | {"__root__": str(root_path), "__fingerprint__": repo_fp})
+        _save_index_state(_with_timestamp(current_state, "workspace_rebuilt_at"))
+        CACHE.flush_metrics()
+        yield {
+            "type": "done",
+            "indexed": len(all_indexed),
+            "chunks": col.count(),
+            "project": root_path.name,
+            "new": 0,
+            "reused": len(unchanged),
+            "map": pmap,
+            "repo_fingerprint": repo_fp,
+            "decision": DECISION_REBUILD_WORKSPACE_ONLY,
+            "workspace_rebuild_scope": "all_files",
+        }
+        return
+
     if not new_files and unchanged:
         # Nothing changed — still emit map event so UI can display it
         pmap = _load_project_map()
+        _save_hashes(next_hashes | {"__root__": str(root_path), "__fingerprint__": repo_fp})
+        _save_index_state(_with_timestamp(current_state, "last_reused_at"))
         CACHE.flush_metrics()
         yield {
             "type": "done", "indexed": len(unchanged),
@@ -228,6 +302,7 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
             "new": 0, "reused": len(unchanged),
             "map": pmap,
             "repo_fingerprint": repo_fp,
+            "decision": DECISION_REUSE_ALL,
         }
         return
 
@@ -280,9 +355,7 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
 
     for fp, fhash in new_files:
         hashes[str(fp.relative_to(root_path))] = fhash
-    hashes["__root__"] = str(root_path)
-    hashes["__fingerprint__"] = repo_fp
-    _save_hashes(hashes)
+    _save_hashes(next_hashes | {"__root__": str(root_path), "__fingerprint__": repo_fp})
 
     # ── Build project intelligence ────────────────────────────────────────────
     yield {"type": "mapping", "message": "Building project map..."}
@@ -302,6 +375,7 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
     _save_json(SYMBOL_INDEX, symidx)
     _save_json(WORKSPACE_INDEX, workspace)
     CACHE.workspace_set(repo_fp, "symbol_index", symidx)
+    _save_index_state(_with_timestamp(current_state, "last_indexed_at"))
     CACHE.flush_metrics()
 
     yield {
@@ -313,6 +387,7 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
         "reused":  len(unchanged),
         "map":     pmap,
         "repo_fingerprint": repo_fp,
+        "decision": DECISION_INCREMENTAL_REINDEX if repo_changed else DECISION_REUSE_ALL,
     }
 
 
@@ -775,6 +850,7 @@ def build_workspace_index(
     chunks: list,
     repo_fingerprint: str = "",
     changed_paths: list[str] | None = None,
+    force_refresh: bool = False,
 ) -> dict:
     """
     Build structure-first workspace intelligence for dependency/config analysis.
@@ -784,38 +860,38 @@ def build_workspace_index(
     changed_paths = changed_paths or []
     repo_fp = repo_fingerprint or get_repo_fingerprint()
 
-    cached_manifests = CACHE.workspace_get(repo_fp, "manifests")
+    cached_manifests = None if force_refresh else CACHE.workspace_get(repo_fp, "manifests")
     manifests = cached_manifests if cached_manifests is not None else _discover_manifests(root_path)
     CACHE.workspace_set(repo_fp, "manifests", manifests)
 
-    cached_modules = CACHE.workspace_get(repo_fp, "module_graph")
+    cached_modules = None if force_refresh else CACHE.workspace_get(repo_fp, "module_graph")
     modules = cached_modules if cached_modules is not None else _discover_modules(root_path, files)
     CACHE.workspace_set(repo_fp, "module_graph", modules)
 
     has_manifest_change = any(Path(p).name in MANIFEST_FILES for p in changed_paths)
     has_code_change = any(Path(p).suffix in SUPPORTED_EXTENSIONS for p in changed_paths)
 
-    dependencies = CACHE.workspace_get(repo_fp, "dependency_inventory")
+    dependencies = None if force_refresh else CACHE.workspace_get(repo_fp, "dependency_inventory")
     if dependencies is None or has_manifest_change:
         dependencies = _collect_declared_dependencies(root_path, manifests)
         CACHE.workspace_set(repo_fp, "dependency_inventory", dependencies)
 
-    import_graph = CACHE.workspace_get(repo_fp, "import_graph")
+    import_graph = None if force_refresh else CACHE.workspace_get(repo_fp, "import_graph")
     if import_graph is None or has_code_change:
         import_graph = _build_import_graph(files, root_path)
         CACHE.workspace_set(repo_fp, "import_graph", import_graph)
 
-    config_graph = CACHE.workspace_get(repo_fp, "config_graph")
+    config_graph = None if force_refresh else CACHE.workspace_get(repo_fp, "config_graph")
     if config_graph is None or has_manifest_change:
         config_graph = _build_config_graph(root_path, manifests)
         CACHE.workspace_set(repo_fp, "config_graph", config_graph)
 
-    entry_points = CACHE.workspace_get(repo_fp, "entry_points")
+    entry_points = None if force_refresh else CACHE.workspace_get(repo_fp, "entry_points")
     if entry_points is None or has_code_change:
         entry_points = _discover_entry_points(root_path, files)
         CACHE.workspace_set(repo_fp, "entry_points", entry_points)
 
-    file_to_module = CACHE.workspace_get(repo_fp, "file_to_module_map")
+    file_to_module = None if force_refresh else CACHE.workspace_get(repo_fp, "file_to_module_map")
     if file_to_module is None or has_code_change:
         file_to_module = _build_file_to_module_map(root_path, files)
         CACHE.workspace_set(repo_fp, "file_to_module_map", file_to_module)
@@ -1572,6 +1648,80 @@ def _rerank(query: str, candidates: list, track_reasons: bool = False) -> list:
     return sorted(candidates, key=lambda x: x["_rank"], reverse=True)
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _with_timestamp(state: dict, field: str) -> dict:
+    out = dict(state)
+    timestamps = dict(out.get("timestamps", {}))
+    timestamps[field] = _utc_now_iso()
+    out["timestamps"] = timestamps
+    return out
+
+
+def _build_current_index_state(root_path: Path, repo_fp: str) -> dict:
+    return {
+        "repo_root": str(root_path),
+        "repo_fingerprint": repo_fp,
+        "index_version": INDEX_VERSION,
+        "parser_version": PARSER_VERSION,
+        "prompt_template_version": PROMPT_TEMPLATE_VERSION,
+        "retrieval_policy_version": RETRIEVAL_POLICY_VERSION,
+        "workspace_schema_version": WORKSPACE_SCHEMA_VERSION,
+        "workspace_extraction_version": WORKSPACE_EXTRACTION_VERSION,
+        "source_of_truth_version": SOURCE_OF_TRUTH_VERSION,
+        "module_detection_version": MODULE_DETECTION_VERSION,
+        "timestamps": {"evaluated_at": _utc_now_iso()},
+    }
+
+
+def evaluate_index_state(current_state: dict, stored_state: dict | None, repo_changed: bool) -> dict:
+    if not stored_state:
+        return {
+            "decision": DECISION_FULL_REBUILD,
+            "reasons": ["Stored index state missing or unreadable; performing safe full rebuild"],
+        }
+
+    if stored_state.get("repo_root") != current_state.get("repo_root"):
+        return {
+            "decision": DECISION_FULL_REBUILD,
+            "reasons": ["Repository root changed; performing full rebuild"],
+        }
+
+    for field in ("index_version", "parser_version"):
+        if stored_state.get(field) != current_state.get(field):
+            return {
+                "decision": DECISION_FULL_REBUILD,
+                "reasons": [f"{field.replace('_', ' ').capitalize()} changed; performing full rebuild"],
+            }
+
+    workspace_only_fields = (
+        ("workspace_schema_version", "Workspace schema version changed; rebuilding workspace metadata"),
+        ("workspace_extraction_version", "Workspace extraction version changed; rebuilding workspace metadata"),
+        ("source_of_truth_version", "Source-of-truth version changed; refreshing authoritative file map"),
+        ("module_detection_version", "Module detection version changed; rebuilding workspace metadata"),
+    )
+    workspace_reasons = [
+        reason
+        for field, reason in workspace_only_fields
+        if stored_state.get(field) != current_state.get(field)
+    ]
+    if workspace_reasons:
+        return {"decision": DECISION_REBUILD_WORKSPACE_ONLY, "reasons": workspace_reasons}
+
+    if repo_changed:
+        return {
+            "decision": DECISION_INCREMENTAL_REINDEX,
+            "reasons": ["Detected changed files; running incremental reindex"],
+        }
+
+    return {
+        "decision": DECISION_REUSE_ALL,
+        "reasons": ["Index state compatible and repository unchanged; reusing all artifacts"],
+    }
+
+
 def _collect_files(root: Path) -> list:
     files = []
     for fp in root.rglob("*"):
@@ -1702,6 +1852,23 @@ def _save_hashes(hashes: dict) -> None:
         HASH_STORE.write_text(json.dumps(hashes))
     except Exception as e:
         logging.warning(f"Could not save hashes: {e}")
+
+
+def _load_index_state() -> dict:
+    try:
+        if INDEX_STATE.exists():
+            return json.loads(INDEX_STATE.read_text())
+    except Exception as e:
+        logging.warning(f"Could not load index state; forcing rebuild: {e}")
+    return {}
+
+
+def _save_index_state(state: dict) -> None:
+    try:
+        INDEX_STATE.parent.mkdir(parents=True, exist_ok=True)
+        INDEX_STATE.write_text(json.dumps(state, indent=2))
+    except Exception as e:
+        logging.warning(f"Could not save index state: {e}")
 
 
 def _load_json(path: Path) -> dict:
