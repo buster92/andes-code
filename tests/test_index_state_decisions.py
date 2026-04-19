@@ -193,6 +193,44 @@ class TestIndexStateDecisions(unittest.TestCase):
             self.indexer.evaluate_index_state = original_eval
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_authoritative_discovery_finds_deep_nested_files_and_respects_skip_dirs(self):
+        tmp = Path(tempfile.mkdtemp(dir=Path.cwd()))
+        try:
+            # Nested multi-module / monorepo-like structure.
+            (tmp / "android" / "app" / "src" / "main").mkdir(parents=True, exist_ok=True)
+            (tmp / "android" / "feature" / "payments").mkdir(parents=True, exist_ok=True)
+            (tmp / "services" / "api").mkdir(parents=True, exist_ok=True)
+            (tmp / "packages" / "python-core").mkdir(parents=True, exist_ok=True)
+            (tmp / "apps" / "mobile").mkdir(parents=True, exist_ok=True)
+            (tmp / "node_modules" / "left-pad").mkdir(parents=True, exist_ok=True)
+            (tmp / ".git" / "hooks").mkdir(parents=True, exist_ok=True)
+
+            (tmp / "android" / "app" / "src" / "main" / "AndroidManifest.xml").write_text("<manifest/>")
+            (tmp / "android" / "feature" / "payments" / "build.gradle.kts").write_text("plugins {}\n")
+            (tmp / "android" / "settings.gradle.kts").write_text("rootProject.name = \"android\"\n")
+            (tmp / "services" / "api" / "package.json").write_text("{\"name\": \"api\"}\n")
+            (tmp / "packages" / "python-core" / "pyproject.toml").write_text("[project]\nname='core'\n")
+            (tmp / "apps" / "mobile" / "settings.gradle.kts").write_text("include(\":app\")\n")
+
+            # Should be skipped due to skip dirs.
+            (tmp / "node_modules" / "left-pad" / "package.json").write_text("{\"name\": \"left-pad\"}\n")
+            (tmp / ".git" / "hooks" / "package.json").write_text("{\"name\": \"hook\"}\n")
+
+            manifests = self.indexer._discover_manifests(tmp)
+
+            self.assertIn("android/app/src/main/AndroidManifest.xml", manifests)
+            self.assertIn("android/feature/payments/build.gradle.kts", manifests)
+            self.assertIn("android/settings.gradle.kts", manifests)
+            self.assertIn("apps/mobile/settings.gradle.kts", manifests)
+            self.assertIn("services/api/package.json", manifests)
+            self.assertIn("packages/python-core/pyproject.toml", manifests)
+
+            self.assertNotIn("node_modules/left-pad/package.json", manifests)
+            self.assertNotIn(".git/hooks/package.json", manifests)
+            self.assertNotIn("package.json", manifests)  # ensure relative nested paths are preserved
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

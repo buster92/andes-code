@@ -103,6 +103,13 @@ MANIFEST_FILES = {
     "Podfile", "Package.swift", "AndroidManifest.xml", "Dockerfile", "docker-compose.yml",
 }
 
+# Canonical authoritative file discovery patterns.
+# Keep this easy to extend as new ecosystems/build systems are added.
+AUTHORITATIVE_FILE_PATTERNS = [
+    # Basenames from MANIFEST_FILES (supports both root and nested discovery).
+    *[f"**/{name}" for name in sorted(MANIFEST_FILES)],
+]
+
 SKIP_DIRS = {
     ".git", ".svn", ".hg",
     "node_modules", ".next", ".nuxt", "dist", "build",
@@ -1037,20 +1044,20 @@ def _load_workspace_index() -> dict:
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
 def _discover_manifests(root_path: Path) -> list[str]:
-    manifests = []
-    for mf in MANIFEST_FILES:
-        if (root_path / mf).exists():
-            manifests.append(mf)
+    """
+    Discover authoritative project files (manifests/build/config declarations).
 
-    # common nested manifests in multi-module repos
-    for pattern in ("**/package.json", "**/go.mod", "**/Cargo.toml", "**/pom.xml", "**/build.gradle"):
+    Backward-compatible: returned values continue to populate workspace["manifests"].
+    """
+    authoritative_files = set()
+    for pattern in AUTHORITATIVE_FILE_PATTERNS:
         for p in root_path.glob(pattern):
-            if any(s in p.parts for s in SKIP_DIRS):
+            if not p.is_file():
                 continue
-            rel = str(p.relative_to(root_path))
-            if rel not in manifests:
-                manifests.append(rel)
-    return sorted(manifests)
+            if any(part in SKIP_DIRS for part in p.parts):
+                continue
+            authoritative_files.add(str(p.relative_to(root_path)))
+    return sorted(authoritative_files)
 
 
 def _detect_repo_types(manifests: list[str]) -> list[str]:
