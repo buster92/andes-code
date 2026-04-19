@@ -46,6 +46,7 @@ AndesCode is built for developers who work with client code under NDA, operate i
 - 🔎 **Smart retrieval** — two-step planning (model selects relevant files first), query routing by filename/symbol/intent, and 4-axis re-ranking
 - 🧱 **Multi-layer caching** — repo-fingerprint-scoped workspace/retrieval/neighborhood/prompt-prefix/patch-plan caches with strict invalidation
 - 📌 **Deterministic routing for repo questions** — config/dependency/manifest questions use a source-of-truth config-first path before inferred code usage
+- 🛠️ **Safe edit/apply primitive (v1)** — deterministic single-file exact-match edits with hash stale-context protection and unified diff preview
 - ⚠️ **Coverage warnings** — the model is told when it has a partial view of a file, so it never pretends to have context it doesn't
 - 🔒 **Local inference** — offline flags enforced at OS level before any library loads; your code never leaves the machine
 - ⚡ **Fast** — KV cache warm-up on startup, 30–40 tokens/second on Apple Silicon, streaming responses
@@ -125,6 +126,43 @@ Streams to the UI with timing metadata
         ↓
 Everything logged locally. Code never uploaded.
 ```
+
+
+## Safe Edit/Apply (v1)
+
+AndesCode includes a minimal, deterministic file edit primitive for controlled code updates.
+
+### Edit model
+
+```python
+EditOperation(
+  file_path="src/example.py",
+  old_content="return old_value",
+  new_content="return new_value",
+)
+```
+
+### Safety guarantees
+
+- Exact-match only: `old_content` must match exactly in the target file.
+- No fuzzy matching or fallback behavior.
+- Stale-context protection: apply is blocked when on-disk file hash differs from indexed hash.
+- Writes are blocked when the file is missing or not indexed.
+- Successful writes trigger single-file re-index only (no full rebuild).
+
+### Diff preview
+
+Use unified diff preview before apply:
+
+```python
+generate_diff_preview(old_text, new_text, file_path="src/example.py")
+```
+
+### v1 limitations
+
+- Single-file operations only.
+- One exact match required for deterministic replacement.
+- No autonomous planning or multi-file orchestration.
 
 ---
 
