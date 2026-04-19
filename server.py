@@ -182,6 +182,22 @@ def _set_auto_status(message: str) -> None:
     audit.info(f"AUTO_INDEX | {message}")
 
 
+def _read_integrity_probe_from_indexer() -> dict:
+    """
+    Optional startup visibility helper.
+    Keeps endpoint behavior testable even when the indexer is partially stubbed.
+    """
+    if not (INDEXER_READY and _indexer_module):
+        return {}
+    getter = getattr(_indexer_module, "get_startup_integrity_probe", None)
+    if not callable(getter):
+        return {}
+    try:
+        return getter() or {}
+    except Exception:
+        return {}
+
+
 def _snapshot_relevant_files(root_path: Path) -> dict[str, str]:
     if not _indexer_module:
         return {}
@@ -334,11 +350,7 @@ def root():
     integrity_probe = {}
     with _auto_status_lock:
         auto_message = _auto_status_message
-    if INDEXER_READY and _indexer_module:
-        try:
-            integrity_probe = _indexer_module.get_startup_integrity_probe()
-        except Exception:
-            integrity_probe = {}
+    integrity_probe = _read_integrity_probe_from_indexer()
     return {
         "status":    "running",
         "product":   "AndesCode",
@@ -358,11 +370,7 @@ def index_state():
     integrity_probe = {}
     with _auto_status_lock:
         message = _auto_status_message
-    if INDEXER_READY and _indexer_module:
-        try:
-            integrity_probe = _indexer_module.get_startup_integrity_probe()
-        except Exception:
-            integrity_probe = {}
+    integrity_probe = _read_integrity_probe_from_indexer()
     return {**state, "status_message": message, "integrity_probe": integrity_probe}
 
 
