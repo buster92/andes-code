@@ -214,7 +214,22 @@ class TestSourceOfTruthBehavior(unittest.TestCase):
             config_files=[],
         )
         self.assertIn("mobile/app/src/main/AndroidManifest.xml", ordered)
-        self.assertIn("androidmanifest.xml", ordered)
+        self.assertIn("AndroidManifest.xml", ordered)
+
+    def test_rank_authoritative_paths_returns_deterministic_list_for_weak_scores(self):
+        paths = [
+            "docs/notes.txt",
+            "tmp/random.data",
+            "misc/untyped.file",
+        ]
+        ranked = rank_authoritative_paths(
+            paths,
+            query="where is this configured",
+            intent="declaration_or_configuration",
+        )
+        self.assertEqual(len(ranked), 3)
+        self.assertEqual(sorted(ranked), sorted(paths))
+        self.assertEqual(ranked, rank_authoritative_paths(paths, query="where is this configured", intent="declaration_or_configuration"))
 
     def test_expected_authority_candidates_expand_non_android_dependency_files(self):
         manifests = ["services/api/pyproject.toml", "services/worker/requirements.txt", "frontend/package.json"]

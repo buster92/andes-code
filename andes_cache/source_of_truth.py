@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 AUTHORITATIVE_NAME_HINTS = [
+    "AndroidManifest.xml",
     "androidmanifest.xml",
     "manifest",
     "build.gradle",
@@ -191,7 +192,7 @@ def rank_authoritative_paths(paths: list[str], query: str, intent: str) -> list[
         score = score_authoritative_path(p, query, intent)
         scored.append((score, -p.count("/"), p))
     scored.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
-    return [p for s, _, p in scored if s > 0]
+    return [p for _, _, p in scored]
 
 
 def select_best_authoritative_path(paths: list[str], query: str, intent: str) -> str:
@@ -293,11 +294,26 @@ def _path_tokens(path: str) -> list[str]:
 
 
 def _is_broad_query(query: str, hint_tokens: set[str]) -> bool:
-    if any(w in query for w in _BROAD_QUERY_WORDS):
+    q = query.lower()
+    if any(w in q for w in _BROAD_QUERY_WORDS):
         return True
-    specific_markers = {"service", "module", "package", "feature", "payments", "orders", "auth", "chat", "worker"}
-    if any(m in query for m in specific_markers):
+
+    # Explicit target scope generally indicates module/service-specific intent.
+    if any(m in q for m in {"service", "module", "package", "feature"}):
         return False
+
+    # Path-like or file-like hints imply specificity.
+    if "/" in q or "\\" in q:
+        return False
+    if any("." in tok for tok in hint_tokens):
+        return False
+
+    # If query provides many specific hints, treat as focused.
+    specific_hints = [t for t in hint_tokens if len(t) >= 4 and t not in _BROAD_QUERY_WORDS]
+    if len(specific_hints) >= 3:
+        return False
+
+    # Few hints with no explicit target markers defaults to broad.
     return len(hint_tokens) <= 2
 
 

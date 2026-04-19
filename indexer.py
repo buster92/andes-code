@@ -1584,6 +1584,7 @@ def _fetch_all_from_file(filename: str, query: str = "", intent: str = "", max_r
             )
         if not candidates_by_file:
             return []
+        # Duplicate basenames are resolved deterministically to one concrete path.
         selected_path = select_best_authoritative_path(list(candidates_by_file.keys()), query, intent)
         if not selected_path:
             selected_path = sorted(candidates_by_file.keys(), key=lambda p: (p.count("/"), p))[0]
