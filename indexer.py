@@ -2250,8 +2250,14 @@ def get_startup_integrity_probe() -> dict:
     current_root = _repo_root_path_from_hashes()
     if INTEGRITY_RUNTIME_STATE.startup_probe:
         if not _is_same_root(current_root):
+            INTEGRITY_RUNTIME_STATE.startup_probe = {}
+            INTEGRITY_RUNTIME_STATE.owner_root = ""
+            INTEGRITY_RUNTIME_STATE.refreshed_at = ""
             return {}
         if not _is_startup_probe_fresh(INTEGRITY_RUNTIME_STATE.refreshed_at):
+            INTEGRITY_RUNTIME_STATE.startup_probe = {}
+            INTEGRITY_RUNTIME_STATE.owner_root = ""
+            INTEGRITY_RUNTIME_STATE.refreshed_at = ""
             return {}
         return dict(INTEGRITY_RUNTIME_STATE.startup_probe)
     persisted = _load_integrity_state()

@@ -282,6 +282,27 @@ class TestIndexStateDecisions(unittest.TestCase):
             )
             self.indexer._repo_root_path_from_hashes = lambda: Path("/tmp/repo")
             self.assertEqual(self.indexer.get_startup_integrity_probe(), {})
+            self.assertEqual(self.indexer.INTEGRITY_RUNTIME_STATE.startup_probe, {})
+            self.assertEqual(self.indexer.INTEGRITY_RUNTIME_STATE.owner_root, "")
+            self.assertEqual(self.indexer.INTEGRITY_RUNTIME_STATE.refreshed_at, "")
+        finally:
+            self.indexer.INTEGRITY_RUNTIME_STATE = original_runtime_state
+            self.indexer._repo_root_path_from_hashes = original_repo_root_from_hashes
+
+    def test_startup_probe_runtime_root_mismatch_clears_runtime_state(self):
+        original_runtime_state = self.indexer.INTEGRITY_RUNTIME_STATE
+        original_repo_root_from_hashes = self.indexer._repo_root_path_from_hashes
+        try:
+            self.indexer.INTEGRITY_RUNTIME_STATE = self.indexer.IntegrityRuntimeState(
+                startup_probe={"overall_status": "healthy"},
+                owner_root="/tmp/repo-a",
+                refreshed_at=datetime.now(timezone.utc).isoformat(),
+            )
+            self.indexer._repo_root_path_from_hashes = lambda: Path("/tmp/repo-b")
+            self.assertEqual(self.indexer.get_startup_integrity_probe(), {})
+            self.assertEqual(self.indexer.INTEGRITY_RUNTIME_STATE.startup_probe, {})
+            self.assertEqual(self.indexer.INTEGRITY_RUNTIME_STATE.owner_root, "")
+            self.assertEqual(self.indexer.INTEGRITY_RUNTIME_STATE.refreshed_at, "")
         finally:
             self.indexer.INTEGRITY_RUNTIME_STATE = original_runtime_state
             self.indexer._repo_root_path_from_hashes = original_repo_root_from_hashes
