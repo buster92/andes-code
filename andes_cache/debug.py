@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import re
 from copy import deepcopy
 
 from andes_cache.routing import retrieval_route_for_intent
@@ -28,16 +27,29 @@ def infer_expected_authority(intent: str, query: str) -> dict:
     expected_classes: list[str] = []
     expected_files: list[str] = []
 
-    if intent in {"declaration_or_configuration", "dependency_or_build_inventory"}:
-        expected_classes.extend(["manifest", "build_file", "dependency_file", "config_file"])
-
-    if any(k in q for k in ("permission", "permissions", "manifest")):
+    # Query-specific expectations first (more precise than broad intent defaults)
+    if any(k in q for k in ("permission", "permissions")):
         expected_classes.append("manifest")
         expected_files.append("AndroidManifest.xml")
-    if any(k in q for k in ("dependenc", "library", "package", "build", "gradle", "cargo", "pom", "requirements")):
+    elif any(k in q for k in ("dependenc", "library", "package", "requirement", "declared")):
         expected_classes.extend(["dependency_file", "build_file"])
-    if any(k in q for k in ("config", "configured", "setting", "env", "environment")):
+    elif any(k in q for k in ("config", "configured", "setting", "env", "environment")):
         expected_classes.append("config_file")
+        if "manifest" in q:
+            expected_classes.append("manifest")
+
+    # Specific file hint remains optional and additive.
+    if any(k in q for k in ("permission", "permissions", "manifest")):
+        expected_classes.append("manifest")
+    if any(k in q for k in ("build", "gradle", "cargo", "pom", "requirements")):
+        expected_classes.extend(["dependency_file", "build_file"])
+
+    # Minimal fallback by intent only when query provides no strong hints.
+    if not expected_classes:
+        if intent == "dependency_or_build_inventory":
+            expected_classes.extend(["dependency_file", "build_file"])
+        elif intent == "declaration_or_configuration":
+            expected_classes.append("config_file")
 
     return {
         "expected_classes": sorted(set(expected_classes)),

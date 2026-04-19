@@ -9,6 +9,7 @@ from andes_cache.debug import (
     apply_failure_signals,
     populate_retrieval_snapshot,
     format_debug_sse_event,
+    infer_expected_authority,
 )
 
 
@@ -101,6 +102,17 @@ class TestDebugMode(unittest.TestCase):
         )
         self.assertIn("dependency_file", checked["source_of_truth"]["missing_expected"])
         self.assertTrue(checked["failure_signals"]["expected_but_missing_authority"])
+
+    def test_expected_authority_is_query_specific(self):
+        dep = infer_expected_authority("dependency_or_build_inventory", "what dependencies are declared")
+        self.assertEqual(sorted(dep["expected_classes"]), ["build_file", "dependency_file"])
+
+        cfg = infer_expected_authority("declaration_or_configuration", "where is auth configured")
+        self.assertEqual(sorted(cfg["expected_classes"]), ["config_file"])
+
+        perms = infer_expected_authority("declaration_or_configuration", "what permissions are declared")
+        self.assertEqual(sorted(perms["expected_classes"]), ["manifest"])
+        self.assertIn("AndroidManifest.xml", perms["expected_files"])
 
 
 if __name__ == "__main__":
