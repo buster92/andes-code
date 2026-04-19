@@ -14,6 +14,7 @@ import re
 import sys
 import time
 import uuid
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -34,6 +35,7 @@ from andes_cache.routing import (
     semantic_cache_allowed,
     orchestration_plan,
 )
+from auto_index import AutoIndexManager, ChangeBatch
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_DIR       = Path(__file__).parent
@@ -163,6 +165,117 @@ _load_indexer()
 _print(f"  [2/4] ✓ Embedding model ready" if INDEXER_READY
        else f"  [2/4] ⚠  Indexer unavailable")
 
+_index_run_lock = threading.Lock()
+_auto_status_lock = threading.Lock()
+_auto_status_message = "Auto-index idle"
+
+
+def _set_auto_status(message: str) -> None:
+    global _auto_status_message
+    with _auto_status_lock:
+        _auto_status_message = message
+    audit.info(f"AUTO_INDEX | {message}")
+
+
+def _snapshot_relevant_files(root_path: Path) -> dict[str, str]:
+    if not _indexer_module:
+        return {}
+    supported = set(getattr(_indexer_module, "SUPPORTED_EXTENSIONS", set()))
+    manifests = set(getattr(_indexer_module, "MANIFEST_FILES", set()))
+    skip_dirs = set(getattr(_indexer_module, "SKIP_DIRS", set()))
+    file_hash = getattr(_indexer_module, "_file_hash")
+    snapshot: dict[str, str] = {}
+    for fp in root_path.rglob("*"):
+        if not fp.is_file():
+            continue
+        rel = str(fp.relative_to(root_path))
+        if not AutoIndexManager.is_relevant_project_path(
+            rel,
+            supported_suffixes=supported,
+            authoritative_basenames=manifests,
+            skip_dirs=skip_dirs,
+        ):
+            continue
+        snapshot[rel] = file_hash(fp)
+    return snapshot
+
+
+def _run_index_stream(path: str, source: str, emit_event, change_batch: ChangeBatch | None = None) -> bool:
+    if not _load_indexer():
+        emit_event({"type": "error", "source": source, "message": "Indexer not available"})
+        return False
+
+    acquired = _index_run_lock.acquire(blocking=False)
+    if not acquired:
+        if source == "auto" and _auto_index_manager:
+            _auto_index_manager.request_rerun_if_busy()
+            _set_auto_status("Index already in progress; queued one follow-up auto-refresh")
+        emit_event({"type": "status", "source": source, "message": "Index already in progress"})
+        return False
+
+    try:
+        if source == "auto" and _auto_index_manager:
+            _auto_index_manager.notify_auto_run_start()
+            count = change_batch.count if change_batch else 0
+            if change_batch and change_batch.deleted_paths:
+                _set_auto_status(f"{count} file changes detected; file deletion detected, performing safe rebuild check")
+            else:
+                _set_auto_status(f"{count} file changes detected; running background refresh")
+            emit_event({"type": "auto_status", "source": source, "message": "Detected file changes, refreshing index..."})
+
+        from indexer import index_codebase_stream
+        done_event = None
+        for event in index_codebase_stream(path):
+            event = dict(event)
+            event["source"] = source
+            if source == "auto" and event.get("type") == "decision":
+                _set_auto_status(event.get("message", "Auto-index decision emitted"))
+            emit_event(event)
+            if event.get("type") == "done":
+                done_event = event
+
+        if done_event and _auto_index_manager:
+            _auto_index_manager.start_for_root(path)
+            if source == "auto":
+                decision = done_event.get("decision", "unknown")
+                _set_auto_status(f"Auto-refresh complete ({decision})")
+        return True
+    except Exception as exc:
+        emit_event({"type": "error", "source": source, "message": str(exc)})
+        if source == "auto":
+            _set_auto_status(f"Auto-refresh failed: {exc}")
+        return False
+    finally:
+        _index_run_lock.release()
+        if source == "auto" and _auto_index_manager:
+            rerun = _auto_index_manager.notify_auto_run_end()
+            if rerun:
+                _set_auto_status("Additional file changes arrived during indexing; running one follow-up refresh")
+                _start_auto_index(path, ChangeBatch(changed_paths=set(), deleted_paths=set()))
+
+
+def _auto_run_index(path: str, batch: ChangeBatch) -> None:
+    _run_index_stream(path, source="auto", emit_event=lambda _event: None, change_batch=batch)
+
+
+def _start_auto_index(path: str, batch: ChangeBatch) -> bool:
+    if _index_run_lock.locked():
+        if _auto_index_manager:
+            _auto_index_manager.request_rerun_if_busy()
+        return False
+    threading.Thread(target=_auto_run_index, args=(path, batch), daemon=True).start()
+    return True
+
+
+_auto_index_manager = AutoIndexManager(
+    snapshot_fn=_snapshot_relevant_files,
+    run_index_fn=_start_auto_index,
+    status_logger=_set_auto_status,
+    debounce_seconds=float(os.getenv("ANDESCODE_AUTO_INDEX_DEBOUNCE_SEC", "2.0")),
+    poll_interval=float(os.getenv("ANDESCODE_AUTO_INDEX_POLL_SEC", "1.0")),
+    enabled=AutoIndexManager.env_enabled(),
+)
+
 # ── Step 3: KV cache warm-up ──────────────────────────────────────────────────
 _print(f"  [3/4] Warming KV cache...")
 
@@ -212,6 +325,9 @@ def root():
             doc_count = _indexer_module.col.count()
         except Exception:
             pass
+    auto_state = _auto_index_manager.status() if _auto_index_manager else {}
+    with _auto_status_lock:
+        auto_message = _auto_status_message
     return {
         "status":    "running",
         "product":   "AndesCode",
@@ -219,7 +335,17 @@ def root():
         "indexer":   INDEXER_READY,
         "doc_count": doc_count,
         "cache":     f"{CACHE_SIZE_GB:.0f}GB",
+        "auto_index": auto_state,
+        "auto_index_message": auto_message,
     }
+
+
+@app.get("/v1/index/state")
+def index_state():
+    state = _auto_index_manager.status() if _auto_index_manager else {}
+    with _auto_status_lock:
+        message = _auto_status_message
+    return {**state, "status_message": message}
 
 
 @app.get("/v1/models")
@@ -306,9 +432,7 @@ async def index_project(request: Request):
 
         def _producer():
             try:
-                from indexer import index_codebase_stream
-                for event in index_codebase_stream(path):
-                    q.put(event)
+                _run_index_stream(path, source="manual", emit_event=q.put)
             except Exception as e:
                 q.put({"type": "error", "message": str(e)})
             finally:
@@ -339,6 +463,13 @@ async def index_project(request: Request):
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
                  "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/v1/index/clear")
+async def clear_index_state():
+    _auto_index_manager.stop()
+    _set_auto_status("Index watcher stopped")
+    return {"ok": True, "watcher_status": _auto_index_manager.status()}
 
 
 # ── Context builder ───────────────────────────────────────────────────────────
