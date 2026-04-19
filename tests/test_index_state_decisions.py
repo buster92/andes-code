@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -241,6 +242,75 @@ class TestIndexStateDecisions(unittest.TestCase):
             self.assertNotIn(".git/hooks/package.json", manifests)
             self.assertNotIn("package.json", manifests)  # ensure relative nested paths are preserved
         finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_startup_probe_persisted_owner_root_mismatch_is_ignored(self):
+        tmp = Path(tempfile.mkdtemp(dir=Path.cwd()))
+        original_hash_store = self.indexer.HASH_STORE
+        original_integrity_state = self.indexer.INTEGRITY_STATE
+        original_runtime_state = self.indexer.INTEGRITY_RUNTIME_STATE
+        try:
+            self.indexer.HASH_STORE = tmp / ".file_hashes.json"
+            self.indexer.INTEGRITY_STATE = tmp / "integrity_state.json"
+            self.indexer.INTEGRITY_RUNTIME_STATE = self.indexer.IntegrityRuntimeState()
+            self.indexer._save_hashes({"__root__": str((tmp / "repo-a").resolve())})
+            self.indexer._save_integrity_state(
+                {
+                    "startup_probe": {"overall_status": "healthy"},
+                    "startup_probe_owner_root": str((tmp / "repo-b").resolve()),
+                    "startup_probe_refreshed_at": datetime.now(timezone.utc).isoformat(),
+                },
+                merge=False,
+            )
+
+            self.assertEqual(self.indexer.get_startup_integrity_probe(), {})
+        finally:
+            self.indexer.HASH_STORE = original_hash_store
+            self.indexer.INTEGRITY_STATE = original_integrity_state
+            self.indexer.INTEGRITY_RUNTIME_STATE = original_runtime_state
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_startup_probe_runtime_stale_timestamp_is_ignored(self):
+        original_runtime_state = self.indexer.INTEGRITY_RUNTIME_STATE
+        original_repo_root_from_hashes = self.indexer._repo_root_path_from_hashes
+        try:
+            stale_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+            self.indexer.INTEGRITY_RUNTIME_STATE = self.indexer.IntegrityRuntimeState(
+                startup_probe={"overall_status": "healthy"},
+                owner_root="/tmp/repo",
+                refreshed_at=stale_at.isoformat(),
+            )
+            self.indexer._repo_root_path_from_hashes = lambda: Path("/tmp/repo")
+            self.assertEqual(self.indexer.get_startup_integrity_probe(), {})
+        finally:
+            self.indexer.INTEGRITY_RUNTIME_STATE = original_runtime_state
+            self.indexer._repo_root_path_from_hashes = original_repo_root_from_hashes
+
+    def test_startup_probe_persisted_stale_timestamp_is_ignored(self):
+        tmp = Path(tempfile.mkdtemp(dir=Path.cwd()))
+        original_hash_store = self.indexer.HASH_STORE
+        original_integrity_state = self.indexer.INTEGRITY_STATE
+        original_runtime_state = self.indexer.INTEGRITY_RUNTIME_STATE
+        try:
+            repo_root = (tmp / "repo").resolve()
+            self.indexer.HASH_STORE = tmp / ".file_hashes.json"
+            self.indexer.INTEGRITY_STATE = tmp / "integrity_state.json"
+            self.indexer.INTEGRITY_RUNTIME_STATE = self.indexer.IntegrityRuntimeState()
+            self.indexer._save_hashes({"__root__": str(repo_root)})
+            stale_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+            self.indexer._save_integrity_state(
+                {
+                    "startup_probe": {"overall_status": "healthy"},
+                    "startup_probe_owner_root": str(repo_root),
+                    "startup_probe_refreshed_at": stale_at.isoformat(),
+                },
+                merge=False,
+            )
+            self.assertEqual(self.indexer.get_startup_integrity_probe(), {})
+        finally:
+            self.indexer.HASH_STORE = original_hash_store
+            self.indexer.INTEGRITY_STATE = original_integrity_state
+            self.indexer.INTEGRITY_RUNTIME_STATE = original_runtime_state
             shutil.rmtree(tmp, ignore_errors=True)
 
 

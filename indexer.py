@@ -41,7 +41,6 @@ from andes_cache.integrity import (
     INTEGRITY_HEALTHY,
     IntegrityValidationMode,
     validate_authoritative_integrity_for_mode,
-    validate_authoritative_integrity,
     deep_repair_integrity_validation,
     repair_authoritative_integrity,
     select_healthy_authoritative_path,
@@ -99,6 +98,7 @@ class IntegrityRuntimeState:
 
 
 INTEGRITY_RUNTIME_STATE = IntegrityRuntimeState()
+STARTUP_INTEGRITY_PROBE_MAX_AGE_SECONDS = 600
 
 # ── Language boundary patterns ────────────────────────────────────────────────
 _BOUNDARY = {
@@ -1347,7 +1347,8 @@ def _retrieve_config_first(
 
     selected_healthy_path, integrity_attempts = select_healthy_authoritative_path(
         priority_files,
-        validate_path_fn=lambda p: validate_authoritative_integrity(
+        validate_path_fn=lambda p: validate_authoritative_integrity_for_mode(
+            mode=IntegrityValidationMode.NORMAL,
             workspace=workspace,
             hash_state=_load_hashes(),
             fetch_exact_file=_fetch_exact_file,
@@ -2222,15 +2223,51 @@ def run_startup_integrity_probe(root_path: Path | None = None, max_files: int = 
     return _refresh_startup_integrity_probe(root_path=root_path, max_files=max_files, reason="startup")
 
 
+def _is_same_root(root_path: Path) -> bool:
+    owner_root = (INTEGRITY_RUNTIME_STATE.owner_root or "").strip()
+    if not owner_root:
+        return False
+    try:
+        return Path(owner_root).resolve() == root_path.resolve()
+    except Exception:
+        return False
+
+
+def _is_startup_probe_fresh(refreshed_at: str, max_age_seconds: int = STARTUP_INTEGRITY_PROBE_MAX_AGE_SECONDS) -> bool:
+    if not refreshed_at:
+        return False
+    try:
+        refreshed = datetime.fromisoformat(refreshed_at)
+    except Exception:
+        return False
+    if refreshed.tzinfo is None:
+        refreshed = refreshed.replace(tzinfo=timezone.utc)
+    age_seconds = (datetime.now(timezone.utc) - refreshed.astimezone(timezone.utc)).total_seconds()
+    return 0 <= age_seconds <= max_age_seconds
+
+
 def get_startup_integrity_probe() -> dict:
+    current_root = _repo_root_path_from_hashes()
     if INTEGRITY_RUNTIME_STATE.startup_probe:
+        if not _is_same_root(current_root):
+            return {}
+        if not _is_startup_probe_fresh(INTEGRITY_RUNTIME_STATE.refreshed_at):
+            return {}
         return dict(INTEGRITY_RUNTIME_STATE.startup_probe)
     persisted = _load_integrity_state()
     probe = persisted.get("startup_probe")
+    persisted_owner_root = str(persisted.get("startup_probe_owner_root", "")).strip()
+    if persisted_owner_root:
+        try:
+            if Path(persisted_owner_root).resolve() != current_root.resolve():
+                return {}
+        except Exception:
+            return {}
+    else:
+        return {}
+    if not _is_startup_probe_fresh(str(persisted.get("startup_probe_refreshed_at", ""))):
+        return {}
     if isinstance(probe, dict):
-        INTEGRITY_RUNTIME_STATE.startup_probe = dict(probe)
-        INTEGRITY_RUNTIME_STATE.owner_root = str(persisted.get("startup_probe_owner_root", ""))
-        INTEGRITY_RUNTIME_STATE.refreshed_at = str(persisted.get("startup_probe_refreshed_at", ""))
         return dict(probe)
     return {}
 

@@ -43,6 +43,28 @@ class TestAuthoritativeIntegrity(unittest.TestCase):
         self.assertEqual(startup.overall_status, INTEGRITY_HEALTHY)
         self.assertEqual(deep.overall_status, INTEGRITY_DEGRADED)
 
+    def test_legacy_boolean_wrapper_matches_mode_api(self):
+        workspace = {"manifests": ["app/build.gradle"], "config_graph": {"config_files": []}}
+        chunks = [{"content": "plugins {}", "line": 0, "file": "app/build.gradle"}]
+        hash_state = {"app/build.gradle": "h"}
+
+        via_wrapper = validate_authoritative_integrity(
+            workspace=workspace,
+            hash_state=hash_state,
+            fetch_exact_file=lambda _p, _m: chunks,
+            expected_chunk_count_lookup=lambda _p: 2,
+            validate_expected_chunks=False,
+        )
+        via_mode = validate_authoritative_integrity_for_mode(
+            mode=IntegrityValidationMode.STARTUP_CHEAP,
+            workspace=workspace,
+            hash_state=hash_state,
+            fetch_exact_file=lambda _p, _m: chunks,
+            expected_chunk_count_lookup=lambda _p: 2,
+        )
+
+        self.assertEqual(via_wrapper.to_dict(), via_mode.to_dict())
+
     def test_discovered_in_workspace_but_not_embedded(self):
         workspace = {"manifests": ["app/build.gradle"], "config_graph": {"config_files": []}}
         report = validate_authoritative_integrity(
