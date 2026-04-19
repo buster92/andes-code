@@ -182,7 +182,19 @@ class TestIndexStateDecisions(unittest.TestCase):
             done = [e for e in events if e.get("type") == "done"][-1]
             self.assertEqual(done.get("decision"), self.indexer.DECISION_REBUILD_WORKSPACE_ONLY)
             self.assertEqual(done.get("workspace_rebuild_scope"), "all_files")
+            self.assertTrue(done.get("workspace_only_rebuild_preserved_embedding_state"))
             self.assertIn("AndroidManifest.xml", done["map"]["workspace"]["manifests"])
+
+            # Workspace-only rebuild must not mark newly discovered files as embedded.
+            post_workspace_hashes = self.indexer._load_hashes()
+            self.assertNotIn("AndroidManifest.xml", post_workspace_hashes)
+
+            # A subsequent run should still detect the manifest as needing embedding.
+            self.indexer.evaluate_index_state = original_eval
+            events_after = list(self.indexer.index_codebase_stream(str(tmp)))
+            done_after = [e for e in events_after if e.get("type") == "done"][-1]
+            self.assertEqual(done_after.get("decision"), self.indexer.DECISION_INCREMENTAL_REINDEX)
+            self.assertEqual(done_after.get("new"), 1)
         finally:
             self.indexer.HASH_STORE = original_hash_store
             self.indexer.PROJECT_MAP = original_project_map
