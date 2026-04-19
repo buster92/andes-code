@@ -122,6 +122,21 @@ class TestFileEditEngine(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual("Path escapes repository root", result.error)
 
+    def test_failure_when_hash_store_missing_repo_root_metadata(self):
+        rel = str(self.file_path.relative_to(self.root))
+        content_hash = hashlib.md5(self.file_path.read_bytes()).hexdigest()
+        self.hash_store.write_text(json.dumps({rel: content_hash}), encoding="utf-8")
+
+        edit = EditOperation(
+            file_path="src/main.py",
+            old_content="return 'hello'",
+            new_content="return 'updated'",
+        )
+        result = self.engine.apply_edit_operation(edit)
+
+        self.assertFalse(result.success)
+        self.assertEqual("Missing indexed repo root metadata (__root__)", result.error)
+
 
 class TestDiffPreview(unittest.TestCase):
     def test_generates_unified_diff(self):

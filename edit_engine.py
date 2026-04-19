@@ -59,6 +59,15 @@ class FileEditEngine:
     def apply_edit_operation(self, edit: EditOperation) -> ApplyResult:
         hashes = self._load_hashes()
         root_path = self._repo_root(hashes)
+        if root_path is None:
+            return self._fail(
+                edit.file_path,
+                exists=False,
+                indexed=False,
+                hash_match=False,
+                content_match=False,
+                message="Missing indexed repo root metadata (__root__)",
+            )
         target_path = self._resolve_target_path(root_path, edit.file_path)
         if target_path is None:
             return self._fail(
@@ -154,11 +163,11 @@ class FileEditEngine:
             return {}
         return data if isinstance(data, dict) else {}
 
-    def _repo_root(self, hashes: dict) -> Path:
+    def _repo_root(self, hashes: dict) -> Path | None:
         root = hashes.get("__root__")
         if root:
             return Path(root).resolve()
-        return Path.cwd().resolve()
+        return None
 
     def _resolve_target_path(self, root_path: Path, file_path: str) -> Path | None:
         path = Path(file_path)
