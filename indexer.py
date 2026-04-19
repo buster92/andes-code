@@ -27,6 +27,8 @@ from andes_cache.source_of_truth import (
     config_priority_files,
     expected_authority_candidates,
     rank_recovery_authoritative_paths,
+    score_authoritative_path,
+    select_best_authoritative_path,
     summarize_declared_permissions,
     annotate_sources,
     missing_manifest_notice,
@@ -1289,11 +1291,18 @@ def _retrieve_config_first(
     )
     if debug_payload is not None:
         debug_payload["source_of_truth"]["priority_files"] = priority_files
+        debug_payload["source_of_truth"]["ranked_paths_with_scores"] = [
+            {"path": p, "score": score_authoritative_path(p, query, intent)}
+            for p in priority_files
+        ]
+        debug_payload["source_of_truth"]["selection_reason"] = ""
+        debug_payload["source_of_truth"]["exact_path_used"] = ""
+        debug_payload["source_of_truth"]["fallback_used"] = False
 
     collected = []
     found_authoritative = False
     for fname in priority_files:
-        file_chunks = _fetch_all_from_file(fname, max_results=40)
+        file_chunks = _fetch_all_from_file(fname, query=query, intent=intent, max_results=40)
         if not file_chunks:
             continue
         found_authoritative = True
@@ -1301,6 +1310,12 @@ def _retrieve_config_first(
         authority = authority_level_for_source(intent, source_type)
         annotate_sources(file_chunks, source_type=source_type, authority_level=authority)
         collected.extend(file_chunks[:6])
+        if debug_payload is not None and not debug_payload["source_of_truth"]["exact_path_used"]:
+            debug_payload["source_of_truth"]["exact_path_used"] = fname if "/" in fname else file_chunks[0].get("file", "")
+            debug_payload["source_of_truth"]["fallback_used"] = bool(file_chunks and file_chunks[0].get("_fallback_used", False))
+            debug_payload["source_of_truth"]["selection_reason"] = (
+                "selected highest ranked authoritative path for this query"
+            )
         if len(collected) >= n_results:
             break
 
@@ -1323,6 +1338,10 @@ def _retrieve_config_first(
         if debug_payload is not None:
             debug_payload["source_of_truth"]["recovery_candidates"] = recovery_candidates
             debug_payload["source_of_truth"]["ranked_paths"] = ranked_paths
+            debug_payload["source_of_truth"]["ranked_paths_with_scores"] = [
+                {"path": p, "score": score_authoritative_path(p, query, intent)}
+                for p in ranked_paths
+            ]
         recovery_chunks = _recover_authoritative_files(
             ranked_paths,
             intent=intent,
@@ -1452,19 +1471,23 @@ def _fetch_exact_file(path: str, max_results: int = 60) -> list:
     try:
         exact = col.get(where={"file": path}, limit=max_results)
         if exact and exact.get("documents"):
-            return [
+            chunks = [
                 {
                     "content": doc,
                     "file": exact["metadatas"][i].get("file", ""),
                     "language": exact["metadatas"][i].get("language", ""),
+                    "line": exact["metadatas"][i].get("line", 0),
                     "symbols": exact["metadatas"][i].get("symbols", ""),
                     "score": 0.0,
                     "_rank": 1.0,
                     "full_file": True,
+                    "_fallback_used": False,
                 }
                 for i, doc in enumerate(exact["documents"])
                 if doc and exact["metadatas"][i].get("file", "") == path
             ]
+            chunks.sort(key=lambda c: int(c.get("line", 0) or 0))
+            return chunks[:max_results]
     except Exception:
         pass
 
@@ -1475,19 +1498,23 @@ def _fetch_exact_file(path: str, max_results: int = 60) -> list:
         )
         if not fallback or not fallback.get("documents"):
             return []
-        return [
+        chunks = [
             {
                 "content": doc,
                 "file": fallback["metadatas"][i].get("file", ""),
                 "language": fallback["metadatas"][i].get("language", ""),
+                "line": fallback["metadatas"][i].get("line", 0),
                 "symbols": fallback["metadatas"][i].get("symbols", ""),
                 "score": 0.0,
                 "_rank": 1.0,
                 "full_file": True,
+                "_fallback_used": True,
             }
             for i, doc in enumerate(fallback["documents"])
             if doc and fallback["metadatas"][i].get("file", "") == path
-        ][:max_results]
+        ]
+        chunks.sort(key=lambda c: int(c.get("line", 0) or 0))
+        return chunks[:max_results]
     except Exception:
         return []
 
@@ -1515,39 +1542,62 @@ def search_semantic_only(query: str, n_results: int = 5) -> list[dict]:
     ranked = _rerank(query, candidates)
     return _add_coverage(ranked[:n_results])
 
-def _fetch_all_from_file(filename: str, max_results: int = 20) -> list:
-    """Retrieve all indexed chunks for a given filename."""
+def _fetch_all_from_file(filename: str, query: str = "", intent: str = "", max_results: int = 20) -> list:
+    """Retrieve all indexed chunks for a file; exact-path first, deterministic fallback."""
     count = col.count()
     if count == 0:
         return []
 
-    # Query with a high n_results and filter by file metadata
+    if "/" in filename:
+        exact = _fetch_exact_file(filename, max_results=max_results)
+        if exact:
+            return exact
+
     try:
         results = col.get(
             where={"file": {"$contains": filename.split("/")[-1]}},
-            limit=max_results,
+            limit=max_results * 4,
         )
         if not results or not results.get("documents"):
             return []
 
-        chunks = [
-            {
-                "content":   doc,
-                "file":      results["metadatas"][i].get("file", ""),
-                "language":  results["metadatas"][i].get("language", ""),
-                "symbols":   results["metadatas"][i].get("symbols", ""),
-                "score":     0.0,
-                "_rank":     1.0,
-                "full_file": True,
-            }
-            for i, doc in enumerate(results["documents"])
-            if doc
-        ]
-        # Sort by line number for coherent reading order
-        chunks.sort(key=lambda c: c.get("line", 0) if "line" in c else 0)
-        return chunks
+        candidates_by_file: dict[str, list[dict]] = defaultdict(list)
+        for i, doc in enumerate(results["documents"]):
+            if not doc:
+                continue
+            meta = results["metadatas"][i]
+            fpath = meta.get("file", "")
+            if not fpath:
+                continue
+            candidates_by_file[fpath].append(
+                {
+                    "content": doc,
+                    "file": fpath,
+                    "language": meta.get("language", ""),
+                    "line": meta.get("line", 0),
+                    "symbols": meta.get("symbols", ""),
+                    "score": 0.0,
+                    "_rank": 1.0,
+                    "full_file": True,
+                    "_fallback_used": True,
+                }
+            )
+        if not candidates_by_file:
+            return []
+        # Duplicate basenames are resolved deterministically to one concrete path.
+        selected_path = select_best_authoritative_path(list(candidates_by_file.keys()), query, intent)
+        if not selected_path:
+            selected_path = sorted(candidates_by_file.keys(), key=lambda p: (p.count("/"), p))[0]
+        chunks = candidates_by_file[selected_path]
+        chunks.sort(key=lambda c: int(c.get("line", 0) or 0))
+        return chunks[:max_results]
     except Exception:
         return []
+
+
+def _fetch_all_from_file_legacy(filename: str, max_results: int = 20) -> list:
+    """Legacy compatibility wrapper."""
+    return _fetch_all_from_file(filename, max_results=max_results)
 
 
 def _add_coverage(chunks: list) -> list:
