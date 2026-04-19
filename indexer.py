@@ -36,6 +36,12 @@ from andes_cache.source_of_truth import (
     authority_level_for_source,
     wants_runtime_usage,
 )
+from andes_cache.integrity import (
+    INTEGRITY_HEALTHY,
+    validate_authoritative_integrity,
+    repair_authoritative_integrity,
+    select_healthy_authoritative_path,
+)
 from andes_cache.versions import (
     INDEX_VERSION,
     MODULE_DETECTION_VERSION,
@@ -63,6 +69,7 @@ PROJECT_MAP   = Path(__file__).parent / "index" / "project_map.json"
 SYMBOL_INDEX  = Path(__file__).parent / "index" / "symbol_index.json"
 WORKSPACE_INDEX = Path(__file__).parent / "index" / "workspace_index.json"
 INDEX_STATE = Path(__file__).parent / "index" / "index_state.json"
+INTEGRITY_STATE = Path(__file__).parent / "index" / "integrity_state.json"
 CACHE_DIR = Path(__file__).parent / "index" / "cache"
 CACHE = AndesCacheManager(CACHE_DIR)
 CURRENT_REPO_FINGERPRINT = ""
@@ -287,6 +294,7 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
         _save_json(WORKSPACE_INDEX, workspace)
         CACHE.workspace_set(repo_fp, "symbol_index", symidx)
         _save_hashes(_preserve_embedded_hash_state(hashes, root_path, repo_fp))
+        _validate_and_repair_authoritative_integrity(root_path)
         _save_index_state(_with_timestamp(current_state, "workspace_rebuilt_at"))
         CACHE.flush_metrics()
         yield {
@@ -308,6 +316,7 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
         # Nothing changed — still emit map event so UI can display it
         pmap = _load_project_map()
         _save_hashes(next_hashes | {"__root__": str(root_path), "__fingerprint__": repo_fp})
+        _validate_and_repair_authoritative_integrity(root_path)
         _save_index_state(_with_timestamp(current_state, "last_reused_at"))
         CACHE.flush_metrics()
         yield {
@@ -389,6 +398,7 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
     _save_json(SYMBOL_INDEX, symidx)
     _save_json(WORKSPACE_INDEX, workspace)
     CACHE.workspace_set(repo_fp, "symbol_index", symidx)
+    _validate_and_repair_authoritative_integrity(root_path)
     _save_index_state(_with_timestamp(current_state, "last_indexed_at"))
     CACHE.flush_metrics()
 
@@ -1303,6 +1313,57 @@ def _retrieve_config_first(
         debug_payload["source_of_truth"]["selection_reason"] = ""
         debug_payload["source_of_truth"]["exact_path_used"] = ""
         debug_payload["source_of_truth"]["fallback_used"] = False
+        debug_payload["source_of_truth"]["integrity"] = {}
+
+    root_path_for_integrity = _repo_root_path_from_hashes()
+    selected_healthy_path, integrity_attempts = select_healthy_authoritative_path(
+        priority_files,
+        validate_path_fn=lambda p: validate_authoritative_integrity(
+            workspace=workspace,
+            hash_state=_load_hashes(),
+            fetch_exact_file=_fetch_exact_file,
+            file_hash_lookup=lambda rp: _file_hash(root_path_for_integrity / rp) if (root_path_for_integrity / rp).exists() else None,
+            expected_chunk_count_lookup=lambda rp: _expected_chunk_count_for_file(root_path_for_integrity, rp),
+            candidate_paths=[p],
+        ),
+        max_candidates=min(6, max(1, len(priority_files))),
+    )
+    if not selected_healthy_path and priority_files:
+        # Attempt targeted repair only for the highest-priority authoritative path first.
+        repaired_attempt = _validate_and_repair_authoritative_integrity(
+            root_path_for_integrity,
+            candidate_paths=[priority_files[0]],
+        )
+        integrity_attempts.append(repaired_attempt | {"candidate": priority_files[0], "repair_ran": True})
+        if repaired_attempt.get("overall_status") == INTEGRITY_HEALTHY:
+            selected_healthy_path = priority_files[0]
+    if debug_payload is not None:
+        debug_payload["source_of_truth"]["integrity"] = {
+            "selected_healthy_path": selected_healthy_path,
+            "attempts": integrity_attempts,
+        }
+    if not selected_healthy_path:
+        limitation = {
+            "content": (
+                "# Source-of-Truth Index Integrity Limitation\n"
+                "- The file was discovered in workspace metadata, but the current index could not retrieve it.\n"
+                "- The index appears stale or incomplete for authoritative file retrieval.\n"
+                "- AndesCode attempted targeted repair for authoritative files before returning this limitation.\n"
+            ),
+            "file": "__source_of_truth_integrity__",
+            "language": "meta",
+            "symbols": "",
+            "score": 0.0,
+            "_rank": 1.0,
+            "full_file": True,
+            "coverage": {"returned": 1, "total": 1, "partial": False},
+            "source_type": "inferred",
+            "authority_level": "inferred",
+        }
+        if debug_payload is not None:
+            debug_payload["failure_signals"]["expected_but_missing_authority"] = True
+        return [limitation]
+    priority_files = [selected_healthy_path] + [p for p in priority_files if p != selected_healthy_path]
 
     collected = []
     found_authoritative = False
@@ -1918,6 +1979,121 @@ def _preserve_embedded_hash_state(hashes: dict, root_path: Path, repo_fp: str) -
     preserved["__root__"] = str(root_path)
     preserved["__fingerprint__"] = repo_fp
     return preserved
+
+
+def _repo_root_path_from_hashes() -> Path:
+    hashes = _load_hashes()
+    root = hashes.get("__root__")
+    if root:
+        return Path(root)
+    return Path(".").resolve()
+
+
+def _expected_chunk_count_for_file(root_path: Path, rel_path: str) -> int | None:
+    fp = root_path / rel_path
+    if not fp.exists() or not fp.is_file():
+        return None
+    try:
+        return len(_chunk_file(fp, root_path))
+    except Exception:
+        return None
+
+
+def _repair_index_paths(root_path: Path, rel_paths: list[str]) -> bool:
+    if not rel_paths:
+        return True
+    repair_chunks = []
+    hashes = _load_hashes()
+    next_hashes = dict(hashes)
+
+    for rel in sorted(set(rel_paths)):
+        fp = root_path / rel
+        try:
+            col.delete(where={"file": rel})
+        except Exception as e:
+            logging.warning(f"Integrity repair could not clear stale vectors for {rel}: {e}")
+        if not fp.exists() or not fp.is_file():
+            continue
+        try:
+            chunks = _chunk_file(fp, root_path)
+        except Exception as e:
+            logging.warning(f"Integrity repair skipped {rel}: {e}")
+            continue
+        repair_chunks.extend(chunks)
+        try:
+            next_hashes[rel] = _file_hash(fp)
+        except Exception:
+            pass
+
+    if not repair_chunks:
+        return False
+
+    try:
+        embeddings = []
+        for start in range(0, len(repair_chunks), EMBED_BATCH):
+            batch = repair_chunks[start: start + EMBED_BATCH]
+            embeddings.extend(embedder.encode([c["content"] for c in batch], show_progress_bar=False).tolist())
+        for start in range(0, len(repair_chunks), CHROMA_BATCH):
+            bc = repair_chunks[start: start + CHROMA_BATCH]
+            bv = embeddings[start: start + CHROMA_BATCH]
+            col.upsert(
+                ids=[c["id"] for c in bc],
+                embeddings=bv,
+                documents=[c["content"] for c in bc],
+                metadatas=[
+                    {"file": c["file"], "language": c["language"], "line": c["line"], "symbols": c.get("symbols", "")}
+                    for c in bc
+                ],
+            )
+        next_hashes["__root__"] = str(root_path)
+        if "__fingerprint__" not in next_hashes:
+            next_hashes["__fingerprint__"] = get_repo_fingerprint()
+        _save_hashes(next_hashes)
+        return True
+    except Exception as e:
+        logging.warning(f"Targeted integrity repair failed: {e}")
+        return False
+
+
+def _validate_and_repair_authoritative_integrity(root_path: Path, candidate_paths: list[str] | None = None) -> dict:
+    workspace = _load_workspace_index()
+    hash_state = _load_hashes()
+
+    def _file_hash_lookup(rel_path: str) -> str | None:
+        fp = root_path / rel_path
+        if not fp.exists() or not fp.is_file():
+            return None
+        try:
+            return _file_hash(fp)
+        except Exception:
+            return None
+
+    report = validate_authoritative_integrity(
+        workspace=workspace,
+        hash_state=hash_state,
+        fetch_exact_file=_fetch_exact_file,
+        file_hash_lookup=_file_hash_lookup,
+        expected_chunk_count_lookup=lambda p: _expected_chunk_count_for_file(root_path, p),
+        candidate_paths=candidate_paths,
+    )
+    if report.overall_status == INTEGRITY_HEALTHY:
+        _save_json(INTEGRITY_STATE, report.to_dict())
+        return report.to_dict()
+
+    repaired = repair_authoritative_integrity(
+        report,
+        repair_paths_fn=lambda paths: _repair_index_paths(root_path, paths),
+        revalidate_fn=lambda paths: validate_authoritative_integrity(
+            workspace=workspace,
+            hash_state=_load_hashes(),
+            fetch_exact_file=_fetch_exact_file,
+            file_hash_lookup=_file_hash_lookup,
+            expected_chunk_count_lookup=lambda p: _expected_chunk_count_for_file(root_path, p),
+            candidate_paths=paths,
+        ),
+    )
+    _save_json(INTEGRITY_STATE, repaired.to_dict())
+    return repaired.to_dict()
 
 
 def _save_hashes(hashes: dict) -> None:
