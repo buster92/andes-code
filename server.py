@@ -181,6 +181,7 @@ def _snapshot_relevant_files(root_path: Path) -> dict[str, str]:
     if not _indexer_module:
         return {}
     supported = set(getattr(_indexer_module, "SUPPORTED_EXTENSIONS", set()))
+    manifests = set(getattr(_indexer_module, "MANIFEST_FILES", set()))
     skip_dirs = set(getattr(_indexer_module, "SKIP_DIRS", set()))
     file_hash = getattr(_indexer_module, "_file_hash")
     snapshot: dict[str, str] = {}
@@ -188,7 +189,12 @@ def _snapshot_relevant_files(root_path: Path) -> dict[str, str]:
         if not fp.is_file():
             continue
         rel = str(fp.relative_to(root_path))
-        if not AutoIndexManager.is_relevant_path(rel, supported_suffixes=supported, skip_dirs=skip_dirs):
+        if not AutoIndexManager.is_relevant_project_path(
+            rel,
+            supported_suffixes=supported,
+            authoritative_basenames=manifests,
+            skip_dirs=skip_dirs,
+        ):
             continue
         snapshot[rel] = file_hash(fp)
     return snapshot

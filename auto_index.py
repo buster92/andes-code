@@ -62,7 +62,18 @@ class AutoIndexManager:
         return os.getenv("ANDESCODE_AUTO_INDEX", "1").strip().lower() in {"1", "true", "yes", "on"}
 
     @staticmethod
-    def is_relevant_path(rel_path: str, *, supported_suffixes: set[str], skip_dirs: set[str]) -> bool:
+    def is_relevant_project_path(
+        rel_path: str,
+        *,
+        supported_suffixes: set[str],
+        authoritative_basenames: set[str],
+        skip_dirs: set[str],
+    ) -> bool:
+        """
+        Relevant means either:
+        - source code file with a supported extension, OR
+        - authoritative/build/config/dependency file by canonical basename.
+        """
         parts = Path(rel_path).parts
         if any(part in skip_dirs for part in parts):
             return False
@@ -73,7 +84,19 @@ class AutoIndexManager:
             return False
         if name.startswith(".") and name not in {".env", ".editorconfig"}:
             return False
+        if name in authoritative_basenames:
+            return True
         return Path(rel_path).suffix in supported_suffixes
+
+    @staticmethod
+    def is_relevant_path(rel_path: str, *, supported_suffixes: set[str], skip_dirs: set[str]) -> bool:
+        """Backward-compatible wrapper for older tests/callers."""
+        return AutoIndexManager.is_relevant_project_path(
+            rel_path,
+            supported_suffixes=supported_suffixes,
+            authoritative_basenames=set(),
+            skip_dirs=skip_dirs,
+        )
 
     def set_enabled(self, enabled: bool) -> None:
         with self._lock:

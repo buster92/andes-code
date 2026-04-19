@@ -10,13 +10,138 @@ from auto_index import AutoIndexManager, ChangeBatch
 
 
 class TestAutoIndexManager(unittest.TestCase):
+    def test_is_relevant_project_path_includes_authoritative_files(self):
+        supported = {".py", ".ts"}
+        authoritative = {
+            "package.json",
+            "pyproject.toml",
+            "Cargo.toml",
+            "go.mod",
+            "build.gradle.kts",
+            "settings.gradle.kts",
+            "docker-compose.yml",
+            "pnpm-workspace.yaml",
+            "Dockerfile",
+        }
+        skip_dirs = {".git", "node_modules"}
+
+        self.assertTrue(
+            AutoIndexManager.is_relevant_project_path(
+                "apps/web/package.json",
+                supported_suffixes=supported,
+                authoritative_basenames=authoritative,
+                skip_dirs=skip_dirs,
+            )
+        )
+        self.assertTrue(
+            AutoIndexManager.is_relevant_project_path(
+                "services/api/pyproject.toml",
+                supported_suffixes=supported,
+                authoritative_basenames=authoritative,
+                skip_dirs=skip_dirs,
+            )
+        )
+        self.assertTrue(
+            AutoIndexManager.is_relevant_project_path(
+                "rust/Cargo.toml",
+                supported_suffixes=supported,
+                authoritative_basenames=authoritative,
+                skip_dirs=skip_dirs,
+            )
+        )
+        self.assertTrue(
+            AutoIndexManager.is_relevant_project_path(
+                "go/go.mod",
+                supported_suffixes=supported,
+                authoritative_basenames=authoritative,
+                skip_dirs=skip_dirs,
+            )
+        )
+        self.assertTrue(
+            AutoIndexManager.is_relevant_project_path(
+                "android/build.gradle.kts",
+                supported_suffixes=supported,
+                authoritative_basenames=authoritative,
+                skip_dirs=skip_dirs,
+            )
+        )
+        self.assertTrue(
+            AutoIndexManager.is_relevant_project_path(
+                "android/settings.gradle.kts",
+                supported_suffixes=supported,
+                authoritative_basenames=authoritative,
+                skip_dirs=skip_dirs,
+            )
+        )
+        self.assertTrue(
+            AutoIndexManager.is_relevant_project_path(
+                "infra/docker-compose.yml",
+                supported_suffixes=supported,
+                authoritative_basenames=authoritative,
+                skip_dirs=skip_dirs,
+            )
+        )
+        self.assertTrue(
+            AutoIndexManager.is_relevant_project_path(
+                "monorepo/pnpm-workspace.yaml",
+                supported_suffixes=supported,
+                authoritative_basenames=authoritative,
+                skip_dirs=skip_dirs,
+            )
+        )
+        self.assertTrue(
+            AutoIndexManager.is_relevant_project_path(
+                "infra/Dockerfile",
+                supported_suffixes=supported,
+                authoritative_basenames=authoritative,
+                skip_dirs=skip_dirs,
+            )
+        )
+
     def test_is_relevant_path_ignores_temp_and_skip_dirs(self):
         supported = {".py", ".ts"}
+        authoritative = {"package.json", "Dockerfile"}
         skip_dirs = {".git", "node_modules"}
-        self.assertTrue(AutoIndexManager.is_relevant_path("src/app.py", supported_suffixes=supported, skip_dirs=skip_dirs))
-        self.assertFalse(AutoIndexManager.is_relevant_path("node_modules/a.js", supported_suffixes=supported, skip_dirs=skip_dirs))
-        self.assertFalse(AutoIndexManager.is_relevant_path("src/app.py.swp", supported_suffixes=supported, skip_dirs=skip_dirs))
-        self.assertFalse(AutoIndexManager.is_relevant_path("src/.DS_Store", supported_suffixes=supported, skip_dirs=skip_dirs))
+        self.assertTrue(
+            AutoIndexManager.is_relevant_project_path(
+                "src/app.py",
+                supported_suffixes=supported,
+                authoritative_basenames=authoritative,
+                skip_dirs=skip_dirs,
+            )
+        )
+        self.assertFalse(
+            AutoIndexManager.is_relevant_project_path(
+                "node_modules/package.json",
+                supported_suffixes=supported,
+                authoritative_basenames=authoritative,
+                skip_dirs=skip_dirs,
+            )
+        )
+        self.assertFalse(
+            AutoIndexManager.is_relevant_project_path(
+                "src/app.py.swp",
+                supported_suffixes=supported,
+                authoritative_basenames=authoritative,
+                skip_dirs=skip_dirs,
+            )
+        )
+        self.assertFalse(
+            AutoIndexManager.is_relevant_project_path(
+                "src/.DS_Store",
+                supported_suffixes=supported,
+                authoritative_basenames=authoritative,
+                skip_dirs=skip_dirs,
+            )
+        )
+        self.assertFalse(
+            AutoIndexManager.is_relevant_project_path(
+                "src/.#Dockerfile",
+                supported_suffixes=supported,
+                authoritative_basenames=authoritative,
+                skip_dirs=skip_dirs,
+            )
+        )
 
     def test_debounce_collapses_multiple_changes_into_one_run(self):
         state = {"a.py": "1"}
