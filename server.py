@@ -42,7 +42,16 @@ LOG_PATH       = BASE_DIR / "audit.log"
 PORT           = int(os.getenv("PORT", 8080))
 CONTEXT_CHUNKS = int(os.getenv("CONTEXT_CHUNKS", 5))
 CACHE_SIZE_GB  = float(os.getenv("CACHE_SIZE_GB", 2.0))
-DEBUG_MODE     = env_debug_mode()
+# Snapshot for startup visibility only.
+# NOTE: If you change ANDESCODE_DEBUG_MODE in .env while the server is running,
+# this startup value will not change until restart. Request-level debug still
+# resolves per request via _resolve_request_debug_mode().
+DEBUG_MODE_STARTUP = env_debug_mode()
+
+
+def _resolve_request_debug_mode(api_debug: bool | None) -> bool:
+    """Resolve debug mode for each request: API checkbox/body flag > current env."""
+    return resolve_debug_mode(api_flag=api_debug, param_flag=env_debug_mode())
 
 # Core system prompt — kept short and static for KV cache reuse
 _BASE_SYSTEM = (
@@ -230,7 +239,7 @@ async def chat(request: Request):
     stream     = body.get("stream", True)
     max_tokens = body.get("max_tokens", 1024)
     api_debug  = body.get("debug_mode")
-    debug_mode = resolve_debug_mode(api_flag=api_debug, param_flag=DEBUG_MODE)
+    debug_mode = _resolve_request_debug_mode(api_debug)
     request_id = str(uuid.uuid4())[:8]
     t_start    = time.perf_counter()
 
@@ -273,7 +282,7 @@ async def debug_explain(request: Request):
     query = body.get("query", "")
     n_results = int(body.get("n_results", CONTEXT_CHUNKS))
     api_debug = body.get("debug_mode")
-    debug_mode = resolve_debug_mode(api_flag=api_debug, param_flag=DEBUG_MODE)
+    debug_mode = _resolve_request_debug_mode(api_debug)
     if not _indexer_module:
         return {"enabled": debug_mode, "error": "Indexer not available", "debug": None}
     if not query:
@@ -574,14 +583,19 @@ def _file_neighborhood(anchor_file: str, mode: str, workspace: dict, repo_fp: st
 
 
 def _build_context_from_plan(
-    messages: list, planned_files: list, request_id: str, diagnosis: dict | None = None
-) -> tuple[list, list[str]]:
+    messages: list,
+    planned_files: list,
+    request_id: str,
+    diagnosis: dict | None = None,
+    debug_mode: bool = False,
+    return_debug: bool = False,
+) -> tuple[list, list[str]] | tuple[list, list[str], dict | None]:
     """
     Step 2: Fetch all chunks from planned files + semantic search fallback.
     Returns (messages_with_context, files_loaded).
     """
     if not INDEXER_READY:
-        return messages, []
+        return (messages, [], None) if return_debug else (messages, [])
 
     query = next(
         (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
@@ -598,6 +612,33 @@ def _build_context_from_plan(
 
     all_chunks  = []
     files_loaded = []
+    semantic_fallback_files = []
+
+    debug_payload = None
+    if debug_mode:
+        debug_payload = {
+            "query": query,
+            "intent": (diagnosis or {}).get("intent", "planned_context"),
+            "retrieval_route": "planned_context",
+            "orchestration_path": "planned_context",
+            "retrieval": {
+                "route_taken": "planned_context",
+                "route_reason": "Planner + neighborhood expansion",
+                "files_retrieved": [],
+                "raw_candidates": list(planned_files),
+                "selected_candidates": [],
+                "chunks_per_file": {},
+                "coverage": {},
+                "cache_hit": False,
+                "orchestration_path": "planned_context",
+            },
+            "planning": {
+                "planned_files": list(planned_files),
+                "files_loaded": [],
+                "semantic_fallback_files": [],
+            },
+            "final_context": {"files_used": [], "context_size": 0},
+        }
 
     # Fetch full content from planned files + deterministic neighborhood expansion.
     expanded_files = []
@@ -614,17 +655,24 @@ def _build_context_from_plan(
 
     # Always add semantic search results to catch anything the planner missed
     try:
-        semantic = search_codebase(query, n_results=3)
+        semantic = search_codebase(query, n_results=3, debug_mode=debug_mode)
         for c in semantic:
             if c["file"] not in files_loaded:
                 all_chunks.append(c)
                 if c["file"] not in files_loaded:
                     files_loaded.append(c["file"])
+                    semantic_fallback_files.append(c["file"])
     except Exception:
         pass
 
     if not all_chunks:
-        return messages, []
+        if debug_payload is not None:
+            debug_payload["planning"]["files_loaded"] = list(files_loaded)
+            debug_payload["planning"]["semantic_fallback_files"] = list(semantic_fallback_files)
+            debug_payload["retrieval"]["files_retrieved"] = list(files_loaded)
+            debug_payload["retrieval"]["selected_candidates"] = list(files_loaded)
+            debug_payload["final_context"]["files_used"] = list(files_loaded)
+        return (messages, [], debug_payload) if return_debug else (messages, [])
 
     # Build code section — cap total tokens (rough: 4 chars per token, stay under 2500 tokens)
     code_section = "## Retrieved Code\n\n"
@@ -656,12 +704,22 @@ def _build_context_from_plan(
         f"loaded={files_loaded} | chunks={len(all_chunks)}"
     )
 
-    return (
+    final_messages = (
         [{"role": "system", "content": system}] + [
             m for m in messages if m.get("role") != "system"
-        ],
-        files_loaded,
+        ]
     )
+    if debug_payload is not None:
+        debug_payload["planning"]["files_loaded"] = list(files_loaded)
+        debug_payload["planning"]["semantic_fallback_files"] = list(semantic_fallback_files)
+        debug_payload["retrieval"]["files_retrieved"] = list(files_loaded)
+        debug_payload["retrieval"]["selected_candidates"] = list(files_loaded)
+        debug_payload["retrieval"]["chunks_per_file"] = {
+            f: sum(1 for c in all_chunks if c.get("file") == f) for f in sorted(set(files_loaded))
+        }
+        debug_payload["final_context"]["files_used"] = [c.get("file") for c in all_chunks if c.get("file")]
+        debug_payload["final_context"]["context_size"] = sum(len(c.get("content", "")) for c in all_chunks)
+    return (final_messages, files_loaded, debug_payload) if return_debug else (final_messages, files_loaded)
 
 
 # ── Streaming ─────────────────────────────────────────────────────────────────
@@ -722,8 +780,16 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
         if planned_files and not orchestration["skip_neighborhood"]:
             short_names = [f.split("/")[-1] for f in planned_files]
             yield _make_chunk(f"\n📂 _Reading: {', '.join(short_names)}_", request_id)
-            messages, _ = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: _build_context_from_plan(messages, planned_files, request_id, diagnosis)
+            messages, _, debug_payload = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: _build_context_from_plan(
+                    messages,
+                    planned_files,
+                    request_id,
+                    diagnosis,
+                    debug_mode=debug_mode,
+                    return_debug=True,
+                ),
             )
         else:
             status = "Loading source-of-truth config..." if is_fast_path_intent(intent) else "Searching codebase..."
@@ -734,6 +800,10 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                 debug_mode=debug_mode,
                 return_debug=True,
             )
+            if debug_payload is not None:
+                retrieval = debug_payload.setdefault("retrieval", {})
+                retrieval.setdefault("orchestration_path", "direct_retrieval")
+                debug_payload["orchestration_path"] = "direct_retrieval"
 
         t_context = time.perf_counter()
         ctx_s = t_context - t_start
