@@ -248,7 +248,11 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
 
     if decision["decision"] == DECISION_REBUILD_WORKSPACE_ONLY:
         yield {"type": "mapping", "message": "Rebuilding workspace metadata only..."}
-        all_indexed = unchanged
+        # Use the full current filesystem snapshot, not just "unchanged" files.
+        # Older index logic may have produced an incomplete indexed set; workspace-only
+        # rebuilds must apply current detection/extraction logic to all files without
+        # forcing re-embedding or vector-store writes.
+        all_indexed = all_files
         workspace_chunks = []
         for fp in all_indexed:
             try:
@@ -274,7 +278,7 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
         CACHE.flush_metrics()
         yield {
             "type": "done",
-            "indexed": len(unchanged),
+            "indexed": len(all_indexed),
             "chunks": col.count(),
             "project": root_path.name,
             "new": 0,
@@ -282,6 +286,7 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
             "map": pmap,
             "repo_fingerprint": repo_fp,
             "decision": DECISION_REBUILD_WORKSPACE_ONLY,
+            "workspace_rebuild_scope": "all_files",
         }
         return
 

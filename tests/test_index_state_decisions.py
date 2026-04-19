@@ -16,7 +16,11 @@ def _import_indexer_with_stubs():
             pass
 
         def encode(self, texts, show_progress_bar=False):
-            return [[0.0] * 3 for _ in texts]
+            class _FakeVectors(list):
+                def tolist(self):
+                    return list(self)
+
+            return _FakeVectors([[0.0] * 3 for _ in texts])
 
     fake_st.SentenceTransformer = FakeModel
     sys.modules["sentence_transformers"] = fake_st
@@ -81,7 +85,7 @@ class TestIndexStateDecisions(unittest.TestCase):
         d1 = self.indexer.evaluate_index_state({"repo_root": "/repo"}, None, repo_changed=False)
         self.assertEqual(d1["decision"], self.indexer.DECISION_FULL_REBUILD)
 
-        tmp = Path(tempfile.mkdtemp())
+        tmp = Path(tempfile.mkdtemp(dir=Path.cwd()))
         try:
             self.indexer.INDEX_STATE = tmp / "index_state.json"
             self.indexer.INDEX_STATE.write_text("{not-json")
@@ -91,7 +95,7 @@ class TestIndexStateDecisions(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_manifest_discovery_refresh_path_with_workspace_rebuild(self):
-        tmp = Path(tempfile.mkdtemp())
+        tmp = Path(tempfile.mkdtemp(dir=Path.cwd()))
         try:
             (tmp / "src").mkdir(parents=True, exist_ok=True)
             (tmp / "src" / "a.py").write_text("def a():\n    return 1\n")
@@ -119,6 +123,74 @@ class TestIndexStateDecisions(unittest.TestCase):
             )
             self.assertIn("package.json", ws2["manifests"])
         finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_workspace_only_rebuild_uses_all_files_scope_for_missed_files(self):
+        tmp = Path(tempfile.mkdtemp(dir=Path.cwd()))
+        original_hash_store = self.indexer.HASH_STORE
+        original_project_map = self.indexer.PROJECT_MAP
+        original_symbol_index = self.indexer.SYMBOL_INDEX
+        original_workspace_index = self.indexer.WORKSPACE_INDEX
+        original_index_state = self.indexer.INDEX_STATE
+        original_cache = self.indexer.CACHE
+        original_eval = self.indexer.evaluate_index_state
+        try:
+            self.indexer.HASH_STORE = tmp / ".file_hashes.json"
+            self.indexer.PROJECT_MAP = tmp / "project_map.json"
+            self.indexer.SYMBOL_INDEX = tmp / "symbol_index.json"
+            self.indexer.WORKSPACE_INDEX = tmp / "workspace_index.json"
+            self.indexer.INDEX_STATE = tmp / "index_state.json"
+            self.indexer.CACHE = self.indexer.AndesCacheManager(tmp / "cache")
+
+            src = tmp / "src"
+            src.mkdir(parents=True, exist_ok=True)
+            code = src / "a.py"
+            manifest = tmp / "AndroidManifest.xml"
+            code.write_text("def a():\n    return 1\n")
+
+            # Baseline index snapshot when manifest does not yet exist.
+            py_hash = self.indexer._file_hash(code)
+            self.indexer._save_hashes(
+                {
+                    "__root__": str(tmp.resolve()),
+                    "src/a.py": py_hash,
+                    "__fingerprint__": "prev-fp",
+                }
+            )
+            self.indexer._save_index_state({"repo_root": str(tmp.resolve()), "index_version": "1"})
+            baseline_workspace = self.indexer.build_workspace_index(
+                tmp,
+                [code],
+                self.indexer._chunk_file(code, tmp),
+                repo_fingerprint="prev-fp",
+                changed_paths=[],
+                force_refresh=True,
+            )
+            self.assertNotIn("AndroidManifest.xml", baseline_workspace["manifests"])
+
+            # Add a newly detectable file and force workspace-only rebuild decision.
+            manifest.write_text("<manifest package=\"com.example\"/>")
+
+            def _force_workspace_only(_current, _stored, repo_changed):
+                return {
+                    "decision": self.indexer.DECISION_REBUILD_WORKSPACE_ONLY,
+                    "reasons": ["Workspace extraction version changed; rebuilding workspace metadata"],
+                }
+
+            self.indexer.evaluate_index_state = _force_workspace_only
+            events = list(self.indexer.index_codebase_stream(str(tmp)))
+            done = [e for e in events if e.get("type") == "done"][-1]
+            self.assertEqual(done.get("decision"), self.indexer.DECISION_REBUILD_WORKSPACE_ONLY)
+            self.assertEqual(done.get("workspace_rebuild_scope"), "all_files")
+            self.assertIn("AndroidManifest.xml", done["map"]["workspace"]["manifests"])
+        finally:
+            self.indexer.HASH_STORE = original_hash_store
+            self.indexer.PROJECT_MAP = original_project_map
+            self.indexer.SYMBOL_INDEX = original_symbol_index
+            self.indexer.WORKSPACE_INDEX = original_workspace_index
+            self.indexer.INDEX_STATE = original_index_state
+            self.indexer.CACHE = original_cache
+            self.indexer.evaluate_index_state = original_eval
             shutil.rmtree(tmp, ignore_errors=True)
 
 
