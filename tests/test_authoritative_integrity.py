@@ -9,6 +9,9 @@ from andes_cache.integrity import (
     REASON_EMBEDDED_NOT_RETRIEVABLE,
     validate_authoritative_integrity,
     repair_authoritative_integrity,
+    select_healthy_authoritative_path,
+    IntegrityReport,
+    FileIntegrityStatus,
 )
 
 
@@ -71,10 +74,34 @@ class TestAuthoritativeIntegrity(unittest.TestCase):
 
 
 class TestIntegrationGuardrails(unittest.TestCase):
+    def test_selector_allows_healthy_top_ranked_path_with_stale_lower_candidate(self):
+        calls = []
+
+        def validate_path(path: str):
+            calls.append(path)
+            if path == "app/build.gradle":
+                return IntegrityReport(
+                    overall_status=INTEGRITY_HEALTHY,
+                    files=[FileIntegrityStatus(path=path, status=INTEGRITY_HEALTHY, reasons=[])],
+                )
+            return IntegrityReport(
+                overall_status=INTEGRITY_STALE,
+                files=[FileIntegrityStatus(path=path, status=INTEGRITY_STALE, reasons=[REASON_DISCOVERED_NOT_EMBEDDED])],
+            )
+
+        selected, attempts = select_healthy_authoritative_path(
+            ["app/build.gradle", "services/api/package.json"],
+            validate_path_fn=validate_path,
+        )
+        self.assertEqual(selected, "app/build.gradle")
+        self.assertEqual(calls, ["app/build.gradle"])
+        self.assertEqual(attempts[0]["overall_status"], INTEGRITY_HEALTHY)
+
     def test_strict_source_truth_gated_by_integrity(self):
         src = Path("indexer.py").read_text(encoding="utf-8")
-        self.assertIn("integrity_report = _validate_and_repair_authoritative_integrity(", src)
+        self.assertIn("selected_healthy_path, integrity_attempts = select_healthy_authoritative_path(", src)
         self.assertIn("Source-of-Truth Index Integrity Limitation", src)
+        self.assertIn("priority_files = [selected_healthy_path]", src)
 
     def test_no_full_rebuild_dependency_in_targeted_repair(self):
         src = Path("indexer.py").read_text(encoding="utf-8")
@@ -85,6 +112,7 @@ class TestIntegrationGuardrails(unittest.TestCase):
         segment = src[start:end]
         self.assertIn("_repair_index_paths", segment)
         self.assertNotIn("delete_collection", segment)
+        self.assertIn('col.delete(where={"file": rel})', src)
 
     def test_integrity_checks_cover_multi_ecosystem_authoritative_files(self):
         workspace = {

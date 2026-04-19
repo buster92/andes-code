@@ -174,3 +174,24 @@ def repair_authoritative_integrity(
             f.repair_attempted = True
             f.repair_succeeded = f.status == INTEGRITY_HEALTHY
     return repaired
+
+
+def select_healthy_authoritative_path(
+    candidate_paths: list[str],
+    validate_path_fn: Callable[[str], IntegrityReport],
+    max_candidates: int = 6,
+) -> tuple[str, list[dict]]:
+    """
+    Validate a small ranked shortlist and return the first healthy path.
+    This keeps strict-answer gating narrow and avoids blocking on lower-ranked
+    stale candidates once a healthy authoritative source is confirmed.
+    """
+    attempts: list[dict] = []
+    for path in candidate_paths[:max_candidates]:
+        report = validate_path_fn(path)
+        report_dict = report.to_dict()
+        report_dict["candidate"] = path
+        attempts.append(report_dict)
+        if report.overall_status == INTEGRITY_HEALTHY:
+            return path, attempts
+    return "", attempts

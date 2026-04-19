@@ -40,6 +40,7 @@ from andes_cache.integrity import (
     INTEGRITY_HEALTHY,
     validate_authoritative_integrity,
     repair_authoritative_integrity,
+    select_healthy_authoritative_path,
 )
 from andes_cache.versions import (
     INDEX_VERSION,
@@ -1314,13 +1315,34 @@ def _retrieve_config_first(
         debug_payload["source_of_truth"]["fallback_used"] = False
         debug_payload["source_of_truth"]["integrity"] = {}
 
-    integrity_report = _validate_and_repair_authoritative_integrity(
-        _repo_root_path_from_hashes(),
-        candidate_paths=priority_files,
+    root_path_for_integrity = _repo_root_path_from_hashes()
+    selected_healthy_path, integrity_attempts = select_healthy_authoritative_path(
+        priority_files,
+        validate_path_fn=lambda p: validate_authoritative_integrity(
+            workspace=workspace,
+            hash_state=_load_hashes(),
+            fetch_exact_file=_fetch_exact_file,
+            file_hash_lookup=lambda rp: _file_hash(root_path_for_integrity / rp) if (root_path_for_integrity / rp).exists() else None,
+            expected_chunk_count_lookup=lambda rp: _expected_chunk_count_for_file(root_path_for_integrity, rp),
+            candidate_paths=[p],
+        ),
+        max_candidates=min(6, max(1, len(priority_files))),
     )
+    if not selected_healthy_path and priority_files:
+        # Attempt targeted repair only for the highest-priority authoritative path first.
+        repaired_attempt = _validate_and_repair_authoritative_integrity(
+            root_path_for_integrity,
+            candidate_paths=[priority_files[0]],
+        )
+        integrity_attempts.append(repaired_attempt | {"candidate": priority_files[0], "repair_ran": True})
+        if repaired_attempt.get("overall_status") == INTEGRITY_HEALTHY:
+            selected_healthy_path = priority_files[0]
     if debug_payload is not None:
-        debug_payload["source_of_truth"]["integrity"] = integrity_report
-    if integrity_report.get("overall_status") != INTEGRITY_HEALTHY:
+        debug_payload["source_of_truth"]["integrity"] = {
+            "selected_healthy_path": selected_healthy_path,
+            "attempts": integrity_attempts,
+        }
+    if not selected_healthy_path:
         limitation = {
             "content": (
                 "# Source-of-Truth Index Integrity Limitation\n"
@@ -1341,6 +1363,7 @@ def _retrieve_config_first(
         if debug_payload is not None:
             debug_payload["failure_signals"]["expected_but_missing_authority"] = True
         return [limitation]
+    priority_files = [selected_healthy_path] + [p for p in priority_files if p != selected_healthy_path]
 
     collected = []
     found_authoritative = False
@@ -1985,6 +2008,10 @@ def _repair_index_paths(root_path: Path, rel_paths: list[str]) -> bool:
 
     for rel in sorted(set(rel_paths)):
         fp = root_path / rel
+        try:
+            col.delete(where={"file": rel})
+        except Exception as e:
+            logging.warning(f"Integrity repair could not clear stale vectors for {rel}: {e}")
         if not fp.exists() or not fp.is_file():
             continue
         try:
