@@ -39,7 +39,13 @@ from andes_cache.versions import (
     PROMPT_TEMPLATE_VERSION,
     RETRIEVAL_POLICY_VERSION,
 )
-from andes_cache.debug import resolve_debug_mode, initialize_payload, finalize_payload, apply_failure_signals
+from andes_cache.debug import (
+    resolve_debug_mode,
+    initialize_payload,
+    finalize_payload,
+    apply_failure_signals,
+    populate_retrieval_snapshot,
+)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 EMBED_MODEL   = "all-MiniLM-L6-v2"
@@ -52,7 +58,6 @@ WORKSPACE_INDEX = Path(__file__).parent / "index" / "workspace_index.json"
 CACHE_DIR = Path(__file__).parent / "index" / "cache"
 CACHE = AndesCacheManager(CACHE_DIR)
 CURRENT_REPO_FINGERPRINT = ""
-LAST_DEBUG_PAYLOAD = None
 EMBED_BATCH   = 64
 CHROMA_BATCH  = 4096
 CHUNK_LINES   = 80
@@ -316,7 +321,8 @@ def search(
     n_results: int = 5,
     debug_mode: bool | None = None,
     debug_payload: dict | None = None,
-) -> list[dict]:
+    return_debug: bool = False,
+) -> list[dict] | tuple[list[dict], dict | None]:
     """
     Smart retrieval with query routing and re-ranking.
 
@@ -326,15 +332,29 @@ def search(
       - Architectural query  → fetch more candidates (8 instead of 5)
       - Default              → semantic search + re-ranking
     """
-    global LAST_DEBUG_PAYLOAD
     debug_enabled = resolve_debug_mode(param_flag=debug_mode)
+    payload_out = None
+
+    def _ret(results: list[dict], payload: dict | None = None):
+        if return_debug:
+            return results, payload
+        return results
     count = col.count()
     if count == 0:
         if debug_enabled:
             decision = classify_query_intent_details(query)
             payload = debug_payload or initialize_payload(query, decision, _load_workspace_index())
-            LAST_DEBUG_PAYLOAD = finalize_payload(payload, [])
-        return []
+            payload_out = finalize_payload(payload, [])
+            payload_out = apply_failure_signals(
+                payload_out,
+                query=query,
+                intent=decision["intent"],
+                retrieval_route=decision["retrieval_route"],
+                top_score=None,
+                final_chunks=[],
+            )
+            return _ret([], payload_out)
+        return _ret([])
     decision = classify_query_intent_details(query)
     intent = decision["intent"]
     retrieval_route = decision["retrieval_route"]
@@ -352,9 +372,23 @@ def search(
         )
         if cached:
             if payload is not None:
-                payload["retrieval"]["selected_candidates"] = [c.get("file", "") for c in cached[:n_results]]
-                LAST_DEBUG_PAYLOAD = finalize_payload(payload, cached[:n_results])
-            return cached[:n_results]
+                payload = populate_retrieval_snapshot(
+                    payload,
+                    chunks=cached[:n_results],
+                    raw_candidates=[c.get("file", "") for c in cached[:n_results]],
+                    cache_hit=True,
+                )
+                payload_out = finalize_payload(payload, cached[:n_results])
+                payload_out = apply_failure_signals(
+                    payload_out,
+                    query=query,
+                    intent=intent,
+                    retrieval_route=retrieval_route,
+                    top_score=None,
+                    final_chunks=cached[:n_results],
+                )
+                return _ret(cached[:n_results], payload_out)
+            return _ret(cached[:n_results])
 
     if retrieval_route == "source_of_truth":
         final = _retrieve_config_first(
@@ -376,18 +410,21 @@ def search(
                 retrieval_route=retrieval_route,
             )
         if payload is not None:
-            payload["retrieval"]["raw_candidates"] = payload.get("source_of_truth", {}).get("priority_files", [])
-            payload["retrieval"]["selected_candidates"] = [c.get("file", "") for c in final]
-            payload["retrieval"]["files_retrieved"] = [c.get("file", "") for c in final]
-            payload["retrieval"]["chunks_per_file"] = {
-                c.get("file", ""): sum(1 for x in final if x.get("file", "") == c.get("file", "")) for c in final
-            }
-            payload["retrieval"]["coverage"] = {c.get("file", ""): c.get("coverage", {}) for c in final}
-            payload = apply_failure_signals(
-                payload, query=query, retrieval_route=retrieval_route, top_score=None, final_chunks=final
+            payload = populate_retrieval_snapshot(
+                payload,
+                chunks=final,
+                raw_candidates=payload.get("source_of_truth", {}).get("priority_files", []),
             )
-            LAST_DEBUG_PAYLOAD = finalize_payload(payload, final)
-        return final
+            payload_out = finalize_payload(payload, final)
+            payload_out = apply_failure_signals(
+                payload_out,
+                query=query,
+                intent=intent,
+                retrieval_route=retrieval_route,
+                top_score=None,
+                final_chunks=final,
+            )
+        return _ret(final, payload_out)
 
     # ── Route 1: Filename detected ────────────────────────────────────────────
     file_match = re.search(
@@ -410,10 +447,21 @@ def search(
                     retrieval_route=retrieval_route,
                 )
             if payload is not None:
-                payload["retrieval"]["raw_candidates"] = [c.get("file", "") for c in results]
-                payload["retrieval"]["selected_candidates"] = [c.get("file", "") for c in final]
-                LAST_DEBUG_PAYLOAD = finalize_payload(payload, final)
-            return final
+                payload = populate_retrieval_snapshot(
+                    payload,
+                    chunks=final,
+                    raw_candidates=[c.get("file", "") for c in results],
+                )
+                payload_out = finalize_payload(payload, final)
+                payload_out = apply_failure_signals(
+                    payload_out,
+                    query=query,
+                    intent=intent,
+                    retrieval_route=retrieval_route,
+                    top_score=None,
+                    final_chunks=final,
+                )
+            return _ret(final, payload_out)
 
     # ── Route 1b: Structured workspace questions ─────────────────────────────
     structured = _structured_query_results(query)
@@ -429,10 +477,21 @@ def search(
                 retrieval_route=retrieval_route,
             )
         if payload is not None:
-            payload["retrieval"]["raw_candidates"] = [c.get("file", "") for c in structured]
-            payload["retrieval"]["selected_candidates"] = [c.get("file", "") for c in final]
-            LAST_DEBUG_PAYLOAD = finalize_payload(payload, final)
-        return final
+            payload = populate_retrieval_snapshot(
+                payload,
+                chunks=final,
+                raw_candidates=[c.get("file", "") for c in structured],
+            )
+            payload_out = finalize_payload(payload, final)
+            payload_out = apply_failure_signals(
+                payload_out,
+                query=query,
+                intent=intent,
+                retrieval_route=retrieval_route,
+                top_score=None,
+                final_chunks=final,
+            )
+        return _ret(final, payload_out)
 
     # ── Route 2: Symbol name lookup ───────────────────────────────────────────
     symidx = _load_json(SYMBOL_INDEX)
@@ -494,13 +553,11 @@ def search(
             retrieval_route=retrieval_route,
         )
     if payload is not None:
-        payload["retrieval"]["raw_candidates"] = [c.get("file", "") for c in candidates]
-        payload["retrieval"]["selected_candidates"] = [c.get("file", "") for c in final]
-        payload["retrieval"]["files_retrieved"] = [c.get("file", "") for c in final]
-        payload["retrieval"]["chunks_per_file"] = {
-            c.get("file", ""): sum(1 for x in final if x.get("file", "") == c.get("file", "")) for c in final
-        }
-        payload["retrieval"]["coverage"] = {c.get("file", ""): c.get("coverage", {}) for c in final}
+        payload = populate_retrieval_snapshot(
+            payload,
+            chunks=final,
+            raw_candidates=[c.get("file", "") for c in candidates],
+        )
         top = []
         for rank, c in enumerate(ranked[: min(5, len(ranked))], start=1):
             top.append({
@@ -510,25 +567,28 @@ def search(
                 "reason": c.get("_debug_reason", "semantic"),
             })
         payload["ranking"]["top_candidates"] = top
-        payload = apply_failure_signals(
-            payload,
+        payload_out = finalize_payload(payload, final)
+        payload_out = apply_failure_signals(
+            payload_out,
             query=query,
+            intent=intent,
             retrieval_route=retrieval_route,
             top_score=(top[0]["score"] if top else None),
             final_chunks=final,
         )
-        LAST_DEBUG_PAYLOAD = finalize_payload(payload, final)
-    return final
-
-
-def get_last_debug_payload() -> dict | None:
-    return LAST_DEBUG_PAYLOAD
+    return _ret(final, payload_out)
 
 
 def inspect_query_debug(query: str, n_results: int = 5, debug_mode: bool = True) -> dict:
     payload = initialize_payload(query, classify_query_intent_details(query), _load_workspace_index())
-    _ = search(query, n_results=n_results, debug_mode=debug_mode, debug_payload=payload)
-    return get_last_debug_payload() or payload
+    _, dbg = search(
+        query,
+        n_results=n_results,
+        debug_mode=debug_mode,
+        debug_payload=payload,
+        return_debug=True,
+    )
+    return dbg or payload
 
 
 def explain_retrieval_decision(query: str, n_results: int = 5) -> dict:
@@ -1210,8 +1270,6 @@ def _retrieve_config_first(
                 "authority_level": "declared",
             }
             if debug_payload is not None:
-                if not any("androidmanifest.xml" in p.lower() for p in workspace.get("manifests", [])):
-                    debug_payload["source_of_truth"]["missing_expected"].append("AndroidManifest.xml")
                 debug_payload["failure_signals"]["expected_but_missing_authority"] = False
             return [summary] + collected[: max(0, n_results - 1)]
 
