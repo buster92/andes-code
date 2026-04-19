@@ -1628,17 +1628,19 @@ async function streamResponse(userText) {
             debugPayload = chunk.debug || null;
             continue;
           }
+          if (chunk.object === 'andescode.error') {
+            sawErrorChunk = true;
+            if (statusEl.parentNode) statusEl.remove();
+            inStatus = false;
+            const phase = chunk.error?.phase || 'unknown';
+            const detail = chunk.error?.message || 'Unknown error';
+            msgEl.content.innerHTML = `<div style="color:var(--danger);font-family:var(--font-mono);font-size:12px;white-space:pre-wrap;">✗ AndesCode pipeline failed (${escapeHtml(phase)})\n${escapeHtml(detail)}</div>`;
+            continue;
+          }
           const content = chunk.choices?.[0]?.delta?.content ?? '';
           if (!content) continue;
 
           currentRawText += content;
-          if (content.includes('❌')) {
-            sawErrorChunk = true;
-            if (statusEl.parentNode) statusEl.remove();
-            inStatus = false;
-            msgEl.content.innerHTML = `<div style="color:var(--danger);font-family:var(--font-mono);font-size:12px;white-space:pre-wrap;">${escapeHtml(content.trim())}</div>`;
-            continue;
-          }
 
           // First real token
           if (ttft === null && content && !content.includes('Searching') && !content.includes('Thinking')) {

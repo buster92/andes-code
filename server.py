@@ -118,6 +118,19 @@ def _make_error_chunk(request_id: str, phase: str, err: Exception | str) -> str:
         request_id,
     )
 
+
+def _make_pipeline_error_event(request_id: str, phase: str, err: Exception | str) -> str:
+    payload = {
+        "id": f"chatcmpl-{request_id}",
+        "object": "andescode.error",
+        "created": int(time.time()),
+        "error": {
+            "phase": phase,
+            "message": _safe(err),
+        },
+    }
+    return f"data: {json.dumps(payload)}\n\n"
+
 for _lib in ("httpx", "httpcore", "sentence_transformers", "transformers", "huggingface_hub"):
     logging.getLogger(_lib).setLevel(logging.ERROR)
 
@@ -276,6 +289,8 @@ def _run_index_stream(path: str, source: str, emit_event, change_batch: ChangeBa
 
         from indexer import index_codebase_stream
         done_event = None
+        embedding_started_logged = False
+        storage_started_logged = False
         for event in index_codebase_stream(path):
             event = dict(event)
             event["source"] = source
@@ -283,11 +298,15 @@ def _run_index_stream(path: str, source: str, emit_event, change_batch: ChangeBa
             if etype == "scan":
                 _index_phase_log(source, "scan_done", files=event.get("files"), new=event.get("new"), unchanged=event.get("unchanged"))
             elif etype == "embed":
-                _index_phase_log(source, "embedding_started", done=event.get("done"), total=event.get("total"))
+                if not embedding_started_logged:
+                    _index_phase_log(source, "embedding_started", total=event.get("total"))
+                    embedding_started_logged = True
                 if event.get("done") == event.get("total"):
                     _index_phase_log(source, "embedding_completed", total=event.get("total"))
             elif etype == "store":
-                _index_phase_log(source, "storage_started", done=event.get("done"), total=event.get("total"))
+                if not storage_started_logged:
+                    _index_phase_log(source, "storage_started", total=event.get("total"))
+                    storage_started_logged = True
                 if event.get("done") == event.get("total"):
                     _index_phase_log(source, "storage_completed", total=event.get("total"))
             elif etype == "mapping":
@@ -1129,6 +1148,7 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
             yield format_debug_sse_event(debug_payload)
     except Exception as e:
         _phase_log(request_id, "pipeline_failed", failed_phase=phase, error=e)
+        yield _make_pipeline_error_event(request_id, phase, e)
         yield _make_error_chunk(request_id, phase, e)
     finally:
         yield "data: [DONE]\n\n"

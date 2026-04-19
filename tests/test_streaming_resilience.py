@@ -29,6 +29,20 @@ def _chunk_contents(events):
     return out
 
 
+def _chunk_objects(events):
+    out = []
+    for raw in events:
+        if not raw.startswith("data: ") or raw.strip() == "data: [DONE]":
+            continue
+        payload = raw[len("data: "):].strip()
+        try:
+            import json
+            out.append(json.loads(payload))
+        except Exception:
+            continue
+    return out
+
+
 class _CaptureHandler(logging.Handler):
     def __init__(self):
         super().__init__()
@@ -75,9 +89,11 @@ class TestStreamingResilience(unittest.TestCase):
 
         events = asyncio.run(_collect_events(server))
         contents = "\n".join(_chunk_contents(events))
+        objects = _chunk_objects(events)
 
         self.assertIn("❌ Sorry", contents)
         self.assertIn("phase: context_build", contents)
+        self.assertTrue(any(obj.get("object") == "andescode.error" for obj in objects))
         self.assertEqual(events[-1].strip(), "data: [DONE]")
 
     def test_phase_logs_and_external_log_path(self):
@@ -117,6 +133,41 @@ class TestStreamingResilience(unittest.TestCase):
         log_path = Path(server.LOG_PATH).resolve()
         self.assertNotEqual(log_path, repo_root / "audit.log")
         self.assertFalse(str(log_path).startswith(str(repo_root)))
+
+    def test_index_logging_emits_started_phases_once(self):
+        server = self.server
+        server.INDEXER_READY = True
+        server._indexer_module = object()
+        old_auto_manager = server._auto_index_manager
+        server._auto_index_manager = None
+
+        import sys
+        fake_indexer = sys.modules["indexer"]
+        fake_indexer.index_codebase_stream = lambda _path: iter([
+            {"type": "scan", "files": 3, "new": 2, "unchanged": 1},
+            {"type": "embed", "done": 1, "total": 2},
+            {"type": "embed", "done": 2, "total": 2},
+            {"type": "store", "done": 1, "total": 2},
+            {"type": "store", "done": 2, "total": 2},
+            {"type": "mapping", "message": "Building project map..."},
+            {"type": "done", "indexed": 2, "chunks": 2, "decision": "incremental"},
+        ])
+
+        handler = _CaptureHandler()
+        server.audit.addHandler(handler)
+        events = []
+        try:
+            ok = server._run_index_stream("/tmp/project", "manual", events.append)
+        finally:
+            server.audit.removeHandler(handler)
+            server._auto_index_manager = old_auto_manager
+
+        self.assertTrue(ok)
+        logs = "\n".join(handler.messages)
+        self.assertEqual(logs.count("phase=embedding_started"), 1)
+        self.assertEqual(logs.count("phase=storage_started"), 1)
+        self.assertIn("phase=embedding_completed", logs)
+        self.assertIn("phase=storage_completed", logs)
 
 
 if __name__ == "__main__":
