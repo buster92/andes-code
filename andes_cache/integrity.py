@@ -16,6 +16,7 @@ REASON_DISCOVERED_NOT_EMBEDDED = "discovered_not_embedded"
 REASON_EMBEDDED_NOT_RETRIEVABLE = "embedded_not_retrievable"
 REASON_RETRIEVABLE_BUT_INCOMPLETE = "retrievable_but_incomplete"
 REASON_WORKSPACE_HASH_MISMATCH = "workspace_hash_mismatch"
+REASON_MISSING_ON_DISK = "missing_on_disk"
 REASON_REPAIR_FAILED = "repair_failed"
 
 
@@ -44,11 +45,13 @@ class IntegrityReport:
     repair_succeeded: bool = False
 
     def to_dict(self) -> dict:
+        reason_codes = sorted({reason for f in self.files for reason in f.reasons})
         return {
             "overall_status": self.overall_status,
             "repair_ran": self.repair_ran,
             "repair_succeeded": self.repair_succeeded,
             "failing_files": [f.path for f in self.files if f.status != INTEGRITY_HEALTHY],
+            "reason_codes": reason_codes,
             "files": [f.to_dict() for f in self.files],
         }
 
@@ -92,6 +95,7 @@ def validate_authoritative_integrity(
     hash_state: dict,
     fetch_exact_file: Callable[[str, int], list[dict]],
     file_hash_lookup: Callable[[str], str | None] | None = None,
+    file_exists_lookup: Callable[[str], bool] | None = None,
     expected_chunk_count_lookup: Callable[[str], int | None] | None = None,
     candidate_paths: list[str] | None = None,
     max_files: int = 24,
@@ -107,9 +111,13 @@ def validate_authoritative_integrity(
         if not embedded:
             reasons.append(REASON_DISCOVERED_NOT_EMBEDDED)
 
-        if file_hash_lookup and embedded:
+        if file_exists_lookup and not file_exists_lookup(path):
+            reasons.append(REASON_MISSING_ON_DISK)
+        if file_hash_lookup:
             current_hash = file_hash_lookup(path)
-            if current_hash and current_hash != embedded_hash:
+            if current_hash is None and not file_exists_lookup:
+                reasons.append(REASON_MISSING_ON_DISK)
+            elif embedded and current_hash is not None and current_hash != embedded_hash:
                 reasons.append(REASON_WORKSPACE_HASH_MISMATCH)
 
         chunks = fetch_exact_file(path, 120)
@@ -121,7 +129,7 @@ def validate_authoritative_integrity(
             reasons.extend(chunk_reasons)
 
         status = INTEGRITY_HEALTHY if not reasons else (
-            INTEGRITY_STALE if any(r in {REASON_DISCOVERED_NOT_EMBEDDED, REASON_WORKSPACE_HASH_MISMATCH} for r in reasons)
+            INTEGRITY_STALE if any(r in {REASON_DISCOVERED_NOT_EMBEDDED, REASON_WORKSPACE_HASH_MISMATCH, REASON_MISSING_ON_DISK} for r in reasons)
             else INTEGRITY_DEGRADED
         )
         statuses.append(
@@ -174,6 +182,22 @@ def repair_authoritative_integrity(
             f.repair_attempted = True
             f.repair_succeeded = f.status == INTEGRITY_HEALTHY
     return repaired
+
+
+def prune_missing_on_disk_hashes(hash_state: dict, report: IntegrityReport) -> tuple[dict, list[str]]:
+    if not hash_state:
+        return {}, []
+    missing_paths = sorted(
+        {
+            f.path
+            for f in report.files
+            if REASON_MISSING_ON_DISK in f.reasons and hash_state.get(f.path) is not None
+        }
+    )
+    if not missing_paths:
+        return dict(hash_state), []
+    cleaned = {k: v for k, v in hash_state.items() if k not in set(missing_paths)}
+    return cleaned, missing_paths
 
 
 def select_healthy_authoritative_path(
