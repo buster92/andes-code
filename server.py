@@ -791,19 +791,35 @@ def _file_neighborhood(anchor_file: str, mode: str, workspace: dict, repo_fp: st
             return cached
 
     neighborhood = [anchor_file]
-    imports = workspace.get("import_graph", {})
-    file_to_module = workspace.get("file_to_module_map", {})
+    # indexer stores import_graph as structured metadata:
+    # {"edge_count": int, "samples": {source_file: [deps...]}}
+    # (not as a raw adjacency map).
+    import_graph = workspace.get("import_graph", {}) if isinstance(workspace, dict) else {}
+    if not isinstance(import_graph, dict):
+        import_graph = {}
+    imports = import_graph.get("samples", {})
+    if not isinstance(imports, dict):
+        imports = {}
+
+    file_to_module = workspace.get("file_to_module_map", {}) if isinstance(workspace, dict) else {}
+    if not isinstance(file_to_module, dict):
+        file_to_module = {}
     target_module = file_to_module.get(anchor_file)
-    for source, deps in imports.items():
+    for source in sorted(imports):
+        deps = imports.get(source)
+        if not isinstance(deps, (list, tuple, set)):
+            continue
         if anchor_file in deps and source not in neighborhood:
             neighborhood.append(source)
-    neighborhood.extend([d for d in imports.get(anchor_file, []) if d not in neighborhood])
+    anchor_deps = imports.get(anchor_file, [])
+    if isinstance(anchor_deps, (list, tuple, set)):
+        neighborhood.extend([d for d in anchor_deps if isinstance(d, str) and d not in neighborhood])
     if target_module:
-        for f, module in file_to_module.items():
+        for f, module in sorted(file_to_module.items()):
             if module == target_module and f not in neighborhood:
                 neighborhood.append(f)
     stem = Path(anchor_file).stem
-    likely_tests = [f for f in file_to_module if stem in f and "test" in f.lower()]
+    likely_tests = [f for f in sorted(file_to_module) if stem in f and "test" in f.lower()]
     neighborhood.extend([f for f in likely_tests if f not in neighborhood])
     final = neighborhood[:8]
     if cache and repo_fp:

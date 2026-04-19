@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import types
 import unittest
 from pathlib import Path
 
@@ -168,6 +169,82 @@ class TestStreamingResilience(unittest.TestCase):
         self.assertEqual(logs.count("phase=storage_started"), 1)
         self.assertIn("phase=embedding_completed", logs)
         self.assertIn("phase=storage_completed", logs)
+
+    def test_file_neighborhood_handles_structured_import_graph_without_type_error(self):
+        server = self.server
+        workspace = {
+            "import_graph": {
+                "edge_count": 5,
+                "samples": {
+                    "ScheduleFragment.kt": ["GuideViewModel.kt"],
+                },
+            },
+            "file_to_module_map": {
+                "ScheduleFragment.kt": "app",
+                "GuideViewModel.kt": "app",
+            },
+        }
+
+        result = server._file_neighborhood("ScheduleFragment.kt", "bugfix", workspace, repo_fp="")
+
+        self.assertIn("ScheduleFragment.kt", result)
+        self.assertIn("GuideViewModel.kt", result)
+
+    def test_file_neighborhood_ignores_malformed_samples_safely(self):
+        server = self.server
+        workspace = {
+            "import_graph": {
+                "edge_count": 5,
+                "samples": 123,
+            },
+            "file_to_module_map": {
+                "ScheduleFragment.kt": "app",
+                "GuideViewModel.kt": "app",
+            },
+        }
+
+        result = server._file_neighborhood("ScheduleFragment.kt", "bugfix", workspace, repo_fp="")
+
+        self.assertIn("ScheduleFragment.kt", result)
+
+    def test_planned_context_streaming_with_structured_import_graph_does_not_emit_pipeline_error(self):
+        server = self.server
+        server.INDEXER_READY = True
+        server._indexer_module = types.SimpleNamespace(
+            _load_project_map=lambda: {"project": "demo", "file_symbols": {"ScheduleFragment.kt": ["render"]}},
+            _load_workspace_index=lambda: {
+                "import_graph": {
+                    "edge_count": 5,
+                    "samples": {
+                        "ScheduleFragment.kt": ["GuideViewModel.kt"],
+                    },
+                },
+                "file_to_module_map": {
+                    "ScheduleFragment.kt": "app",
+                    "GuideViewModel.kt": "app",
+                },
+            },
+            get_repo_fingerprint=lambda: "fp-structured-import-graph",
+            get_chunks_for_file=lambda fname: [{"file": fname, "content": f"// chunk for {fname}", "full_file": True}],
+            CACHE=None,
+        )
+        server.classify_query_intent_details = lambda _query: {
+            "intent": "code_fix_or_patch",
+            "retrieval_route": "semantic",
+        }
+        server.orchestration_plan = lambda _intent: {"skip_patch_plan": False, "skip_neighborhood": False}
+        server._diagnose_query = lambda _query, _intent: {"intent": "code_fix_or_patch", "mode": "bugfix"}
+        server._plan_files = lambda _query, _pmap: ["ScheduleFragment.kt"]
+        server.search_codebase = lambda *_args, **_kwargs: []
+
+        events = asyncio.run(_collect_events(server))
+        contents = "\n".join(_chunk_contents(events))
+        objects = _chunk_objects(events)
+
+        self.assertIn("stub-token", contents)
+        self.assertFalse(any(obj.get("object") == "andescode.error" for obj in objects))
+        self.assertNotIn("phase: context_build", contents)
+        self.assertEqual(events[-1].strip(), "data: [DONE]")
 
 
 if __name__ == "__main__":
