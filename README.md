@@ -173,7 +173,7 @@ generate_diff_preview(old_text, new_text, file_path="src/example.py")
 - Your source code (never read by any external server)
 - ChromaDB vector embeddings of your code
 - Every query and every response
-- The audit log at `audit.log`
+- Runtime logs in `~/Documents/AndesCode/` (`server.log`, `app.log`)
 - Project map, symbol index, and file hash cache
 
 ### Offline enforcement
@@ -195,18 +195,33 @@ os.environ["HF_HUB_OFFLINE"]       = "1"
 
 Both are cached permanently after first run.
 
-### Audit log format
+### Runtime log format and location
 
-The audit log records metadata only — no code content, no query text, no responses. Absolute paths and usernames are stripped from all log entries.
+Runtime logs are written outside the repository to:
+
+- `~/Documents/AndesCode/server.log` (chat + indexing pipeline phases)
+- `~/Documents/AndesCode/app.log` (desktop wrapper lifecycle/setup)
+
+Logs record metadata only — no code content, no query text, no responses. Absolute paths and usernames are stripped from log entries.
 
 ```
-2026-04-08 09:15:33 | REQUEST d24024dd | tokens=1024 | messages=1
-2026-04-08 09:15:34 | CONTEXT d24024dd | planned=['server.py', 'indexer.py'] | loaded=['server.py', 'indexer.py'] | chunks=14
-2026-04-08 09:15:42 | STREAM_DONE d24024dd | context=1.1s | think=2.3s | ttft=2.1s | total=8.4s | chunks=47
+2026-04-08 09:15:33 | CHAT d24024dd | phase=request_received | max_tokens=1024 | message_count=1
+2026-04-08 09:15:34 | CHAT d24024dd | phase=context_build_start | path=direct_retrieval
+2026-04-08 09:15:42 | CHAT d24024dd | phase=generation_completed | context_s=1.1 | think_s=2.3 | ttft_s=2.1 | total_s=8.4 | chunks=47
 ```
 
 **Logged:** request ID, token count, file names of retrieved chunks, timing.  
 **Never logged:** query text, response text, code content, file paths, usernames.
+
+### Troubleshooting stuck responses
+
+If the UI shows status updates but no answer:
+
+1. Open `~/Documents/AndesCode/server.log`.
+2. Find the request by `request_id` and inspect the final `phase=...` line.
+3. For failures, look for `phase=pipeline_failed` plus `failed_phase=...` and `error=...`.
+
+The frontend now surfaces backend stream failures as visible assistant errors, and streams always terminate with `[DONE]` to prevent indefinite spinner/status hangs.
 
 ### Network access summary
 

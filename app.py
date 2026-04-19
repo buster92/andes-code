@@ -17,11 +17,13 @@ import time
 import urllib.request
 from pathlib import Path
 
+from runtime_paths import ensure_app_data_dir, get_runtime_log_path
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 APP_DIR   = Path(__file__).parent.resolve()
-DATA_DIR  = Path.home() / "Documents" / "AndesCode"
+DATA_DIR  = ensure_app_data_dir()
 LOCK_FILE = DATA_DIR / ".running"
-LOG_FILE  = DATA_DIR / "app.log"
+LOG_FILE  = get_runtime_log_path("app")
 
 # ── HuggingFace model source ──────────────────────────────────────────────────
 MODEL_REPO           = "lmstudio-community/gemma-4-26B-A4B-it-GGUF"
