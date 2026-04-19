@@ -1603,6 +1603,8 @@ async function streamResponse(userText) {
     let   realContent = '';
     let   debugPayload = null;
     let   inStatus    = true;   // still showing status messages
+    let   sawDone      = false;
+    let   sawErrorChunk = false;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -1615,12 +1617,24 @@ async function streamResponse(userText) {
       for (const line of lines) {
         if (!line.startsWith('data:')) continue;
         const payload = line.slice(5).trim();
-        if (payload === '[DONE]') break;
+        if (payload === '[DONE]') {
+          sawDone = true;
+          continue;
+        }
 
         try {
           const chunk   = JSON.parse(payload);
           if (chunk.object === 'debug.payload') {
             debugPayload = chunk.debug || null;
+            continue;
+          }
+          if (chunk.object === 'andescode.error') {
+            sawErrorChunk = true;
+            if (statusEl.parentNode) statusEl.remove();
+            inStatus = false;
+            const phase = chunk.error?.phase || 'unknown';
+            const detail = chunk.error?.message || 'Unknown error';
+            msgEl.content.innerHTML = `<div style="color:var(--danger);font-family:var(--font-mono);font-size:12px;white-space:pre-wrap;">✗ AndesCode pipeline failed (${escapeHtml(phase)})\n${escapeHtml(detail)}</div>`;
             continue;
           }
           const content = chunk.choices?.[0]?.delta?.content ?? '';
@@ -1675,6 +1689,14 @@ async function streamResponse(userText) {
     // Final render
     if (realContent) {
       renderFinalContent(msgEl, realContent, t0, ttft);
+    } else if (!sawErrorChunk) {
+      if (statusEl.parentNode) statusEl.remove();
+      const failureReason = sawDone
+        ? '✗ Request ended before a response was generated.'
+        : '✗ Streaming connection closed unexpectedly before a response was generated.';
+      msgEl.content.innerHTML = `<div style="color:var(--danger);font-family:var(--font-mono);font-size:12px;">
+        ${failureReason}<br><span style="color:var(--text-dim)">Check server logs for phase failure details.</span>
+      </div>`;
     }
     if (debugPayload && debugMode) {
       renderDebugPanel(msgEl, debugPayload);

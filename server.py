@@ -19,6 +19,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
+from runtime_paths import get_runtime_log_path
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -40,7 +41,7 @@ from auto_index import AutoIndexManager, ChangeBatch
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_DIR       = Path(__file__).parent
 MODEL_PATH     = str(BASE_DIR / os.getenv("MODEL_PATH", "models/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"))
-LOG_PATH       = BASE_DIR / "audit.log"
+LOG_PATH       = get_runtime_log_path("server")
 PORT           = int(os.getenv("PORT", 8080))
 CONTEXT_CHUNKS = int(os.getenv("CONTEXT_CHUNKS", 5))
 CACHE_SIZE_GB  = float(os.getenv("CACHE_SIZE_GB", 2.0))
@@ -89,6 +90,46 @@ def _safe(value: object) -> str:
     # Replace any remaining absolute paths  /foo/bar/baz → .../baz
     text = re.sub(r"(?:^|\s)/(?:[\w./\-]+/)(\w[\w.\-]*)", r".../ \1", text)
     return text
+
+
+def _phase_log(request_id: str, phase: str, **fields) -> None:
+    payload = " | ".join([f"{k}={_safe(v)}" for k, v in fields.items()])
+    message = f"CHAT {request_id} | phase={phase}"
+    if payload:
+        message = f"{message} | {payload}"
+    audit.info(message)
+
+
+def _index_phase_log(source: str, phase: str, **fields) -> None:
+    payload = " | ".join([f"{k}={_safe(v)}" for k, v in fields.items()])
+    message = f"INDEX | source={source} | phase={phase}"
+    if payload:
+        message = f"{message} | {payload}"
+    audit.info(message)
+
+
+def _make_error_chunk(request_id: str, phase: str, err: Exception | str) -> str:
+    err_text = _safe(err)
+    return _make_chunk(
+        (
+            "\n\n❌ Sorry — AndesCode failed while processing this request. "
+            f"(phase: {phase})\nDetails: {err_text}"
+        ),
+        request_id,
+    )
+
+
+def _make_pipeline_error_event(request_id: str, phase: str, err: Exception | str) -> str:
+    payload = {
+        "id": f"chatcmpl-{request_id}",
+        "object": "andescode.error",
+        "created": int(time.time()),
+        "error": {
+            "phase": phase,
+            "message": _safe(err),
+        },
+    }
+    return f"data: {json.dumps(payload)}\n\n"
 
 for _lib in ("httpx", "httpcore", "sentence_transformers", "transformers", "huggingface_hub"):
     logging.getLogger(_lib).setLevel(logging.ERROR)
@@ -222,7 +263,9 @@ def _snapshot_relevant_files(root_path: Path) -> dict[str, str]:
 
 
 def _run_index_stream(path: str, source: str, emit_event, change_batch: ChangeBatch | None = None) -> bool:
+    _index_phase_log(source, "index_request_started", path=path)
     if not _load_indexer():
+        _index_phase_log(source, "index_failed", failed_phase="load_indexer", error="Indexer not available")
         emit_event({"type": "error", "source": source, "message": "Indexer not available"})
         return False
 
@@ -246,9 +289,37 @@ def _run_index_stream(path: str, source: str, emit_event, change_batch: ChangeBa
 
         from indexer import index_codebase_stream
         done_event = None
+        embedding_started_logged = False
+        storage_started_logged = False
         for event in index_codebase_stream(path):
             event = dict(event)
             event["source"] = source
+            etype = event.get("type")
+            if etype == "scan":
+                _index_phase_log(source, "scan_done", files=event.get("files"), new=event.get("new"), unchanged=event.get("unchanged"))
+            elif etype == "embed":
+                if not embedding_started_logged:
+                    _index_phase_log(source, "embedding_started", total=event.get("total"))
+                    embedding_started_logged = True
+                if event.get("done") == event.get("total"):
+                    _index_phase_log(source, "embedding_completed", total=event.get("total"))
+            elif etype == "store":
+                if not storage_started_logged:
+                    _index_phase_log(source, "storage_started", total=event.get("total"))
+                    storage_started_logged = True
+                if event.get("done") == event.get("total"):
+                    _index_phase_log(source, "storage_completed", total=event.get("total"))
+            elif etype == "mapping":
+                _index_phase_log(source, "project_map_workspace_build_started", message=event.get("message", "mapping"))
+            elif etype == "done":
+                _index_phase_log(
+                    source,
+                    "index_completed",
+                    indexed=event.get("indexed"),
+                    chunks=event.get("chunks"),
+                    decision=event.get("decision"),
+                )
+                _index_phase_log(source, "project_map_workspace_build_completed", indexed=event.get("indexed"))
             if source == "auto" and event.get("type") == "decision":
                 _set_auto_status(event.get("message", "Auto-index decision emitted"))
             emit_event(event)
@@ -262,6 +333,7 @@ def _run_index_stream(path: str, source: str, emit_event, change_batch: ChangeBa
                 _set_auto_status(f"Auto-refresh complete ({decision})")
         return True
     except Exception as exc:
+        _index_phase_log(source, "index_failed", failed_phase="run_index_stream", error=exc)
         emit_event({"type": "error", "source": source, "message": str(exc)})
         if source == "auto":
             _set_auto_status(f"Auto-refresh failed: {exc}")
@@ -884,98 +956,119 @@ def _build_context_from_plan(
 async def _stream(messages: list, max_tokens: int, request_id: str, t_start: float, debug_mode: bool = False):
     think_open = "<|channel>"
     think_close = "<channel|>"
-    yield _make_chunk("⚙️ _Analyzing request..._", request_id)
-
-    query = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
-    pmap = _indexer_module._load_project_map() if _indexer_module else {}
-    decision = classify_query_intent_details(query)
-    intent = decision["intent"]
-    retrieval_route = decision["retrieval_route"]
-    orchestration = orchestration_plan(intent)
-    diagnosis = _diagnose_query(query, intent)
-    repo_fp = _indexer_module.get_repo_fingerprint() if _indexer_module else ""
-    cache = getattr(_indexer_module, "CACHE", None) if _indexer_module else None
-    retrieval_signature = f"{retrieval_route}:{intent}:{query}:{CONTEXT_CHUNKS}"
-    planned_files = []
-    cached_semantic = False
+    phase = "request_received"
     final_text = ""
     debug_payload = None
+    cache = None
+    repo_fp = ""
+    query = ""
+    intent = "unknown"
+    retrieval_route = "unknown"
+    retrieval_signature = ""
+    try:
+        _phase_log(request_id, "request_received", max_tokens=max_tokens, message_count=len(messages))
+        yield _make_chunk("⚙️ _Analyzing request..._", request_id)
 
-    if cache and repo_fp and semantic_cache_allowed(intent, retrieval_route):
-        semantic_hit = cache.semantic_get(
-            repo_fp=repo_fp,
-            query=query,
-            retrieval_signature=retrieval_signature,
-            safe_class="descriptive",
-        )
-        if semantic_hit:
-            cached_semantic = True
-            yield _make_chunk("\n🧩 _Semantic cache hit (safe descriptive answer)_\n\n", request_id)
-            final_text = semantic_hit
-            yield _make_chunk(final_text, request_id)
+        query = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+        pmap = _indexer_module._load_project_map() if _indexer_module else {}
+        phase = "intent_classified"
+        decision = classify_query_intent_details(query)
+        intent = decision["intent"]
+        retrieval_route = decision["retrieval_route"]
+        _phase_log(request_id, "intent_classified", intent=intent, retrieval_route=retrieval_route)
+        orchestration = orchestration_plan(intent)
+        diagnosis = _diagnose_query(query, intent)
+        repo_fp = _indexer_module.get_repo_fingerprint() if _indexer_module else ""
+        cache = getattr(_indexer_module, "CACHE", None) if _indexer_module else None
+        retrieval_signature = f"{retrieval_route}:{intent}:{query}:{CONTEXT_CHUNKS}"
+        planned_files = []
+        cached_semantic = False
 
-    if not cached_semantic:
-        if INDEXER_READY and pmap and query and not orchestration["skip_patch_plan"]:
-            import asyncio
+        if cache and repo_fp and semantic_cache_allowed(intent, retrieval_route):
+            phase = "semantic_cache_lookup"
+            _phase_log(request_id, "semantic_cache_lookup_start")
+            semantic_hit = cache.semantic_get(
+                repo_fp=repo_fp,
+                query=query,
+                retrieval_signature=retrieval_signature,
+                safe_class="descriptive",
+            )
+            _phase_log(request_id, "semantic_cache_lookup_result", hit=bool(semantic_hit))
+            if semantic_hit:
+                cached_semantic = True
+                yield _make_chunk("\n🧩 _Semantic cache hit (safe descriptive answer)_\n\n", request_id)
+                final_text = semantic_hit
+                yield _make_chunk(final_text, request_id)
 
-            loop = asyncio.get_event_loop()
-            if cache and repo_fp:
-                plan_cached = cache.patch_plan_get(repo_fp=repo_fp, query=query, target_signature="preplan")
-                if plan_cached:
-                    planned_files = plan_cached.get("planned_files", [])
-                    diagnosis = plan_cached.get("diagnosis", diagnosis)
-            if not planned_files:
-                planned_files = await loop.run_in_executor(None, lambda: _plan_files(query, pmap))
+        if not cached_semantic:
+            if INDEXER_READY and pmap and query and not orchestration["skip_patch_plan"]:
+                import asyncio
+
+                phase = "planner"
+                _phase_log(request_id, "planner_start")
+                loop = asyncio.get_event_loop()
                 if cache and repo_fp:
-                    cache.patch_plan_set(
-                        repo_fp=repo_fp,
-                        query=query,
-                        target_signature="preplan",
-                        value={"diagnosis": diagnosis, "planned_files": planned_files},
-                    )
+                    plan_cached = cache.patch_plan_get(repo_fp=repo_fp, query=query, target_signature="preplan")
+                    if plan_cached:
+                        planned_files = plan_cached.get("planned_files", [])
+                        diagnosis = plan_cached.get("diagnosis", diagnosis)
+                if not planned_files:
+                    planned_files = await loop.run_in_executor(None, lambda: _plan_files(query, pmap))
+                    if cache and repo_fp:
+                        cache.patch_plan_set(
+                            repo_fp=repo_fp,
+                            query=query,
+                            target_signature="preplan",
+                            value={"diagnosis": diagnosis, "planned_files": planned_files},
+                        )
+                _phase_log(request_id, "planner_result", planned_files=planned_files)
 
-        if planned_files and not orchestration["skip_neighborhood"]:
-            short_names = [f.split("/")[-1] for f in planned_files]
-            yield _make_chunk(f"\n📂 _Reading: {', '.join(short_names)}_", request_id)
-            messages, _, debug_payload = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: _build_context_from_plan(
+            phase = "context_build"
+            _phase_log(request_id, "context_build_start", path="planned_context" if planned_files else "direct_retrieval")
+            if planned_files and not orchestration["skip_neighborhood"]:
+                short_names = [f.split("/")[-1] for f in planned_files]
+                yield _make_chunk(f"\n📂 _Reading: {', '.join(short_names)}_", request_id)
+                messages, _, debug_payload = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: _build_context_from_plan(
+                        messages,
+                        planned_files,
+                        request_id,
+                        diagnosis,
+                        debug_mode=debug_mode,
+                        return_debug=True,
+                    ),
+                )
+            else:
+                status = "Loading source-of-truth config..." if is_fast_path_intent(intent) else "Searching codebase..."
+                yield _make_chunk(f"\n📂 _{status}_", request_id)
+                messages, debug_payload = _build_context(
                     messages,
-                    planned_files,
                     request_id,
-                    diagnosis,
                     debug_mode=debug_mode,
                     return_debug=True,
-                ),
-            )
-        else:
-            status = "Loading source-of-truth config..." if is_fast_path_intent(intent) else "Searching codebase..."
-            yield _make_chunk(f"\n📂 _{status}_", request_id)
-            messages, debug_payload = _build_context(
-                messages,
-                request_id,
-                debug_mode=debug_mode,
-                return_debug=True,
-            )
-            if debug_payload is not None:
-                retrieval = debug_payload.setdefault("retrieval", {})
-                retrieval.setdefault("orchestration_path", "direct_retrieval")
-                debug_payload["orchestration_path"] = "direct_retrieval"
+                )
+                if debug_payload is not None:
+                    retrieval = debug_payload.setdefault("retrieval", {})
+                    retrieval.setdefault("orchestration_path", "direct_retrieval")
+                    debug_payload["orchestration_path"] = "direct_retrieval"
+            _phase_log(request_id, "context_build_result")
 
-        t_context = time.perf_counter()
-        ctx_s = t_context - t_start
-        prompt = _messages_to_prompt(messages)
-        yield _make_chunk(f"\n🧠 _Thinking... (ready in {ctx_s:.1f}s)_\n\n", request_id)
+            t_context = time.perf_counter()
+            ctx_s = t_context - t_start
+            prompt = _messages_to_prompt(messages)
+            yield _make_chunk(f"\n🧠 _Thinking... (ready in {ctx_s:.1f}s)_\n\n", request_id)
+            _phase_log(request_id, "generation_start")
 
-        buffer = ""
-        in_think = False
-        t_think_start = None
-        t_think_total = 0.0
-        t_first_token = None
-        token_count = 0
-        cleared = False
+            buffer = ""
+            in_think = False
+            t_think_start = None
+            t_think_total = 0.0
+            t_first_token = None
+            token_count = 0
+            cleared = False
 
-        try:
+            phase = "generation"
             for chunk in llm(prompt, max_tokens=max_tokens, stream=True, echo=False):
                 token = chunk["choices"][0]["text"]
                 buffer += token
@@ -990,6 +1083,7 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                             cleared = True
                         if t_first_token is None:
                             t_first_token = time.perf_counter()
+                            _phase_log(request_id, "first_token_emitted", seconds=f"{t_first_token - t_start:.2f}")
                         token_count += 1
                         final_text += before
                         yield _make_chunk(before, request_id)
@@ -1010,45 +1104,54 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                             cleared = True
                         if t_first_token is None:
                             t_first_token = time.perf_counter()
+                            _phase_log(request_id, "first_token_emitted", seconds=f"{t_first_token - t_start:.2f}")
                         token_count += 1
                         final_text += emit
                         yield _make_chunk(emit, request_id)
-        except Exception as e:
-            audit.warning(f"STREAM_FAIL {request_id} | {_safe(e)}")
-            yield _make_chunk(f"\n\n❌ Generation error: {e}", request_id)
 
-        if buffer and not in_think:
-            remainder = _strip_thinking(buffer)
-            if remainder:
-                if not cleared:
-                    yield _make_chunk("\n\n---\n\n", request_id)
-                final_text += remainder
-                yield _make_chunk(remainder, request_id)
+            if buffer and not in_think:
+                remainder = _strip_thinking(buffer)
+                if remainder:
+                    if not cleared:
+                        yield _make_chunk("\n\n---\n\n", request_id)
+                    final_text += remainder
+                    yield _make_chunk(remainder, request_id)
 
-        t_done = time.perf_counter()
-        total_s = t_done - t_start
-        think_s = t_think_total
-        ttft_s = (t_first_token - t_start) if t_first_token else 0.0
-        yield _make_chunk(
-            f"\n\n---\n⏱ context `{ctx_s:.1f}s` · think `{think_s:.1f}s` · first token `{ttft_s:.1f}s` · total `{total_s:.1f}s`",
-            request_id,
-        )
-        audit.info(
-            f"STREAM_DONE {request_id} | context={ctx_s:.1f}s | think={think_s:.1f}s | ttft={ttft_s:.1f}s | total={total_s:.1f}s | chunks={token_count}"
-        )
+            t_done = time.perf_counter()
+            total_s = t_done - t_start
+            think_s = t_think_total
+            ttft_s = (t_first_token - t_start) if t_first_token else 0.0
+            yield _make_chunk(
+                f"\n\n---\n⏱ context `{ctx_s:.1f}s` · think `{think_s:.1f}s` · first token `{ttft_s:.1f}s` · total `{total_s:.1f}s`",
+                request_id,
+            )
+            _phase_log(
+                request_id,
+                "generation_completed",
+                context_s=f"{ctx_s:.1f}",
+                think_s=f"{think_s:.1f}",
+                ttft_s=f"{ttft_s:.1f}",
+                total_s=f"{total_s:.1f}",
+                chunks=token_count,
+            )
 
-    if cache and repo_fp and semantic_cache_allowed(intent, retrieval_route) and final_text.strip():
-        cache.semantic_set(
-            repo_fp=repo_fp,
-            query=query,
-            retrieval_signature=retrieval_signature,
-            safe_class="descriptive",
-            value=final_text.strip(),
-        )
-        cache.flush_metrics()
-    if debug_mode and debug_payload:
-        yield format_debug_sse_event(debug_payload)
-    yield "data: [DONE]\n\n"
+        if cache and repo_fp and semantic_cache_allowed(intent, retrieval_route) and final_text.strip():
+            cache.semantic_set(
+                repo_fp=repo_fp,
+                query=query,
+                retrieval_signature=retrieval_signature,
+                safe_class="descriptive",
+                value=final_text.strip(),
+            )
+            cache.flush_metrics()
+        if debug_mode and debug_payload:
+            yield format_debug_sse_event(debug_payload)
+    except Exception as e:
+        _phase_log(request_id, "pipeline_failed", failed_phase=phase, error=e)
+        yield _make_pipeline_error_event(request_id, phase, e)
+        yield _make_error_chunk(request_id, phase, e)
+    finally:
+        yield "data: [DONE]\n\n"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1094,7 +1197,7 @@ if __name__ == "__main__":
     _print(f"│  ✅  AndesCode is running                │")
     _print(f"│                                         │")
     _print(f"│  🖥️   http://localhost:{PORT}/ui           │")
-    _print(f"│  📋  Audit log: audit.log               │")
+    _print(f"│  📋  Server log: {_safe(LOG_PATH)}      │")
     _print(f"│                                         │")
     _print(f"│  Your AI. Your code. Nobody else.       │")
     _print("└─────────────────────────────────────────┘")
