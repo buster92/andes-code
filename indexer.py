@@ -261,6 +261,10 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
         # Older index logic may have produced an incomplete indexed set; workspace-only
         # rebuilds must apply current detection/extraction logic to all files without
         # forcing re-embedding or vector-store writes.
+        #
+        # Invariant: discovered in workspace metadata != embedded in vector index.
+        # Workspace-only rebuild must not promote newly discovered files into the
+        # embedded hash state unless chunks were actually stored in Chroma.
         all_indexed = all_files
         workspace_chunks = []
         for fp in all_indexed:
@@ -282,7 +286,7 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
         _save_json(SYMBOL_INDEX, symidx)
         _save_json(WORKSPACE_INDEX, workspace)
         CACHE.workspace_set(repo_fp, "symbol_index", symidx)
-        _save_hashes(next_hashes | {"__root__": str(root_path), "__fingerprint__": repo_fp})
+        _save_hashes(_preserve_embedded_hash_state(hashes, root_path, repo_fp))
         _save_index_state(_with_timestamp(current_state, "workspace_rebuilt_at"))
         CACHE.flush_metrics()
         yield {
@@ -296,6 +300,7 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
             "repo_fingerprint": repo_fp,
             "decision": DECISION_REBUILD_WORKSPACE_ONLY,
             "workspace_rebuild_scope": "all_files",
+            "workspace_only_rebuild_preserved_embedding_state": True,
         }
         return
 
@@ -1901,6 +1906,18 @@ def _load_hashes() -> dict:
     except Exception:
         pass
     return {}
+
+
+def _preserve_embedded_hash_state(hashes: dict, root_path: Path, repo_fp: str) -> dict:
+    """
+    Keep only files that were already tracked as embedded/indexed.
+    Used during workspace-only rebuilds, where metadata is refreshed but
+    vector-store writes are intentionally skipped.
+    """
+    preserved = {k: v for k, v in hashes.items() if not k.startswith("__")}
+    preserved["__root__"] = str(root_path)
+    preserved["__fingerprint__"] = repo_fp
+    return preserved
 
 
 def _save_hashes(hashes: dict) -> None:
