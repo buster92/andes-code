@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
+from enum import Enum
 from typing import Callable
 
 from .source_of_truth import rank_authoritative_paths
@@ -19,6 +20,12 @@ REASON_RETRIEVABLE_BUT_INCOMPLETE = "retrievable_but_incomplete"
 REASON_WORKSPACE_HASH_MISMATCH = "workspace_hash_mismatch"
 REASON_MISSING_ON_DISK = "missing_on_disk"
 REASON_REPAIR_FAILED = "repair_failed"
+
+
+class IntegrityValidationMode(str, Enum):
+    STARTUP_CHEAP = "startup_cheap"
+    NORMAL = "normal"
+    DEEP_REPAIR = "deep_repair"
 
 
 @dataclass
@@ -102,6 +109,33 @@ def validate_authoritative_integrity(
     max_files: int = 24,
     validate_expected_chunks: bool = True,
 ) -> IntegrityReport:
+    mode = IntegrityValidationMode.NORMAL if validate_expected_chunks else IntegrityValidationMode.STARTUP_CHEAP
+    return validate_authoritative_integrity_for_mode(
+        mode=mode,
+        workspace=workspace,
+        hash_state=hash_state,
+        fetch_exact_file=fetch_exact_file,
+        file_hash_lookup=file_hash_lookup,
+        file_exists_lookup=file_exists_lookup,
+        expected_chunk_count_lookup=expected_chunk_count_lookup,
+        candidate_paths=candidate_paths,
+        max_files=max_files,
+    )
+
+
+def validate_authoritative_integrity_for_mode(
+    mode: IntegrityValidationMode,
+    workspace: dict,
+    hash_state: dict,
+    fetch_exact_file: Callable[[str, int], list[dict]],
+    file_hash_lookup: Callable[[str], str | None] | None = None,
+    file_exists_lookup: Callable[[str], bool] | None = None,
+    expected_chunk_count_lookup: Callable[[str], int | None] | None = None,
+    candidate_paths: list[str] | None = None,
+    max_files: int = 24,
+) -> IntegrityReport:
+    validate_expected_chunks = mode != IntegrityValidationMode.STARTUP_CHEAP
+    effective_expected_chunk_lookup = expected_chunk_count_lookup if validate_expected_chunks else None
     paths = candidate_paths or authoritative_paths_from_workspace(workspace)
     statuses: list[FileIntegrityStatus] = []
 
@@ -125,8 +159,8 @@ def validate_authoritative_integrity(
         chunks = fetch_exact_file(path, 120)
         retrievable = bool(chunks)
         expected_chunks = None
-        if validate_expected_chunks and expected_chunk_count_lookup:
-            expected_chunks = expected_chunk_count_lookup(path)
+        if effective_expected_chunk_lookup:
+            expected_chunks = effective_expected_chunk_lookup(path)
 
         ok_chunks, chunk_reasons = _assess_chunks(chunks, expected_chunks)
         if not ok_chunks and embedded:
@@ -196,6 +230,29 @@ def lightweight_integrity_probe(
         "checked_paths": [f.path for f in report.files],
         "probe_mode": "lightweight",
     }
+
+
+def deep_repair_integrity_validation(
+    workspace: dict,
+    hash_state: dict,
+    fetch_exact_file: Callable[[str, int], list[dict]],
+    file_hash_lookup: Callable[[str], str | None] | None = None,
+    file_exists_lookup: Callable[[str], bool] | None = None,
+    expected_chunk_count_lookup: Callable[[str], int | None] | None = None,
+    candidate_paths: list[str] | None = None,
+    max_files: int = 24,
+) -> IntegrityReport:
+    return validate_authoritative_integrity_for_mode(
+        mode=IntegrityValidationMode.DEEP_REPAIR,
+        workspace=workspace,
+        hash_state=hash_state,
+        fetch_exact_file=fetch_exact_file,
+        file_hash_lookup=file_hash_lookup,
+        file_exists_lookup=file_exists_lookup,
+        expected_chunk_count_lookup=expected_chunk_count_lookup,
+        candidate_paths=candidate_paths,
+        max_files=max_files,
+    )
 
 
 

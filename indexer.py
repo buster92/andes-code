@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import sys
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from collections import defaultdict
 from pathlib import Path
@@ -38,7 +39,10 @@ from andes_cache.source_of_truth import (
 )
 from andes_cache.integrity import (
     INTEGRITY_HEALTHY,
+    IntegrityValidationMode,
+    validate_authoritative_integrity_for_mode,
     validate_authoritative_integrity,
+    deep_repair_integrity_validation,
     repair_authoritative_integrity,
     select_healthy_authoritative_path,
     prune_missing_on_disk_hashes,
@@ -76,7 +80,6 @@ CHUNK_COUNT_STATE = Path(__file__).parent / "index" / "chunk_count_state.json"
 CACHE_DIR = Path(__file__).parent / "index" / "cache"
 CACHE = AndesCacheManager(CACHE_DIR)
 CURRENT_REPO_FINGERPRINT = ""
-STARTUP_INTEGRITY_PROBE: dict = {}
 EMBED_BATCH   = 64
 CHROMA_BATCH  = 4096
 CHUNK_LINES   = 80
@@ -86,6 +89,16 @@ DECISION_REUSE_ALL = "reuse_all"
 DECISION_REBUILD_WORKSPACE_ONLY = "rebuild_workspace_only"
 DECISION_INCREMENTAL_REINDEX = "incremental_reindex"
 DECISION_FULL_REBUILD = "full_rebuild"
+
+
+@dataclass
+class IntegrityRuntimeState:
+    startup_probe: dict = field(default_factory=dict)
+    refreshed_at: str = ""
+    owner_root: str = ""
+
+
+INTEGRITY_RUNTIME_STATE = IntegrityRuntimeState()
 
 # ── Language boundary patterns ────────────────────────────────────────────────
 _BOUNDARY = {
@@ -2045,8 +2058,18 @@ def _expected_chunk_count_for_file_deep(root_path: Path, rel_path: str) -> int |
 
 
 def _repair_index_paths(root_path: Path, rel_paths: list[str]) -> bool:
+    """
+    Best-effort, rollback-safe targeted repair for specific files.
+    This flow is intentionally not fully transactional across all files:
+    we apply per-path updates, and if a later path fails we attempt to roll
+    back previously-applied paths to their captured vector snapshot.
+    """
     if not rel_paths:
         return True
+    required_collection_ops = ("get", "upsert", "delete")
+    if any(not hasattr(col, op) for op in required_collection_ops):
+        logging.warning("Targeted integrity repair skipped: collection does not expose required rollback-safe APIs")
+        return False
     hashes = _load_hashes()
     next_hashes = dict(hashes)
     sorted_paths = sorted(set(rel_paths))
@@ -2149,13 +2172,13 @@ def _repair_index_paths(root_path: Path, rel_paths: list[str]) -> bool:
         _save_chunk_count_state(chunk_counts)
         return True
     except Exception as e:
-        logging.warning(f"Targeted integrity repair failed: {e}")
+        logging.warning(f"Targeted integrity repair failed (best-effort rollback will run): {e}")
         for prepared in reversed(applied_paths):
             try:
                 if prepared["new_ids"]:
                     col.delete(ids=prepared["new_ids"])
             except Exception as rollback_err:
-                logging.warning(f"Integrity rollback failed while clearing new vectors for {prepared['path']}: {rollback_err}")
+                logging.warning(f"Integrity rollback step failed while clearing new vectors for {prepared['path']}: {rollback_err}")
             try:
                 if prepared["previous_ids"]:
                     for start in range(0, len(prepared["previous_ids"]), CHROMA_BATCH):
@@ -2166,12 +2189,11 @@ def _repair_index_paths(root_path: Path, rel_paths: list[str]) -> bool:
                             metadatas=prepared["previous_metadatas"][start: start + CHROMA_BATCH],
                         )
             except Exception as rollback_err:
-                logging.warning(f"Integrity rollback failed while restoring previous vectors for {prepared['path']}: {rollback_err}")
+                logging.warning(f"Integrity rollback step failed while restoring previous vectors for {prepared['path']}: {rollback_err}")
         return False
 
 
-def run_startup_integrity_probe(root_path: Path | None = None, max_files: int = 6) -> dict:
-    global STARTUP_INTEGRITY_PROBE
+def _refresh_startup_integrity_probe(root_path: Path | None = None, max_files: int = 6, reason: str = "") -> dict:
     root_path = root_path or _repo_root_path_from_hashes()
     workspace = _load_workspace_index()
     hash_state = _load_hashes()
@@ -2184,12 +2206,33 @@ def run_startup_integrity_probe(root_path: Path | None = None, max_files: int = 
         file_exists_lookup=lambda rel: (root_path / rel).exists() and (root_path / rel).is_file(),
         max_files=max_files,
     )
-    STARTUP_INTEGRITY_PROBE = probe
+    INTEGRITY_RUNTIME_STATE.startup_probe = dict(probe)
+    INTEGRITY_RUNTIME_STATE.owner_root = str(root_path)
+    INTEGRITY_RUNTIME_STATE.refreshed_at = datetime.now(timezone.utc).isoformat()
+    _save_integrity_state({
+        "startup_probe": probe,
+        "startup_probe_refreshed_at": INTEGRITY_RUNTIME_STATE.refreshed_at,
+        "startup_probe_owner_root": INTEGRITY_RUNTIME_STATE.owner_root,
+        "startup_probe_reason": reason,
+    }, merge=True)
     return probe
 
 
+def run_startup_integrity_probe(root_path: Path | None = None, max_files: int = 6) -> dict:
+    return _refresh_startup_integrity_probe(root_path=root_path, max_files=max_files, reason="startup")
+
+
 def get_startup_integrity_probe() -> dict:
-    return dict(STARTUP_INTEGRITY_PROBE)
+    if INTEGRITY_RUNTIME_STATE.startup_probe:
+        return dict(INTEGRITY_RUNTIME_STATE.startup_probe)
+    persisted = _load_integrity_state()
+    probe = persisted.get("startup_probe")
+    if isinstance(probe, dict):
+        INTEGRITY_RUNTIME_STATE.startup_probe = dict(probe)
+        INTEGRITY_RUNTIME_STATE.owner_root = str(persisted.get("startup_probe_owner_root", ""))
+        INTEGRITY_RUNTIME_STATE.refreshed_at = str(persisted.get("startup_probe_refreshed_at", ""))
+        return dict(probe)
+    return {}
 
 
 def _validate_and_repair_authoritative_integrity(root_path: Path, candidate_paths: list[str] | None = None) -> dict:
@@ -2209,7 +2252,8 @@ def _validate_and_repair_authoritative_integrity(root_path: Path, candidate_path
         fp = root_path / rel_path
         return fp.exists() and fp.is_file()
 
-    report = validate_authoritative_integrity(
+    report = validate_authoritative_integrity_for_mode(
+        mode=IntegrityValidationMode.NORMAL,
         workspace=workspace,
         hash_state=hash_state,
         fetch_exact_file=_fetch_exact_file,
@@ -2224,14 +2268,14 @@ def _validate_and_repair_authoritative_integrity(root_path: Path, candidate_path
         hash_state = cleaned_hash_state
 
     if report.overall_status == INTEGRITY_HEALTHY:
-        _save_json(INTEGRITY_STATE, report.to_dict())
-        run_startup_integrity_probe(root_path=root_path)
+        _save_integrity_state({"report": report.to_dict()}, merge=False)
+        _refresh_startup_integrity_probe(root_path=root_path, reason="validate_healthy")
         return report.to_dict()
 
     repaired = repair_authoritative_integrity(
         report,
         repair_paths_fn=lambda paths: _repair_index_paths(root_path, paths),
-        revalidate_fn=lambda paths: validate_authoritative_integrity(
+        revalidate_fn=lambda paths: deep_repair_integrity_validation(
             workspace=workspace,
             hash_state=_load_hashes(),
             fetch_exact_file=_fetch_exact_file,
@@ -2241,25 +2285,23 @@ def _validate_and_repair_authoritative_integrity(root_path: Path, candidate_path
             candidate_paths=paths,
         ),
     )
-    _save_json(INTEGRITY_STATE, repaired.to_dict())
-    run_startup_integrity_probe(root_path=root_path)
+    _save_integrity_state({"report": repaired.to_dict()}, merge=False)
+    _refresh_startup_integrity_probe(root_path=root_path, reason="validate_repair")
     return repaired.to_dict()
 
 
 def _save_hashes(hashes: dict) -> None:
     try:
-        HASH_STORE.parent.mkdir(parents=True, exist_ok=True)
-        HASH_STORE.write_text(json.dumps(hashes))
+        _save_state_json(HASH_STORE, hashes, indent=None)
     except Exception as e:
         logging.warning(f"Could not save hashes: {e}")
 
 
 def _load_chunk_count_state() -> dict:
     try:
-        if CHUNK_COUNT_STATE.exists():
-            data = json.loads(CHUNK_COUNT_STATE.read_text())
-            if isinstance(data, dict):
-                return data
+        data = _load_state_json(CHUNK_COUNT_STATE, {})
+        if isinstance(data, dict):
+            return data
     except Exception:
         pass
     return {}
@@ -2267,16 +2309,26 @@ def _load_chunk_count_state() -> dict:
 
 def _save_chunk_count_state(state: dict[str, int]) -> None:
     try:
-        CHUNK_COUNT_STATE.parent.mkdir(parents=True, exist_ok=True)
         cleaned = {}
         for path, count in state.items():
             try:
                 cleaned[path] = int(count)
             except Exception:
                 continue
-        CHUNK_COUNT_STATE.write_text(json.dumps(cleaned))
+        _save_state_json(CHUNK_COUNT_STATE, cleaned, indent=None)
     except Exception as e:
         logging.warning(f"Could not save chunk count state: {e}")
+
+
+def _load_integrity_state() -> dict:
+    data = _load_state_json(INTEGRITY_STATE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def _save_integrity_state(state: dict, merge: bool = True) -> None:
+    payload = dict(_load_integrity_state()) if merge else {}
+    payload.update(state)
+    _save_state_json(INTEGRITY_STATE, payload, indent=2)
 
 
 def _load_index_state() -> dict:
@@ -2297,20 +2349,32 @@ def _save_index_state(state: dict) -> None:
 
 
 def _load_json(path: Path) -> dict:
-    try:
-        if path.exists():
-            return json.loads(path.read_text())
-    except Exception:
-        pass
-    return {}
+    data = _load_state_json(path, {})
+    return data if isinstance(data, dict) else {}
 
 
 def _save_json(path: Path, data: dict) -> None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=2))
+        _save_state_json(path, data, indent=2)
     except Exception as e:
         logging.warning(f"Could not save {path.name}: {e}")
+
+
+def _load_state_json(path: Path, default):
+    try:
+        if path.exists():
+            return json.loads(path.read_text())
+    except Exception:
+        return default
+    return default
+
+
+def _save_state_json(path: Path, data, indent: int | None = 2) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if indent is None:
+        path.write_text(json.dumps(data))
+    else:
+        path.write_text(json.dumps(data, indent=indent))
 
 
 if __name__ == "__main__":

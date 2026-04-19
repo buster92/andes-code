@@ -47,6 +47,46 @@ def _import_server_with_stubs():
     fake_indexer.CACHE = None
     sys.modules["indexer"] = fake_indexer
 
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *_args, **_kwargs: None
+    sys.modules["dotenv"] = fake_dotenv
+
+    fake_uvicorn = types.ModuleType("uvicorn")
+    fake_uvicorn.run = lambda *_args, **_kwargs: None
+    sys.modules["uvicorn"] = fake_uvicorn
+
+    fake_fastapi = types.ModuleType("fastapi")
+
+    class _FakeFastAPI:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def mount(self, *args, **kwargs):
+            return None
+
+        def get(self, *_args, **_kwargs):
+            return lambda fn: fn
+
+        def post(self, *_args, **_kwargs):
+            return lambda fn: fn
+
+    class _FakeRequest:
+        async def json(self):
+            return {}
+
+    fake_fastapi.FastAPI = _FakeFastAPI
+    fake_fastapi.Request = _FakeRequest
+    sys.modules["fastapi"] = fake_fastapi
+
+    fake_fastapi_responses = types.ModuleType("fastapi.responses")
+    fake_fastapi_responses.StreamingResponse = lambda *args, **kwargs: {"stream": True}
+    fake_fastapi_responses.HTMLResponse = lambda body, status_code=200: {"body": body, "status_code": status_code}
+    sys.modules["fastapi.responses"] = fake_fastapi_responses
+
+    fake_fastapi_staticfiles = types.ModuleType("fastapi.staticfiles")
+    fake_fastapi_staticfiles.StaticFiles = lambda *args, **kwargs: None
+    sys.modules["fastapi.staticfiles"] = fake_fastapi_staticfiles
+
     import server
 
     return importlib.reload(server)
@@ -106,6 +146,7 @@ class TestServerStreamingDebugMode(unittest.TestCase):
 
     def test_stream_direct_retrieval_emits_debug_event(self):
         server = self.server
+        server._indexer_module = None
         server.orchestration_plan = lambda _intent: {"skip_patch_plan": True, "skip_neighborhood": True}
         server.classify_query_intent_details = lambda _query: {
             "intent": "runtime_usage_or_reference",
@@ -162,6 +203,15 @@ class TestServerStreamingDebugMode(unittest.TestCase):
         self.assertIn("integrity_probe", root)
         self.assertTrue(root["integrity_probe"]["warning_active"])
         self.assertIn("integrity_probe", state)
+
+    def test_index_state_tolerates_missing_integrity_probe_getter(self):
+        server = self.server
+        server.INDEXER_READY = True
+        server._indexer_module = types.SimpleNamespace(col=types.SimpleNamespace(count=lambda: 1))
+        root = server.root()
+        state = server.index_state()
+        self.assertEqual(root["integrity_probe"], {})
+        self.assertEqual(state["integrity_probe"], {})
 
 
 if __name__ == "__main__":

@@ -5,11 +5,13 @@ from andes_cache.integrity import (
     INTEGRITY_DEGRADED,
     INTEGRITY_HEALTHY,
     INTEGRITY_STALE,
+    IntegrityValidationMode,
     REASON_DISCOVERED_NOT_EMBEDDED,
     REASON_EMBEDDED_NOT_RETRIEVABLE,
     REASON_MISSING_ON_DISK,
     REASON_REPAIR_FAILED,
     validate_authoritative_integrity,
+    validate_authoritative_integrity_for_mode,
     repair_authoritative_integrity,
     lightweight_integrity_probe,
     prune_missing_on_disk_hashes,
@@ -20,6 +22,27 @@ from andes_cache.integrity import (
 
 
 class TestAuthoritativeIntegrity(unittest.TestCase):
+    def test_validation_mode_makes_chunk_depth_explicit(self):
+        workspace = {"manifests": ["app/build.gradle"], "config_graph": {"config_files": []}}
+        chunks = [{"content": "plugins {}", "line": 0, "file": "app/build.gradle"}]
+
+        startup = validate_authoritative_integrity_for_mode(
+            mode=IntegrityValidationMode.STARTUP_CHEAP,
+            workspace=workspace,
+            hash_state={"app/build.gradle": "h"},
+            fetch_exact_file=lambda _p, _m: chunks,
+            expected_chunk_count_lookup=lambda _p: 2,
+        )
+        deep = validate_authoritative_integrity_for_mode(
+            mode=IntegrityValidationMode.DEEP_REPAIR,
+            workspace=workspace,
+            hash_state={"app/build.gradle": "h"},
+            fetch_exact_file=lambda _p, _m: chunks,
+            expected_chunk_count_lookup=lambda _p: 2,
+        )
+        self.assertEqual(startup.overall_status, INTEGRITY_HEALTHY)
+        self.assertEqual(deep.overall_status, INTEGRITY_DEGRADED)
+
     def test_discovered_in_workspace_but_not_embedded(self):
         workspace = {"manifests": ["app/build.gradle"], "config_graph": {"config_files": []}}
         report = validate_authoritative_integrity(
@@ -184,6 +207,35 @@ class TestAuthoritativeIntegrity(unittest.TestCase):
         self.assertEqual(by_path["old/package.json"].status, INTEGRITY_STALE)
         self.assertIn(REASON_MISSING_ON_DISK, by_path["old/package.json"].reasons)
 
+    def test_authoritative_lifecycle_add_modify_delete_rename(self):
+        workspace = {
+            "manifests": ["app/new.gradle", "lib/renamed.json"],
+            "config_graph": {"config_files": []},
+        }
+        hash_state = {
+            "app/new.gradle": "h-new",
+            "lib/old.json": "h-old",
+            "lib/renamed.json": "h-renamed",
+        }
+        fetch_map = {
+            "app/new.gradle": [{"content": "plugins {}", "line": 0, "file": "app/new.gradle"}],
+            "lib/renamed.json": [{"content": "{\"name\":\"renamed\"}", "line": 0, "file": "lib/renamed.json"}],
+        }
+
+        report = validate_authoritative_integrity(
+            workspace=workspace,
+            hash_state=hash_state,
+            fetch_exact_file=lambda p, _m: fetch_map.get(p, []),
+            file_hash_lookup=lambda p: None if p == "lib/old.json" else hash_state.get(p),
+            file_exists_lookup=lambda p: p != "lib/old.json",
+            candidate_paths=["app/new.gradle", "lib/old.json", "lib/renamed.json"],
+        )
+        by_path = {f.path: f for f in report.files}
+        self.assertEqual(by_path["app/new.gradle"].status, INTEGRITY_HEALTHY)
+        self.assertEqual(by_path["lib/renamed.json"].status, INTEGRITY_HEALTHY)
+        self.assertEqual(by_path["lib/old.json"].status, INTEGRITY_STALE)
+        self.assertIn(REASON_MISSING_ON_DISK, by_path["lib/old.json"].reasons)
+
     def test_report_contains_aggregated_reason_codes(self):
         report = IntegrityReport(
             overall_status=INTEGRITY_STALE,
@@ -272,7 +324,8 @@ class TestIntegrationGuardrails(unittest.TestCase):
         self.assertIn("_repair_index_paths", segment)
         self.assertNotIn("delete_collection", segment)
         self.assertIn("stale_ids = sorted(set(prepared[\"previous_ids\"]) - set(prepared[\"new_ids\"]))", src)
-        self.assertIn("Integrity rollback failed while restoring previous vectors", src)
+        self.assertIn("Best-effort, rollback-safe targeted repair", src)
+        self.assertIn("Integrity rollback step failed while restoring previous vectors", src)
 
     def test_integrity_checks_cover_multi_ecosystem_authoritative_files(self):
         workspace = {
