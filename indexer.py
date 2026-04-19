@@ -39,6 +39,7 @@ from andes_cache.versions import (
     PROMPT_TEMPLATE_VERSION,
     RETRIEVAL_POLICY_VERSION,
 )
+from andes_cache.debug import resolve_debug_mode, initialize_payload, finalize_payload, apply_failure_signals
 
 # ── Config ────────────────────────────────────────────────────────────────────
 EMBED_MODEL   = "all-MiniLM-L6-v2"
@@ -51,6 +52,7 @@ WORKSPACE_INDEX = Path(__file__).parent / "index" / "workspace_index.json"
 CACHE_DIR = Path(__file__).parent / "index" / "cache"
 CACHE = AndesCacheManager(CACHE_DIR)
 CURRENT_REPO_FINGERPRINT = ""
+LAST_DEBUG_PAYLOAD = None
 EMBED_BATCH   = 64
 CHROMA_BATCH  = 4096
 CHUNK_LINES   = 80
@@ -309,7 +311,12 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
     }
 
 
-def search(query: str, n_results: int = 5) -> list[dict]:
+def search(
+    query: str,
+    n_results: int = 5,
+    debug_mode: bool | None = None,
+    debug_payload: dict | None = None,
+) -> list[dict]:
     """
     Smart retrieval with query routing and re-ranking.
 
@@ -319,12 +326,21 @@ def search(query: str, n_results: int = 5) -> list[dict]:
       - Architectural query  → fetch more candidates (8 instead of 5)
       - Default              → semantic search + re-ranking
     """
+    global LAST_DEBUG_PAYLOAD
+    debug_enabled = resolve_debug_mode(param_flag=debug_mode)
     count = col.count()
     if count == 0:
+        if debug_enabled:
+            decision = classify_query_intent_details(query)
+            payload = debug_payload or initialize_payload(query, decision, _load_workspace_index())
+            LAST_DEBUG_PAYLOAD = finalize_payload(payload, [])
         return []
     decision = classify_query_intent_details(query)
     intent = decision["intent"]
     retrieval_route = decision["retrieval_route"]
+    payload = debug_payload or (initialize_payload(query, decision, _load_workspace_index()) if debug_enabled else None)
+    if payload is not None:
+        payload["retrieval"]["route_taken"] = retrieval_route
     repo_fp = get_repo_fingerprint()
     if repo_fp:
         cached = CACHE.retrieval_get(
@@ -335,6 +351,9 @@ def search(query: str, n_results: int = 5) -> list[dict]:
             retrieval_route=retrieval_route,
         )
         if cached:
+            if payload is not None:
+                payload["retrieval"]["selected_candidates"] = [c.get("file", "") for c in cached[:n_results]]
+                LAST_DEBUG_PAYLOAD = finalize_payload(payload, cached[:n_results])
             return cached[:n_results]
 
     if retrieval_route == "source_of_truth":
@@ -345,6 +364,7 @@ def search(query: str, n_results: int = 5) -> list[dict]:
             ambiguous=decision.get("ambiguous", False),
             allow_runtime_fallback=decision.get("allow_runtime_fallback", False),
             strict_authority_mode=decision.get("strict_authority_mode", True),
+            debug_payload=payload,
         )
         if repo_fp and final:
             CACHE.retrieval_set(
@@ -355,6 +375,18 @@ def search(query: str, n_results: int = 5) -> list[dict]:
                 intent=intent,
                 retrieval_route=retrieval_route,
             )
+        if payload is not None:
+            payload["retrieval"]["raw_candidates"] = payload.get("source_of_truth", {}).get("priority_files", [])
+            payload["retrieval"]["selected_candidates"] = [c.get("file", "") for c in final]
+            payload["retrieval"]["files_retrieved"] = [c.get("file", "") for c in final]
+            payload["retrieval"]["chunks_per_file"] = {
+                c.get("file", ""): sum(1 for x in final if x.get("file", "") == c.get("file", "")) for c in final
+            }
+            payload["retrieval"]["coverage"] = {c.get("file", ""): c.get("coverage", {}) for c in final}
+            payload = apply_failure_signals(
+                payload, query=query, retrieval_route=retrieval_route, top_score=None, final_chunks=final
+            )
+            LAST_DEBUG_PAYLOAD = finalize_payload(payload, final)
         return final
 
     # ── Route 1: Filename detected ────────────────────────────────────────────
@@ -377,6 +409,10 @@ def search(query: str, n_results: int = 5) -> list[dict]:
                     intent=intent,
                     retrieval_route=retrieval_route,
                 )
+            if payload is not None:
+                payload["retrieval"]["raw_candidates"] = [c.get("file", "") for c in results]
+                payload["retrieval"]["selected_candidates"] = [c.get("file", "") for c in final]
+                LAST_DEBUG_PAYLOAD = finalize_payload(payload, final)
             return final
 
     # ── Route 1b: Structured workspace questions ─────────────────────────────
@@ -392,6 +428,10 @@ def search(query: str, n_results: int = 5) -> list[dict]:
                 intent=intent,
                 retrieval_route=retrieval_route,
             )
+        if payload is not None:
+            payload["retrieval"]["raw_candidates"] = [c.get("file", "") for c in structured]
+            payload["retrieval"]["selected_candidates"] = [c.get("file", "") for c in final]
+            LAST_DEBUG_PAYLOAD = finalize_payload(payload, final)
         return final
 
     # ── Route 2: Symbol name lookup ───────────────────────────────────────────
@@ -438,7 +478,7 @@ def search(query: str, n_results: int = 5) -> list[dict]:
             if any(mf in c["file"] for mf in matched_files):
                 c["score"] *= 0.8   # lower distance = better match
 
-    ranked = _rerank(query, candidates)
+    ranked = _rerank(query, candidates, track_reasons=payload is not None)
 
     # Add coverage metadata — lets server tell model how much of each file it has
     final = _add_coverage(ranked[:n_results])
@@ -453,7 +493,59 @@ def search(query: str, n_results: int = 5) -> list[dict]:
             intent=intent,
             retrieval_route=retrieval_route,
         )
+    if payload is not None:
+        payload["retrieval"]["raw_candidates"] = [c.get("file", "") for c in candidates]
+        payload["retrieval"]["selected_candidates"] = [c.get("file", "") for c in final]
+        payload["retrieval"]["files_retrieved"] = [c.get("file", "") for c in final]
+        payload["retrieval"]["chunks_per_file"] = {
+            c.get("file", ""): sum(1 for x in final if x.get("file", "") == c.get("file", "")) for c in final
+        }
+        payload["retrieval"]["coverage"] = {c.get("file", ""): c.get("coverage", {}) for c in final}
+        top = []
+        for rank, c in enumerate(ranked[: min(5, len(ranked))], start=1):
+            top.append({
+                "file": c.get("file", ""),
+                "score": round(c.get("_rank", 0.0), 5),
+                "rank": rank,
+                "reason": c.get("_debug_reason", "semantic"),
+            })
+        payload["ranking"]["top_candidates"] = top
+        payload = apply_failure_signals(
+            payload,
+            query=query,
+            retrieval_route=retrieval_route,
+            top_score=(top[0]["score"] if top else None),
+            final_chunks=final,
+        )
+        LAST_DEBUG_PAYLOAD = finalize_payload(payload, final)
     return final
+
+
+def get_last_debug_payload() -> dict | None:
+    return LAST_DEBUG_PAYLOAD
+
+
+def inspect_query_debug(query: str, n_results: int = 5, debug_mode: bool = True) -> dict:
+    payload = initialize_payload(query, classify_query_intent_details(query), _load_workspace_index())
+    _ = search(query, n_results=n_results, debug_mode=debug_mode, debug_payload=payload)
+    return get_last_debug_payload() or payload
+
+
+def explain_retrieval_decision(query: str, n_results: int = 5) -> dict:
+    return inspect_query_debug(query, n_results=n_results, debug_mode=True).get("retrieval", {})
+
+
+def explain_source_of_truth(query: str, n_results: int = 5) -> dict:
+    return inspect_query_debug(query, n_results=n_results, debug_mode=True).get("source_of_truth", {})
+
+
+def explain_missing_authority(query: str, n_results: int = 5) -> dict:
+    payload = inspect_query_debug(query, n_results=n_results, debug_mode=True)
+    return {
+        "query": query,
+        "missing_expected": payload.get("source_of_truth", {}).get("missing_expected", []),
+        "expected_but_missing_authority": payload.get("failure_signals", {}).get("expected_but_missing_authority", False),
+    }
 
 
 def get_chunks_for_file(filename: str) -> list[dict]:
@@ -1039,6 +1131,7 @@ def _retrieve_config_first(
     ambiguous: bool = False,
     allow_runtime_fallback: bool = False,
     strict_authority_mode: bool = True,
+    debug_payload: dict | None = None,
 ) -> list[dict]:
     """
     Deterministic source-of-truth retrieval path for config/declaration/dependency
@@ -1051,6 +1144,8 @@ def _retrieve_config_first(
         workspace.get("manifests", []),
         workspace.get("config_graph", {}).get("config_files", []),
     )
+    if debug_payload is not None:
+        debug_payload["source_of_truth"]["priority_files"] = priority_files
 
     collected = []
     found_authoritative = False
@@ -1082,6 +1177,9 @@ def _retrieve_config_first(
             workspace.get("config_graph", {}).get("config_files", []),
             recovery_candidates,
         )
+        if debug_payload is not None:
+            debug_payload["source_of_truth"]["recovery_candidates"] = recovery_candidates
+            debug_payload["source_of_truth"]["ranked_paths"] = ranked_paths
         recovery_chunks = _recover_authoritative_files(
             ranked_paths,
             intent=intent,
@@ -1090,6 +1188,8 @@ def _retrieve_config_first(
         if recovery_chunks:
             collected.extend(recovery_chunks)
             found_authoritative = True
+    if debug_payload is not None:
+        debug_payload["source_of_truth"]["selected_files"] = [c.get("file", "") for c in collected]
 
     q = query.lower()
     asks_permissions = any(k in q for k in ("permission", "permissions", "declared", "manifest"))
@@ -1109,10 +1209,17 @@ def _retrieve_config_first(
                 "source_type": "manifest",
                 "authority_level": "declared",
             }
+            if debug_payload is not None:
+                if not any("androidmanifest.xml" in p.lower() for p in workspace.get("manifests", [])):
+                    debug_payload["source_of_truth"]["missing_expected"].append("AndroidManifest.xml")
+                debug_payload["failure_signals"]["expected_but_missing_authority"] = False
             return [summary] + collected[: max(0, n_results - 1)]
 
         # Explicit missing-manifest declaration path
         if not any(c.get("file", "").endswith("AndroidManifest.xml") for c in collected):
+            if debug_payload is not None:
+                debug_payload["source_of_truth"]["missing_expected"].append("AndroidManifest.xml")
+                debug_payload["failure_signals"]["expected_but_missing_authority"] = True
             explicit = missing_manifest_notice()
             explicit.update({
                 "symbols": "",
@@ -1157,7 +1264,11 @@ def _retrieve_config_first(
     ):
         fallback = search_semantic_only(query, n_results=max(1, n_results - 1))
         annotate_sources(fallback, source_type="source_code", authority_level="referenced")
+        if debug_payload is not None:
+            debug_payload["failure_signals"]["expected_but_missing_authority"] = True
         return [limitation] + fallback
+    if debug_payload is not None:
+        debug_payload["failure_signals"]["expected_but_missing_authority"] = True
     return [limitation]
 
 
@@ -1337,7 +1448,7 @@ def _camel_tokens(s: str) -> set:
     return set(re.findall(r"\w+", parts))
 
 
-def _rerank(query: str, candidates: list) -> list:
+def _rerank(query: str, candidates: list, track_reasons: bool = False) -> list:
     """
     Score each candidate on four axes then sort descending.
 
@@ -1388,6 +1499,17 @@ def _rerank(query: str, candidates: list) -> list:
         len_penalty = 0.05 if n_lines < 4 else 0.0
 
         c["_rank"] = base + kw_bonus + sym_bonus + phrase_bonus - len_penalty
+        if track_reasons:
+            reasons = []
+            if kw_bonus > 0:
+                reasons.append("keyword overlap")
+            if sym_bonus > 0:
+                reasons.append("symbol match")
+            if phrase_bonus > 0:
+                reasons.append("phrase match")
+            if not reasons:
+                reasons.append("semantic distance")
+            c["_debug_reason"] = ", ".join(reasons)
 
     return sorted(candidates, key=lambda x: x["_rank"], reverse=True)
 

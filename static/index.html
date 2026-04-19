@@ -864,6 +864,34 @@
     color: var(--text-dim);
     font-family: var(--font-mono);
   }
+  .debug-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-size: 10px;
+  }
+  .debug-panel {
+    margin-top: 10px;
+    border: 1px solid var(--border2);
+    border-radius: 8px;
+    background: var(--surface2);
+    padding: 8px 10px;
+  }
+  .debug-panel summary {
+    cursor: pointer;
+    color: var(--warning);
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
+  .debug-json {
+    margin-top: 8px;
+    white-space: pre-wrap;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text);
+  }
 
   .char-count {
     font-size: 11px;
@@ -1116,6 +1144,7 @@
       </div>
       <div class="input-footer">
         <span class="input-hint">⏎ send · ⇧⏎ newline</span>
+        <label class="debug-toggle"><input type="checkbox" id="debugMode"> debug mode</label>
         <span class="char-count" id="charCount">0</span>
       </div>
     </div>
@@ -1132,6 +1161,7 @@ let sessionStats  = { messages: 0, totalTime: [], ttft: [] };
 let indexedFiles  = null;
 let currentMsgEl  = null;
 let currentRawText = '';
+let debugMode = false;
 
 // ── Init ─────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {
@@ -1147,6 +1177,9 @@ window.addEventListener('DOMContentLoaded', () => {
   // Input char counter
   document.getElementById('chatInput').addEventListener('input', e => {
     document.getElementById('charCount').textContent = e.target.value.length;
+  });
+  document.getElementById('debugMode').addEventListener('change', (e) => {
+    debugMode = !!e.target.checked;
   });
 });
 
@@ -1537,6 +1570,7 @@ async function streamResponse(userText) {
         messages:   conversation,
         max_tokens: 1024,
         stream:     true,
+        debug_mode: debugMode,
       }),
     });
 
@@ -1546,6 +1580,7 @@ async function streamResponse(userText) {
     const decoder = new TextDecoder();
     let   buf     = '';
     let   realContent = '';
+    let   debugPayload = null;
     let   inStatus    = true;   // still showing status messages
 
     while (true) {
@@ -1565,6 +1600,13 @@ async function streamResponse(userText) {
           const chunk   = JSON.parse(payload);
           const content = chunk.choices?.[0]?.delta?.content ?? '';
           if (!content) continue;
+          if (content.includes('[DEBUG_PAYLOAD]')) {
+            const m = content.match(/\[DEBUG_PAYLOAD\]([\s\S]*?)\[\/DEBUG_PAYLOAD\]/);
+            if (m && m[1]) {
+              try { debugPayload = JSON.parse(m[1]); } catch {}
+            }
+            continue;
+          }
 
           currentRawText += content;
 
@@ -1616,6 +1658,9 @@ async function streamResponse(userText) {
     if (realContent) {
       renderFinalContent(msgEl, realContent, t0, ttft);
     }
+    if (debugPayload && debugMode) {
+      renderDebugPanel(msgEl, debugPayload);
+    }
 
     // Update stats
     const total = (performance.now() - t0) / 1000;
@@ -1637,6 +1682,16 @@ async function streamResponse(userText) {
     currentMsgEl = null;
     scrollToBottom();
   }
+}
+
+function renderDebugPanel(msgEl, payload) {
+  const details = document.createElement('details');
+  details.className = 'debug-panel';
+  details.innerHTML = `
+    <summary>DEBUG PIPELINE</summary>
+    <div class="debug-json">${escapeHtml(JSON.stringify(payload, null, 2))}</div>
+  `;
+  msgEl.content.after(details);
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────

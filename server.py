@@ -25,6 +25,7 @@ from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from llama_cpp import Llama, LlamaCache
 from andes_cache import build_prompt_sections, serialize_prompt_sections
+from andes_cache.debug import resolve_debug_mode, env_debug_mode
 from andes_cache.routing import (
     classify_query_intent,
     classify_query_intent_details,
@@ -41,6 +42,7 @@ LOG_PATH       = BASE_DIR / "audit.log"
 PORT           = int(os.getenv("PORT", 8080))
 CONTEXT_CHUNKS = int(os.getenv("CONTEXT_CHUNKS", 5))
 CACHE_SIZE_GB  = float(os.getenv("CACHE_SIZE_GB", 2.0))
+DEBUG_MODE     = env_debug_mode()
 
 # Core system prompt — kept short and static for KV cache reuse
 _BASE_SYSTEM = (
@@ -227,6 +229,8 @@ async def chat(request: Request):
     messages   = body.get("messages", [])
     stream     = body.get("stream", True)
     max_tokens = body.get("max_tokens", 1024)
+    api_debug  = body.get("debug_mode")
+    debug_mode = resolve_debug_mode(api_flag=api_debug, param_flag=DEBUG_MODE)
     request_id = str(uuid.uuid4())[:8]
     t_start    = time.perf_counter()
 
@@ -234,13 +238,13 @@ async def chat(request: Request):
 
     if stream:
         return StreamingResponse(
-            _stream(messages, max_tokens, request_id, t_start),
+            _stream(messages, max_tokens, request_id, t_start, debug_mode=debug_mode),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
                      "X-Accel-Buffering": "no"},
         )
 
-    messages = _build_context(messages, request_id)
+    messages = _build_context(messages, request_id, debug_mode=debug_mode)
     prompt   = _messages_to_prompt(messages)
     try:
         result = llm(prompt, max_tokens=max_tokens, echo=False)
@@ -257,7 +261,23 @@ async def chat(request: Request):
         "choices": [{"index": 0,
                      "message": {"role": "assistant", "content": text},
                      "finish_reason": "stop"}],
+        "debug": (_indexer_module.get_last_debug_payload() if (debug_mode and _indexer_module) else None),
     }
+
+
+@app.post("/v1/debug/explain")
+async def debug_explain(request: Request):
+    body = await request.json()
+    query = body.get("query", "")
+    n_results = int(body.get("n_results", CONTEXT_CHUNKS))
+    api_debug = body.get("debug_mode")
+    debug_mode = resolve_debug_mode(api_flag=api_debug, param_flag=DEBUG_MODE)
+    if not _indexer_module:
+        return {"enabled": debug_mode, "error": "Indexer not available", "debug": None}
+    if not query:
+        return {"enabled": debug_mode, "error": "query is required", "debug": None}
+    payload = _indexer_module.inspect_query_debug(query, n_results=n_results, debug_mode=debug_mode)
+    return {"enabled": debug_mode, "debug": payload if debug_mode else None}
 
 
 @app.post("/v1/index")
@@ -312,7 +332,7 @@ async def index_project(request: Request):
 
 # ── Context builder ───────────────────────────────────────────────────────────
 
-def _build_context(messages: list, request_id: str) -> list:
+def _build_context(messages: list, request_id: str, debug_mode: bool = False) -> list:
     """
     Build the full system prompt with:
       1. Base instructions
@@ -349,7 +369,7 @@ def _build_context(messages: list, request_id: str) -> list:
         workspace_signature = cache.workspace_signature(ws) if cache and ws else ""
 
         # ── Code retrieval ────────────────────────────────────────────────────
-        chunks = search_codebase(query, n_results=CONTEXT_CHUNKS)
+        chunks = search_codebase(query, n_results=CONTEXT_CHUNKS, debug_mode=debug_mode)
 
         if not chunks:
             sections = build_prompt_sections(
@@ -627,7 +647,7 @@ def _build_context_from_plan(
 
 # ── Streaming ─────────────────────────────────────────────────────────────────
 
-async def _stream(messages: list, max_tokens: int, request_id: str, t_start: float):
+async def _stream(messages: list, max_tokens: int, request_id: str, t_start: float, debug_mode: bool = False):
     think_open = "<|channel>"
     think_close = "<channel|>"
     yield _make_chunk("⚙️ _Analyzing request..._", request_id)
@@ -688,7 +708,7 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
         else:
             status = "Loading source-of-truth config..." if is_fast_path_intent(intent) else "Searching codebase..."
             yield _make_chunk(f"\n📂 _{status}_", request_id)
-            messages = _build_context(messages, request_id)
+            messages = _build_context(messages, request_id, debug_mode=debug_mode)
 
         t_context = time.perf_counter()
         ctx_s = t_context - t_start
@@ -774,6 +794,10 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
             value=final_text.strip(),
         )
         cache.flush_metrics()
+    if debug_mode and _indexer_module:
+        dbg = _indexer_module.get_last_debug_payload()
+        if dbg:
+            yield _make_chunk(f"\n\n[DEBUG_PAYLOAD]{json.dumps(dbg)}[/DEBUG_PAYLOAD]", request_id)
     yield "data: [DONE]\n\n"
 
 
