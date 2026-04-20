@@ -1345,6 +1345,12 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                     yield _make_chunk(remainder, request_id)
 
             filtered_text, filtered_out = _validate_high_signal_output(final_text, is_performance)
+            if is_performance and filtered_text.strip() and filtered_text.strip() != final_text.strip():
+                yield _make_chunk(
+                    "\n\n🔎 Refined high-signal summary:\n",
+                    request_id,
+                )
+                yield _make_chunk(filtered_text, request_id)
 
             t_done = time.perf_counter()
             total_s = t_done - t_start
