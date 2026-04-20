@@ -162,7 +162,70 @@ class TestDirectRetrievalAuthoritative(unittest.TestCase):
         self.assertEqual(payload["retrieval"]["authority_retrieval_mode"], "workspace_only_detected_not_indexed")
         self.assertEqual(payload["retrieval"]["declaration_answer_mode"], "missing_declarations")
 
-    def test_multiple_authoritative_files_are_force_included(self):
+    def test_authoritative_multichunk_file_keeps_all_chunks(self):
+        indexer = _import_indexer_with_stubs()
+        indexer._load_workspace_index = lambda: {
+            "manifests": [],
+            "config_graph": {"config_files": ["a/package.json"]},
+        }
+        indexer.classify_query_intent_details = lambda _q: {
+            "intent": "dependency_or_build_inventory",
+            "retrieval_route": "semantic",
+            "ambiguous": False,
+            "allow_runtime_fallback": False,
+            "strict_authority_mode": True,
+        }
+        indexer._structured_query_results = lambda _q: []
+        indexer._load_json = lambda _p: {}
+        indexer.get_repo_fingerprint = lambda: ""
+        indexer._fetch_exact_file = lambda path, max_results=6: [
+            {"file": path, "content": "dep_a", "line": 1, "language": "", "symbols": ""},
+            {"file": path, "content": "dep_b", "line": 20, "language": "", "symbols": ""},
+            {"file": path, "content": "dep_c", "line": 40, "language": "", "symbols": ""},
+            {"file": path, "content": "dep_d", "line": 90, "language": "", "symbols": ""},
+        ]
+        indexer._fetch_indexed_candidates_by_basename = lambda *_args, **_kwargs: {}
+        indexer._add_coverage = lambda chunks: chunks
+        indexer._rerank = lambda _q, candidates, track_reasons=False: sorted(candidates, key=lambda c: c.get("file", ""))
+
+        results = indexer.search("what dependencies are declared", n_results=1, debug_mode=False)
+        dep_chunks = [r for r in results if r.get("file") == "a/package.json"]
+        self.assertEqual(len(dep_chunks), 4)
+        self.assertEqual([c.get("content") for c in dep_chunks], ["dep_a", "dep_b", "dep_c", "dep_d"])
+
+    def test_semantic_duplicates_do_not_readd_authoritative_chunks(self):
+        indexer = _import_indexer_with_stubs()
+        indexer._load_workspace_index = lambda: {
+            "manifests": [],
+            "config_graph": {"config_files": ["a/package.json"]},
+        }
+        indexer.classify_query_intent_details = lambda _q: {
+            "intent": "dependency_or_build_inventory",
+            "retrieval_route": "semantic",
+            "ambiguous": False,
+            "allow_runtime_fallback": False,
+            "strict_authority_mode": True,
+        }
+        indexer._structured_query_results = lambda _q: []
+        indexer._load_json = lambda _p: {}
+        indexer.get_repo_fingerprint = lambda: ""
+        indexer._fetch_exact_file = lambda path, max_results=6: [
+            {"file": path, "content": "dep_a", "line": 1, "language": "", "symbols": ""},
+            {"file": path, "content": "dep_b", "line": 2, "language": "", "symbols": ""},
+        ]
+        indexer._fetch_indexed_candidates_by_basename = lambda *_args, **_kwargs: {}
+        indexer._add_coverage = lambda chunks: chunks
+        indexer._rerank = lambda _q, candidates, track_reasons=False: [
+            {"file": "a/package.json", "content": "dep_a", "line": 1, "score": 0.01},
+            {"file": "src/runtime_usage.kt", "content": "runtime", "line": 5, "score": 0.02},
+        ]
+
+        results = indexer.search("what dependencies are declared", n_results=3, debug_mode=False)
+        dep_a_count = sum(1 for r in results if r.get("file") == "a/package.json" and r.get("content") == "dep_a")
+        self.assertEqual(dep_a_count, 1)
+        self.assertTrue(any(r.get("file") == "a/package.json" and r.get("content") == "dep_b" for r in results))
+
+    def test_partial_authority_debug_mode_is_declared_partial_only(self):
         indexer = _import_indexer_with_stubs()
         indexer._load_workspace_index = lambda: {
             "manifests": [],
@@ -178,15 +241,19 @@ class TestDirectRetrievalAuthoritative(unittest.TestCase):
         indexer._structured_query_results = lambda _q: []
         indexer._load_json = lambda _p: {}
         indexer.get_repo_fingerprint = lambda: ""
-        indexer._fetch_exact_file = lambda path, max_results=6: [{"file": path, "content": f"{path} deps", "language": "", "symbols": ""}]
+        indexer._fetch_exact_file = lambda path, max_results=6: (
+            [{"file": path, "content": "dep_only", "line": 1, "language": "", "symbols": ""}]
+            if path == "a/package.json"
+            else []
+        )
         indexer._fetch_indexed_candidates_by_basename = lambda *_args, **_kwargs: {}
         indexer._add_coverage = lambda chunks: chunks
-        indexer._rerank = lambda _q, candidates, track_reasons=False: sorted(candidates, key=lambda c: c.get("file", ""))
+        indexer._rerank = lambda _q, candidates, track_reasons=False: candidates
 
-        results = indexer.search("what dependencies are declared", n_results=1, debug_mode=False)
-        files = [r.get("file") for r in results]
-        self.assertIn("a/package.json", files)
-        self.assertIn("b/pyproject.toml", files)
+        _results, payload = indexer.search("what dependencies are declared", n_results=1, debug_mode=True, return_debug=True)
+        self.assertEqual(payload["retrieval"]["authoritative_files_retrieved"], ["a/package.json"])
+        self.assertEqual(payload["retrieval"]["authoritative_files_missing"], ["b/pyproject.toml"])
+        self.assertEqual(payload["retrieval"]["declaration_answer_mode"], "declared_partial_only")
 
     def test_debug_payload_includes_authoritative_fields(self):
         indexer = _import_indexer_with_stubs()

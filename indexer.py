@@ -507,6 +507,12 @@ def search(
         base = Path(path).name
         return any(Path(p).name == base for p in authoritative_files_required)
 
+    def _chunk_identity(chunk: dict) -> tuple[str, int, str]:
+        file_path = str(chunk.get("file", "") or "")
+        line = int(chunk.get("line", 0) or 0)
+        content = str(chunk.get("content", "") or "")
+        return (file_path, line, content)
+
     def _update_authoritative_debug(final_chunks: list[dict], *, mode: str = "", reason: str = "") -> None:
         if payload is None:
             return
@@ -527,10 +533,19 @@ def search(
         if mode:
             payload["retrieval"]["authority_retrieval_mode"] = mode
         if decl_query:
-            if retrieved and not payload["retrieval"]["authoritative_files_missing"]:
+            missing = payload["retrieval"]["authoritative_files_missing"]
+            has_runtime_or_inferred = any(
+                c.get("file")
+                and not _matches_authoritative(c.get("file", ""))
+                and c.get("source_type") in {"source_code", "inferred"}
+                for c in (final_chunks or [])
+            )
+            if retrieved and not missing and not has_runtime_or_inferred:
                 payload["retrieval"]["declaration_answer_mode"] = "declared_only"
-            elif retrieved and payload["retrieval"]["authoritative_files_missing"]:
-                payload["retrieval"]["declaration_answer_mode"] = "missing_declarations"
+            elif retrieved and has_runtime_or_inferred:
+                payload["retrieval"]["declaration_answer_mode"] = "declared_plus_runtime"
+            elif retrieved and missing and not has_runtime_or_inferred:
+                payload["retrieval"]["declaration_answer_mode"] = "declared_partial_only"
             elif payload["retrieval"]["authority_retrieval_mode"] == "runtime_fallback_used":
                 payload["retrieval"]["declaration_answer_mode"] = "runtime_only_fallback"
             else:
@@ -716,6 +731,7 @@ def search(
             "content":  doc,
             "file":     results["metadatas"][0][i].get("file", ""),
             "language": results["metadatas"][0][i].get("language", ""),
+            "line":     results["metadatas"][0][i].get("line", 0),
             "symbols":  results["metadatas"][0][i].get("symbols", ""),
             "score":    results["distances"][0][i],
         }
@@ -746,6 +762,7 @@ def search(
                         "content": ch.get("content", ""),
                         "file": ch.get("file", authoritative_path),
                         "language": ch.get("language", ""),
+                        "line": ch.get("line", 0),
                         "symbols": ch.get("symbols", ""),
                         "score": -1.0,
                     }
@@ -801,20 +818,21 @@ def search(
                     final_chunks=final,
                 )
             return _ret(final, payload_out)
-        authoritative_files_injected = set()
+        authoritative_chunks_injected: set[tuple[str, int, str]] = set()
         merged = []
         for c in authoritative_forced_candidates:
-            key = c.get("file", "")
-            if key and key in authoritative_files_injected:
+            key = _chunk_identity(c)
+            if key in authoritative_chunks_injected:
                 continue
-            authoritative_files_injected.add(key)
+            authoritative_chunks_injected.add(key)
             merged.append(c)
+        target_size = max(n_results, len(authoritative_chunks_injected))
         for c in final_ranked:
-            if c.get("file", "") in authoritative_files_injected:
+            if len(merged) >= target_size:
+                break
+            if _chunk_identity(c) in authoritative_chunks_injected:
                 continue
             merged.append(c)
-            if len(merged) >= max(n_results, len(authoritative_files_injected)):
-                break
         final_ranked = merged
 
     # Add coverage metadata — lets server tell model how much of each file it has

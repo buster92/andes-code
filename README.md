@@ -351,7 +351,7 @@ For declaration/config/dependency questions, debug payloads now include authorit
 - `forced_authoritative_file`: whether authoritative context was force-included.
 - `authority_selection_reason`: why authoritative paths were selected.
 - `authority_retrieval_mode`: `direct_chunk_load`, `integrity_repair`, `workspace_only_detected_not_indexed`, `semantic_fallback_blocked`, or `runtime_fallback_used`.
-- `declaration_answer_mode`: `declared_only`, `declared_plus_runtime`, `runtime_only_fallback`, or `missing_declarations`.
+- `declaration_answer_mode`: `declared_only`, `declared_plus_runtime`, `declared_partial_only`, `runtime_only_fallback`, or `missing_declarations`.
 
 If AndesCode detects authoritative files in workspace metadata but cannot retrieve chunks from the index, it now emits an explicit limitation (`workspace_only_detected_not_indexed`) instead of silently degrading to inferred/runtime-only answers.
 
