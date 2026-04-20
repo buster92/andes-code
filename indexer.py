@@ -703,6 +703,14 @@ def search(
                 continue
             file_chunks = _fetch_exact_file(authoritative_path, max_results=3)
             if not file_chunks:
+                basename_candidates = sorted(
+                    _fetch_indexed_candidates_by_basename(authoritative_path, limit=120).keys()
+                )
+                logging.warning(
+                    "AUTHORITATIVE_FETCH_EMPTY requested=%s candidates=%s",
+                    authoritative_path,
+                    basename_candidates,
+                )
                 continue
             source_type = classify_source_type(authoritative_path)
             authority = authority_level_for_source(intent, source_type)
@@ -1642,6 +1650,91 @@ def _recover_authoritative_files(candidates: list[str], intent: str, n_results: 
     return recovered[:n_results]
 
 
+def _normalize_index_path(path: str) -> str:
+    """Normalize index/workspace paths into a comparable relative POSIX form."""
+    if not path:
+        return ""
+    p = str(path).replace("\\", "/").strip()
+    if not p:
+        return ""
+    root = str(Path.cwd()).replace("\\", "/").rstrip("/")
+    if root and p.startswith(root + "/"):
+        p = p[len(root) + 1:]
+    repo_name = Path.cwd().name
+    marker = f"/{repo_name}/"
+    if marker in f"/{p}":
+        idx = f"/{p}".find(marker)
+        if idx >= 0:
+            p = f"/{p}"[idx + len(marker):]
+    while p.startswith("./"):
+        p = p[2:]
+    p = p.lstrip("/")
+    return p
+
+
+def _path_suffix_match(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    l = _normalize_index_path(left)
+    r = _normalize_index_path(right)
+    if not l or not r:
+        return False
+    return l == r or l.endswith("/" + r) or r.endswith("/" + l)
+
+
+def _fetch_indexed_candidates_by_basename(path: str, limit: int = 240) -> dict[str, list[dict]]:
+    """Fetch indexed chunks grouped by file for files sharing the same basename."""
+    base = Path(str(path).replace("\\", "/")).name
+    if not base:
+        return {}
+    try:
+        lookup = col.get(where={"file": {"$contains": base}}, limit=limit)
+    except Exception:
+        return {}
+    if not lookup or not lookup.get("documents"):
+        return {}
+
+    candidates_by_file: dict[str, list[dict]] = defaultdict(list)
+    for i, doc in enumerate(lookup["documents"]):
+        if not doc:
+            continue
+        meta = lookup["metadatas"][i] if i < len(lookup.get("metadatas", [])) else {}
+        file_path = meta.get("file", "")
+        if not file_path or Path(file_path).name != base:
+            continue
+        candidates_by_file[file_path].append(
+            {
+                "content": doc,
+                "file": file_path,
+                "language": meta.get("language", ""),
+                "line": meta.get("line", 0),
+                "symbols": meta.get("symbols", ""),
+                "score": 0.0,
+                "_rank": 1.0,
+                "full_file": True,
+                "_fallback_used": True,
+            }
+        )
+    return candidates_by_file
+
+
+def _choose_preferred_candidate_path(requested_path: str, candidate_paths: list[str]) -> str:
+    if not candidate_paths:
+        return ""
+    requested_norm = _normalize_index_path(requested_path)
+    build_hints = ("buildsrc", "gradle", "settings.gradle", "build.gradle", "deps", "dependenc", "config")
+
+    def _score(path: str) -> tuple[int, int, int, int, str]:
+        p_norm = _normalize_index_path(path)
+        exact_norm = int(bool(requested_norm and p_norm == requested_norm))
+        suffix_match = int(_path_suffix_match(p_norm, requested_norm))
+        build_related = int(any(h in p_norm.lower() for h in build_hints))
+        depth = p_norm.count("/")
+        return (exact_norm, suffix_match, build_related, -depth, p_norm)
+
+    return sorted(candidate_paths, key=_score, reverse=True)[0]
+
+
 def _fetch_exact_file(path: str, max_results: int = 60) -> list:
     """
     Fetch indexed chunks for an exact relative path with a strict fallback to
@@ -1650,6 +1743,8 @@ def _fetch_exact_file(path: str, max_results: int = 60) -> list:
     count = col.count()
     if count == 0:
         return []
+
+    normalized_path = _normalize_index_path(path)
 
     try:
         exact = col.get(where={"file": path}, limit=max_results)
@@ -1667,7 +1762,7 @@ def _fetch_exact_file(path: str, max_results: int = 60) -> list:
                     "_fallback_used": False,
                 }
                 for i, doc in enumerate(exact["documents"])
-                if doc and exact["metadatas"][i].get("file", "") == path
+                if doc and _path_suffix_match(exact["metadatas"][i].get("file", ""), path)
             ]
             chunks.sort(key=lambda c: int(c.get("line", 0) or 0))
             return chunks[:max_results]
@@ -1675,27 +1770,14 @@ def _fetch_exact_file(path: str, max_results: int = 60) -> list:
         pass
 
     try:
-        fallback = col.get(
-            where={"file": {"$contains": path.split("/")[-1]}},
-            limit=max_results * 3,
-        )
-        if not fallback or not fallback.get("documents"):
+        candidates_by_file = _fetch_indexed_candidates_by_basename(path, limit=max_results * 12)
+        if not candidates_by_file:
             return []
-        chunks = [
-            {
-                "content": doc,
-                "file": fallback["metadatas"][i].get("file", ""),
-                "language": fallback["metadatas"][i].get("language", ""),
-                "line": fallback["metadatas"][i].get("line", 0),
-                "symbols": fallback["metadatas"][i].get("symbols", ""),
-                "score": 0.0,
-                "_rank": 1.0,
-                "full_file": True,
-                "_fallback_used": True,
-            }
-            for i, doc in enumerate(fallback["documents"])
-            if doc and fallback["metadatas"][i].get("file", "") == path
-        ]
+        selected_path = _choose_preferred_candidate_path(
+            normalized_path or path,
+            list(candidates_by_file.keys()),
+        )
+        chunks = candidates_by_file.get(selected_path, [])
         chunks.sort(key=lambda c: int(c.get("line", 0) or 0))
         return chunks[:max_results]
     except Exception:

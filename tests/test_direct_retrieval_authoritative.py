@@ -100,3 +100,33 @@ class TestDirectRetrievalAuthoritative(unittest.TestCase):
                 for c in results
             )
         )
+
+    def test_fetch_exact_file_recovers_suffix_path_mismatch_for_authoritative_file(self):
+        indexer = _import_indexer_with_stubs()
+
+        class _PathMismatchCollection:
+            def count(self):
+                return 2
+
+            def get(self, where=None, limit=None):  # noqa: ARG002
+                if where == {"file": "buildSrc/dependencies.kt"}:
+                    return {"documents": [], "metadatas": []}
+                return {
+                    "documents": ["implementation(\"a:b:1.0\")"],
+                    "metadatas": [{
+                        "file": "app/buildSrc/dependencies.kt",
+                        "language": "kt",
+                        "line": 7,
+                        "symbols": "dep",
+                    }],
+                }
+
+        original_col = indexer.col
+        indexer.col = _PathMismatchCollection()
+        try:
+            chunks = indexer._fetch_exact_file("buildSrc/dependencies.kt", max_results=5)
+        finally:
+            indexer.col = original_col
+
+        self.assertTrue(chunks)
+        self.assertEqual(chunks[0]["file"], "app/buildSrc/dependencies.kt")
