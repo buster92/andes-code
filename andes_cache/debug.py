@@ -109,6 +109,7 @@ def initialize_payload(query: str, decision: dict, workspace: dict | None) -> di
             "authority_selection_reason": "",
             "authority_retrieval_mode": "",
             "declaration_answer_mode": "",
+            "declaration_query_trigger_reason": "",
             "chunks_per_file": {},
             "coverage": {},
             "cache_hit": False,

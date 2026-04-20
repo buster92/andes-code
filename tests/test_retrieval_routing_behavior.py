@@ -111,6 +111,9 @@ class TestSourceOfTruthBehavior(unittest.TestCase):
     def test_dependency_queries_are_treated_as_declaration_questions(self):
         self.assertTrue(is_declaration_query("what dependencies and versions are configured"))
         self.assertTrue(is_declaration_query("where are build settings declared"))
+        self.assertTrue(is_declaration_query("what dependencies are declared"))
+        self.assertTrue(is_declaration_query("what libraries does this project use"))
+        self.assertTrue(is_declaration_query("where is config defined"))
 
     def test_guidance_requires_declared_and_inferred_sections(self):
         guidance = source_of_truth_guidance("what dependencies are declared in package.json")

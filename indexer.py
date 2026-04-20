@@ -37,6 +37,7 @@ from andes_cache.source_of_truth import (
     authority_level_for_source,
     wants_runtime_usage,
     is_declaration_query,
+    has_declaration_keywords,
 )
 from andes_cache.integrity import (
     INTEGRITY_HEALTHY,
@@ -498,7 +499,17 @@ def search(
         if isinstance(workspace_index, dict)
         else []
     )
+    declaration_query_trigger_reason = ""
     decl_query = is_declaration_query(query, intent)
+    if intent in {"dependency_or_build_inventory", "config_lookup", "dependency_lookup"}:
+        declaration_query_trigger_reason = "intent"
+    elif has_declaration_keywords(query):
+        declaration_query_trigger_reason = "keyword_fallback"
+
+    if not decl_query and authoritative_files_detected and has_declaration_keywords(query):
+        decl_query = True
+        declaration_query_trigger_reason = "workspace_signal"
+
     authoritative_files_required = list(authoritative_files_detected) if decl_query else []
 
     def _matches_authoritative(path: str) -> bool:
@@ -528,6 +539,7 @@ def search(
         payload["retrieval"]["authoritative_files_retrieved"] = retrieved
         payload["retrieval"]["authoritative_files_missing"] = [p for p in authoritative_files_required if p not in retrieved]
         payload["retrieval"]["forced_authoritative_file"] = bool(retrieved)
+        payload["retrieval"]["declaration_query_trigger_reason"] = declaration_query_trigger_reason
         if reason:
             payload["retrieval"]["authority_selection_reason"] = reason
         if mode:

@@ -268,24 +268,46 @@ def missing_manifest_notice() -> dict:
 def is_declaration_query(query: str, intent: str = "") -> bool:
     """Return True when user asks for config/build/dependency declarations."""
     q = (query or "").lower()
-    if intent in {"declaration_or_configuration", "dependency_or_build_inventory"}:
+    declaration_keywords = (
+        "dependenc",
+        "declared",
+        "librar",
+        "version",
+        "manifest",
+        "permission",
+        "config",
+        "build",
+        "settings",
+        "requirements",
+        "package.json",
+        "pyproject",
+        "gradle",
+        "pom.xml",
+    )
+    if intent in {
+        "declaration_or_configuration",
+        "dependency_or_build_inventory",
+        "config_lookup",
+        "dependency_lookup",
+    }:
         return True
+    return any(k in q for k in declaration_keywords)
+
+
+def has_declaration_keywords(query: str) -> bool:
+    q = (query or "").lower()
     return any(
         k in q
         for k in (
             "dependenc",
+            "declared",
             "librar",
             "version",
+            "build",
+            "config",
+            "requirements",
             "manifest",
             "permission",
-            "config",
-            "build",
-            "settings",
-            "requirements",
-            "package.json",
-            "pyproject",
-            "gradle",
-            "pom.xml",
         )
     )
 
