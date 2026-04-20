@@ -144,29 +144,33 @@ def _reasoning_policy_for_query(query: str) -> tuple[str, str]:
 def _validate_high_signal_output(text: str, enabled: bool) -> tuple[str, int]:
     if not enabled or not text.strip():
         return text, 0
-    lines = text.splitlines()
-    kept = []
+    blocks = [b for b in re.split(r"\n\s*\n", text.strip()) if b.strip()]
+    if not blocks:
+        return text, 0
+
+    architecture_markers = (
+        "dependency injection", "di", "repository", "use case",
+        "clean architecture", "mvvm", "mvi", "oncreate", "init", "setup",
+    )
+    hot_path_markers = (
+        "per frame", "per event", "frame", "scroll", "jank", "render",
+        "recyclerview", "main thread", "cpu", "bind", "gesture",
+    )
+
+    kept_blocks: list[str] = []
     filtered_out = 0
-    item_re = re.compile(r"^\s*(?:[-*]\s+|\d+\.\s+)")
-    has_item = False
-    for line in lines:
-        if item_re.match(line):
-            has_item = True
-            normalized = line.lower()
-            has_freq = any(tag in normalized for tag in ("per frame", "per event", "frequency: high"))
-            has_cost = any(tag in normalized for tag in ("cost: medium", "cost: high", "high cost", "medium cost"))
-            has_thread = any(tag in normalized for tag in ("thread: main", "main thread", "thread impact: high"))
-            if has_freq and has_cost and has_thread:
-                kept.append(line)
-            else:
-                filtered_out += 1
-        elif kept:
-            kept.append(line)
-    if has_item:
-        if kept:
-            return "\n".join(kept).strip(), filtered_out
+    for block in blocks:
+        normalized = block.lower()
+        has_architecture = any(marker in normalized for marker in architecture_markers)
+        has_hot_path = any(marker in normalized for marker in hot_path_markers)
+        if has_architecture and not has_hot_path:
+            filtered_out += 1
+            continue
+        kept_blocks.append(block)
+
+    if not kept_blocks:
         return "No high-signal hot paths found.", filtered_out
-    return text, filtered_out
+    return "\n\n".join(kept_blocks).strip(), filtered_out
 
 
 def _index_phase_log(source: str, phase: str, **fields) -> None:
@@ -666,8 +670,8 @@ def _build_context(
     )
     reasoning_policy, query_type = _reasoning_policy_for_query(query)
     audit.info(
-        f"HIGH_SIGNAL {request_id} | query_type={query_type} | "
-        f"applied={bool(reasoning_policy)} | filtered_out_items=0"
+        f"HIGH_SIGNAL_MODE {request_id} | query_type={query_type} | "
+        f"applied={bool(reasoning_policy)}"
     )
     if not INDEXER_READY:
         sections = build_prompt_sections(
@@ -1044,8 +1048,8 @@ def _build_context_from_plan(
     )
     reasoning_policy, query_type = _reasoning_policy_for_query(query)
     audit.info(
-        f"HIGH_SIGNAL {request_id} | query_type={query_type} | "
-        f"applied={bool(reasoning_policy)} | filtered_out_items=0"
+        f"HIGH_SIGNAL_MODE {request_id} | query_type={query_type} | "
+        f"applied={bool(reasoning_policy)}"
     )
 
     pmap        = _indexer_module._load_project_map() if _indexer_module else {}
@@ -1184,11 +1188,14 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
     intent = "unknown"
     retrieval_route = "unknown"
     retrieval_signature = ""
+    filtered_out = 0
+    is_performance = False
     try:
         _phase_log(request_id, "request_received", max_tokens=max_tokens, message_count=len(messages))
         yield _make_chunk("⚙️ _Analyzing request..._", request_id)
 
         query = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+        is_performance = _is_performance_query(query)
         pmap = _indexer_module._load_project_map() if _indexer_module else {}
         phase = "intent_classified"
         decision = classify_query_intent_details(query)
@@ -1216,13 +1223,7 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
             if semantic_hit:
                 cached_semantic = True
                 yield _make_chunk("\n🧩 _Semantic cache hit (safe descriptive answer)_\n\n", request_id)
-                is_performance = _is_performance_query(query)
                 final_text, filtered_out = _validate_high_signal_output(semantic_hit, is_performance)
-                query_type = "performance" if is_performance else "general"
-                audit.info(
-                    f"HIGH_SIGNAL {request_id} | query_type={query_type} | "
-                    f"applied={is_performance} | filtered_out_items={filtered_out}"
-                )
                 yield _make_chunk(final_text, request_id)
 
         if not cached_semantic:
@@ -1291,6 +1292,7 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
             t_think_total = 0.0
             t_first_token = None
             token_count = 0
+            emitted_answer = False
 
             phase = "generation"
             for chunk in llm(prompt, max_tokens=max_tokens, stream=True, echo=False):
@@ -1302,11 +1304,15 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                     in_think = True
                     t_think_start = time.perf_counter()
                     if before.strip():
+                        if not emitted_answer:
+                            yield _make_chunk("\n\n---\n\n", request_id)
+                            emitted_answer = True
                         if t_first_token is None:
                             t_first_token = time.perf_counter()
                             _phase_log(request_id, "first_token_emitted", seconds=f"{t_first_token - t_start:.2f}")
                         token_count += 1
                         final_text += before
+                        yield _make_chunk(before, request_id)
                     continue
                 if in_think:
                     if think_close in buffer:
@@ -1319,27 +1325,26 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                     emit = _strip_thinking(buffer[:-len(think_open)])
                     buffer = buffer[-len(think_open):]
                     if emit:
+                        if not emitted_answer:
+                            yield _make_chunk("\n\n---\n\n", request_id)
+                            emitted_answer = True
                         if t_first_token is None:
                             t_first_token = time.perf_counter()
                             _phase_log(request_id, "first_token_emitted", seconds=f"{t_first_token - t_start:.2f}")
                         token_count += 1
                         final_text += emit
+                        yield _make_chunk(emit, request_id)
 
             if buffer and not in_think:
                 remainder = _strip_thinking(buffer)
                 if remainder:
+                    if not emitted_answer:
+                        yield _make_chunk("\n\n---\n\n", request_id)
+                        emitted_answer = True
                     final_text += remainder
+                    yield _make_chunk(remainder, request_id)
 
-            is_performance = _is_performance_query(query)
-            final_text, filtered_out = _validate_high_signal_output(final_text, is_performance)
-            query_type = "performance" if is_performance else "general"
-            audit.info(
-                f"HIGH_SIGNAL {request_id} | query_type={query_type} | "
-                f"applied={is_performance} | filtered_out_items={filtered_out}"
-            )
-            if final_text.strip():
-                yield _make_chunk("\n\n---\n\n", request_id)
-                yield _make_chunk(final_text, request_id)
+            filtered_text, filtered_out = _validate_high_signal_output(final_text, is_performance)
 
             t_done = time.perf_counter()
             total_s = t_done - t_start
@@ -1359,13 +1364,20 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                 chunks=token_count,
             )
 
-        if cache and repo_fp and semantic_cache_allowed(intent, retrieval_route) and final_text.strip():
+        query_type = "performance" if is_performance else "general"
+        audit.info(
+            f"HIGH_SIGNAL {request_id} | query_type={query_type} | "
+            f"applied={is_performance} | filtered_out_items={filtered_out}"
+        )
+
+        cache_value = filtered_text if 'filtered_text' in locals() else final_text
+        if cache and repo_fp and semantic_cache_allowed(intent, retrieval_route) and cache_value.strip():
             cache.semantic_set(
                 repo_fp=repo_fp,
                 query=query,
                 retrieval_signature=retrieval_signature,
                 safe_class="descriptive",
-                value=final_text.strip(),
+                value=cache_value.strip(),
             )
             cache.flush_metrics()
         if debug_mode and debug_payload:

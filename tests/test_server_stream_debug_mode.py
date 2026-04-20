@@ -219,16 +219,16 @@ class TestServerStreamingDebugMode(unittest.TestCase):
         self.assertEqual(query_type, "performance")
         self.assertIn("High-Signal Performance Analysis Mode", policy)
 
-    def test_high_signal_output_validation_filters_low_signal_items(self):
+    def test_high_signal_output_validation_is_conservative_for_mixed_items(self):
         server = self.server
         text = (
             "- Path A frequency: per frame, thread: main, cost: high\n"
             "- Path B frequency: once, thread: background, cost: low\n"
         )
         filtered, removed = server._validate_high_signal_output(text, True)
-        self.assertEqual(removed, 1)
+        self.assertEqual(removed, 0)
         self.assertIn("Path A", filtered)
-        self.assertNotIn("Path B", filtered)
+        self.assertIn("Path B", filtered)
 
     def test_build_context_injects_reasoning_policy_for_performance_query(self):
         server = self.server
@@ -237,6 +237,65 @@ class TestServerStreamingDebugMode(unittest.TestCase):
         built = server._build_context(messages, "req123", debug_mode=False, return_debug=False)
         self.assertIn("REASONING POLICY", built[0]["content"])
         self.assertIn("High-Signal Performance Analysis Mode", built[0]["content"])
+
+    def test_streaming_still_emits_incremental_answer_tokens(self):
+        server = self.server
+        server._indexer_module = None
+        server.orchestration_plan = lambda _intent: {"skip_patch_plan": True, "skip_neighborhood": True}
+        server.classify_query_intent_details = lambda _query: {
+            "intent": "runtime_usage_or_reference",
+            "retrieval_route": "semantic",
+        }
+        server._build_context = lambda messages, request_id, debug_mode=False, return_debug=False: (
+            messages,
+            {"query": "q", "retrieval": {}, "orchestration_path": "direct_retrieval"},
+        )
+
+        class _TokenLlm:
+            def __call__(self, _prompt, max_tokens=0, stream=False, echo=False):
+                if stream:
+                    def _gen():
+                        yield {"choices": [{"text": "hot-path-1 "}]}
+                        yield {"choices": [{"text": "hot-path-2"}]}
+                    return _gen()
+                return {"choices": [{"text": "unused"}]}
+
+        server.llm = _TokenLlm()
+        events = _collect_stream(server, debug_mode=False)
+        hot_path_1_idx = next(i for i, e in enumerate(events) if "hot-path-1" in e)
+        hot_path_2_idx = next(i for i, e in enumerate(events) if "hot-path-2" in e)
+        done_idx = next(i for i, e in enumerate(events) if "[DONE]" in e)
+        self.assertLess(hot_path_1_idx, done_idx)
+        self.assertLess(hot_path_2_idx, done_idx)
+        self.assertLess(hot_path_1_idx, hot_path_2_idx)
+
+    def test_high_signal_validation_preserves_multiline_structured_finding(self):
+        server = self.server
+        text = (
+            "1. Scroll diff churn\n"
+            "   - frequency: per frame\n"
+            "   - thread: main\n"
+            "   - cost: high\n"
+            "   - data flow → execution → UI impact: VM emit → adapter submitList → bind storm → frame drop\n"
+        )
+        filtered, removed = server._validate_high_signal_output(text, True)
+        self.assertEqual(removed, 0)
+        self.assertIn("Scroll diff churn", filtered)
+        self.assertIn("frame drop", filtered)
+
+    def test_high_signal_validation_filters_architecture_only_block_but_keeps_hot_path(self):
+        server = self.server
+        text = (
+            "Architecture notes:\n"
+            "Use repository + use case with dependency injection for cleaner separation.\n\n"
+            "Hot path finding:\n"
+            "ViewModel emit → Fragment accept → adapter update → RecyclerView bind → frame drop.\n"
+            "frequency: per frame, thread: main, cost: high\n"
+        )
+        filtered, removed = server._validate_high_signal_output(text, True)
+        self.assertEqual(removed, 1)
+        self.assertNotIn("Architecture notes", filtered)
+        self.assertIn("Hot path finding", filtered)
 
 
 if __name__ == "__main__":
