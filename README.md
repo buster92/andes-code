@@ -44,6 +44,7 @@ AndesCode is built for developers who work with client code under NDA, operate i
 - 🔍 **Codebase-aware** — indexes your project, builds a project map, injects relevant context automatically
 - 🗺️ **Project intelligence** — detects language, stack, entry points, domain, and key symbols on indexing
 - 🔎 **Smart retrieval** — two-step planning (model selects relevant files first), query routing by filename/symbol/intent, and 4-axis re-ranking
+- 🎯 **Token-aware context packing** — prompt assembly is budgeted against model context window, with deterministic priority-based truncation instead of overflow failures
 - 🧱 **Multi-layer caching** — repo-fingerprint-scoped workspace/retrieval/neighborhood/prompt-prefix/patch-plan caches with strict invalidation
 - 📌 **Deterministic routing for repo questions** — config/dependency/manifest questions use a source-of-truth config-first path before inferred code usage
 - 🛠️ **Safe edit/apply primitive (v1)** — deterministic single-file exact-match edits with hash stale-context protection and unified diff preview
@@ -117,6 +118,9 @@ Step 1 — Planning: model scans your project map and identifies
         ↓
 Step 2 — Retrieval: those files are loaded in full, plus
          semantic search fills any gaps the planner missed
+        ↓
+Token-aware packing keeps anchor/planned/neighbor files first and
+truncates lower-priority context when needed to stay under model limits
         ↓
 Project map + code context injected into system prompt
 Coverage warnings added if any file is only partially retrieved
@@ -223,6 +227,21 @@ If the UI shows status updates but no answer:
 
 The frontend now surfaces backend stream failures as visible assistant errors, and streams always terminate with `[DONE]` to prevent indefinite spinner/status hangs.
 
+### Context budget tuning
+
+AndesCode now computes a real prompt budget from the model context window before injecting retrieved code. If retrieval is too large, context is truncated by deterministic priority:
+
+1. Anchor files explicitly mentioned in the question
+2. Planner-selected files
+3. Neighborhood-expanded files
+4. Semantic fallback chunks
+
+Relevant environment knobs:
+
+- `MODEL_CONTEXT_WINDOW` (default `8192`)
+- `CONTEXT_RESERVED_RESPONSE_TOKENS` (default `1400`)
+- `CONTEXT_SAFETY_MARGIN_TOKENS` (default `256`)
+
 ### Network access summary
 
 | Phase | Network | Notes |
@@ -254,6 +273,9 @@ All configuration lives in `.env`:
 MODEL_PATH=models/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
 PORT=8080
 CONTEXT_CHUNKS=5        # code chunks injected per query
+MODEL_CONTEXT_WINDOW=8192
+CONTEXT_RESERVED_RESPONSE_TOKENS=1400
+CONTEXT_SAFETY_MARGIN_TOKENS=256
 CACHE_SIZE_GB=2.0       # KV cache size allocated at startup
 TRANSFORMERS_OFFLINE=1
 HF_DATASETS_OFFLINE=1

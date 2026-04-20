@@ -26,7 +26,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from llama_cpp import Llama, LlamaCache
-from andes_cache import build_prompt_sections, serialize_prompt_sections
+from andes_cache import (
+    build_prompt_sections,
+    serialize_prompt_sections,
+    compute_context_budget,
+    estimate_tokens,
+    pack_chunks_to_budget,
+)
 from andes_cache.debug import resolve_debug_mode, env_debug_mode, format_debug_sse_event
 from andes_cache.routing import (
     classify_query_intent,
@@ -45,6 +51,9 @@ LOG_PATH       = get_runtime_log_path("server")
 PORT           = int(os.getenv("PORT", 8080))
 CONTEXT_CHUNKS = int(os.getenv("CONTEXT_CHUNKS", 5))
 CACHE_SIZE_GB  = float(os.getenv("CACHE_SIZE_GB", 2.0))
+MODEL_CONTEXT_WINDOW = int(os.getenv("MODEL_CONTEXT_WINDOW", 8192))
+CONTEXT_RESERVED_RESPONSE_TOKENS = int(os.getenv("CONTEXT_RESERVED_RESPONSE_TOKENS", 1400))
+CONTEXT_SAFETY_MARGIN_TOKENS = int(os.getenv("CONTEXT_SAFETY_MARGIN_TOKENS", 256))
 # Snapshot for startup visibility only.
 # NOTE: If you change ANDESCODE_DEBUG_MODE in .env while the server is running,
 # this startup value will not change until restart. Request-level debug still
@@ -167,7 +176,7 @@ _print(f"  [1/4] Loading Gemma 4 26B ({os.path.basename(MODEL_PATH)})...")
 with _suppress_stderr():
     llm = Llama(
         model_path   = MODEL_PATH,
-        n_ctx        = 8192,   # enough for project map + code chunks + answer
+        n_ctx        = MODEL_CONTEXT_WINDOW,   # enough for project map + code chunks + answer
         n_batch      = 1024,
         n_gpu_layers = -1,
         n_threads    = 6,
@@ -647,48 +656,20 @@ def _build_context(
             ]
             return (base, retrieval_debug) if return_debug else base
 
-        # ── Format code section with coverage warnings ────────────────────────
-        code_section = "## Retrieved Code\n\n"
-        source_instruction = ""
-        files_used   = []
-        ctx_char_budget = 18000
-        ctx_chars_used  = 0
-
-        for c in chunks:
-            fname    = c["file"]
-            coverage = c.get("coverage", {})
-            files_used.append(fname)
-
-            if coverage.get("partial"):
-                ret   = coverage["returned"]
-                total = coverage["total"]
-                code_section += (
-                    f"⚠️ Partial view — showing {ret}/{total} chunks from {fname}. "
-                    f"You may not have the complete file.\n"
-                )
-
-            chunk_txt = f"```\n{c['content']}\n```\n\n"
-            if ctx_chars_used + len(chunk_txt) > ctx_char_budget:
-                break
-            code_section  += chunk_txt
-            ctx_chars_used += len(chunk_txt)
-            if c.get("source_type") in {"manifest", "build_file", "config_file"}:
-                source_instruction = (
-                    "## Source-of-Truth Guidance\n"
-                    "- Prefer declared/config/build sources before code references.\n"
-                    "- Distinguish declared vs referenced vs inferred facts.\n"
-                    "- If source-of-truth files are missing, state that explicitly.\n\n"
-                )
-
-        # Full-file indicator
-        full_files = [c["file"] for c in chunks if c.get("full_file")]
-        if full_files:
-            code_section += f"\n_Full file retrieved: {', '.join(set(full_files))}_\n"
+        anchor_files = _extract_anchor_files(query)
+        code_section, packing_info = _pack_context_section(
+            query=query,
+            map_section=map_section,
+            chunks=chunks,
+            anchor_files=anchor_files,
+            conversation_messages=[m for m in messages if m.get("role") != "system"],
+            request_id=request_id,
+        )
 
         sections = build_prompt_sections(
             system_prefix=_BASE_SYSTEM,
             workspace_prefix=map_section,
-            retrieval_context=source_instruction + code_section,
+            retrieval_context=code_section,
             user_turn="",
         )
         if cache and repo_fp and workspace_signature and not code_section.strip():
@@ -702,7 +683,7 @@ def _build_context(
 
         audit.info(
             f"CONTEXT {request_id} | chunks={len(chunks)} | "
-            f"files={files_used}"
+            f"packed={packing_info['packed_chunks']} | files={packing_info['kept_files']}"
         )
 
         base = [{"role": "system", "content": system}] + [
@@ -716,6 +697,146 @@ def _build_context(
 
 
 # ── Two-step planning ─────────────────────────────────────────────────────────
+
+_FILENAME_HINT_RE = re.compile(r"[\w./-]+\.(?:py|kt|java|js|ts|tsx|jsx|go|rs|swift|cpp|c|h|hpp|json|yaml|yml|toml|gradle|xml|md)")
+
+
+def _extract_anchor_files(query: str) -> list[str]:
+    if not query:
+        return []
+    seen = set()
+    anchors = []
+    for match in _FILENAME_HINT_RE.findall(query):
+        if match not in seen:
+            seen.add(match)
+            anchors.append(match)
+    return anchors
+
+
+def _prioritize_chunk_candidates(
+    chunks: list[dict],
+    *,
+    anchor_files: list[str] | None = None,
+    planned_files: list[str] | None = None,
+    neighbor_files: list[str] | None = None,
+) -> list[dict]:
+    anchor_set = set(anchor_files or [])
+    planned_set = set(planned_files or [])
+    neighbor_set = set(neighbor_files or [])
+
+    def _matches(target_file: str, candidates: set[str]) -> bool:
+        if target_file in candidates:
+            return True
+        target_basename = Path(target_file).name
+        return any(Path(candidate).name == target_basename for candidate in candidates)
+
+    prioritized = []
+    for idx, chunk in enumerate(chunks):
+        fname = chunk.get("file", "")
+        if _matches(fname, anchor_set):
+            tier = 0
+        elif _matches(fname, planned_set):
+            tier = 1
+        elif _matches(fname, neighbor_set):
+            tier = 2
+        else:
+            tier = 3
+        content = chunk.get("content", "")
+        partial_note = ""
+        coverage = chunk.get("coverage", {})
+        if coverage.get("partial"):
+            ret = coverage.get("returned")
+            total = coverage.get("total")
+            partial_note = (
+                f"⚠️ Partial view — showing {ret}/{total} chunks from {fname}. "
+                f"You may not have the complete file.\n"
+            )
+        full_file_note = f"_Full file retrieved: {fname}_\n" if chunk.get("full_file") else ""
+        formatted = f"```{fname}\n{content}\n```\n\n"
+        section_text = partial_note + full_file_note + formatted
+        prioritized.append(
+            {
+                "tier": tier,
+                "rank": idx,
+                "file": fname,
+                "chunk": chunk,
+                "text": section_text,
+                "est_tokens": estimate_tokens(section_text),
+            }
+        )
+    prioritized.sort(key=lambda c: (c["tier"], c["rank"], c["file"]))
+    return prioritized
+
+
+def _pack_context_section(
+    *,
+    query: str,
+    map_section: str,
+    chunks: list[dict],
+    anchor_files: list[str] | None = None,
+    planned_files: list[str] | None = None,
+    neighbor_files: list[str] | None = None,
+    conversation_messages: list[dict] | None = None,
+    request_id: str,
+) -> tuple[str, dict]:
+    conversation_text = _messages_to_prompt(
+        [{"role": m.get("role"), "content": m.get("content", "")} for m in (conversation_messages or []) if m.get("role") != "system"]
+    )
+    budget = compute_context_budget(
+        system_prompt=_BASE_SYSTEM,
+        workspace_prefix=map_section,
+        user_query=conversation_text or query,
+        total_ctx=MODEL_CONTEXT_WINDOW,
+        reserved_response=CONTEXT_RESERVED_RESPONSE_TOKENS,
+        safety_margin=CONTEXT_SAFETY_MARGIN_TOKENS,
+    )
+    candidates = _prioritize_chunk_candidates(
+        chunks,
+        anchor_files=anchor_files,
+        planned_files=planned_files,
+        neighbor_files=neighbor_files,
+    )
+    packed = pack_chunks_to_budget(candidates, budget.context_budget_tokens)
+    code_section = "## Retrieved Code\n\n"
+    for c in packed.chunks:
+        code_section += c["text"]
+    if packed.truncated:
+        code_section += "\n_Context truncated to fit model window; highest-priority files were kept first._\n"
+    has_authoritative = any(
+        c["chunk"].get("source_type") in {"manifest", "build_file", "config_file"}
+        for c in packed.chunks
+    )
+    source_instruction = ""
+    if has_authoritative:
+        source_instruction = (
+            "## Source-of-Truth Guidance\n"
+            "- Prefer declared/config/build sources before code references.\n"
+            "- Distinguish declared vs referenced vs inferred facts.\n"
+            "- If source-of-truth files are missing, state that explicitly.\n\n"
+        )
+    audit.info(
+        "CONTEXT_BUDGET %s | budget=%s | used=%s | considered=%s | packed=%s | truncated=%s | kept=%s | dropped=%s"
+        % (
+            request_id,
+            budget.context_budget_tokens,
+            packed.used_tokens,
+            packed.considered_chunks,
+            packed.packed_chunks,
+            packed.truncated,
+            packed.kept_files[:8],
+            packed.dropped_files[:8],
+        )
+    )
+    return source_instruction + code_section, {
+        "budget_tokens": budget.context_budget_tokens,
+        "used_tokens": packed.used_tokens,
+        "considered_chunks": packed.considered_chunks,
+        "packed_chunks": packed.packed_chunks,
+        "truncated": packed.truncated,
+        "kept_files": packed.kept_files,
+        "dropped_files": packed.dropped_files,
+        "packed_chunks_raw": [c["chunk"] for c in packed.chunks],
+    }
 
 def _plan_files(query: str, pmap: dict) -> list[str]:
     """
@@ -887,8 +1008,11 @@ def _build_context_from_plan(
 
     # Fetch full content from planned files + deterministic neighborhood expansion.
     expanded_files = []
+    neighbor_files = []
     for fname in planned_files:
-        expanded_files.extend(_file_neighborhood(fname, mode, workspace, repo_fp))
+        neighborhood = _file_neighborhood(fname, mode, workspace, repo_fp)
+        expanded_files.extend(neighborhood)
+        neighbor_files.extend(neighborhood)
     for fname in expanded_files:
         try:
             file_chunks = _indexer_module.get_chunks_for_file(fname)
@@ -919,22 +1043,17 @@ def _build_context_from_plan(
             debug_payload["final_context"]["files_used"] = list(files_loaded)
         return (messages, [], debug_payload) if return_debug else (messages, [])
 
-    # Build code section — cap total tokens (rough: 4 chars per token, stay under 2500 tokens)
-    code_section = "## Retrieved Code\n\n"
-    char_budget  = 18000   # ~4500 tokens of code context — safe within 8192 ctx
-    chars_used   = 0
-
-    for c in all_chunks:
-        c_content  = c["content"]
-        c_file     = c["file"]
-        chunk_text = f"```\n{c_content}\n```\n\n"
-        if chars_used + len(chunk_text) > char_budget:
-            code_section += f"_[Truncated — {len(all_chunks)} total chunks, budget reached]_\n"
-            break
-        if c.get("full_file") and chars_used == 0:
-            code_section += f"_Full file: {c_file}_ \n"
-        code_section += chunk_text
-        chars_used   += len(chunk_text)
+    anchor_files = _extract_anchor_files(query)
+    code_section, packing_info = _pack_context_section(
+        query=query,
+        map_section=map_section,
+        chunks=all_chunks,
+        anchor_files=anchor_files,
+        planned_files=planned_files,
+        neighbor_files=neighbor_files,
+        conversation_messages=[m for m in messages if m.get("role") != "system"],
+        request_id=request_id,
+    )
 
     sections = build_prompt_sections(
         system_prefix=_BASE_SYSTEM,
@@ -946,7 +1065,8 @@ def _build_context_from_plan(
 
     audit.info(
         f"CONTEXT {request_id} | planned={planned_files} | "
-        f"loaded={files_loaded} | chunks={len(all_chunks)}"
+        f"loaded={files_loaded} | chunks={len(all_chunks)} | "
+        f"packed={packing_info['packed_chunks']} | kept={packing_info['kept_files']}"
     )
 
     final_messages = (
@@ -959,11 +1079,12 @@ def _build_context_from_plan(
         debug_payload["planning"]["semantic_fallback_files"] = list(semantic_fallback_files)
         debug_payload["retrieval"]["files_retrieved"] = list(files_loaded)
         debug_payload["retrieval"]["selected_candidates"] = list(files_loaded)
+        packed_chunks = packing_info["packed_chunks_raw"]
         debug_payload["retrieval"]["chunks_per_file"] = {
-            f: sum(1 for c in all_chunks if c.get("file") == f) for f in sorted(set(files_loaded))
+            f: sum(1 for c in packed_chunks if c.get("file") == f) for f in sorted(set(files_loaded))
         }
-        debug_payload["final_context"]["files_used"] = [c.get("file") for c in all_chunks if c.get("file")]
-        debug_payload["final_context"]["context_size"] = sum(len(c.get("content", "")) for c in all_chunks)
+        debug_payload["final_context"]["files_used"] = [c.get("file") for c in packed_chunks if c.get("file")]
+        debug_payload["final_context"]["context_size"] = sum(len(c.get("content", "")) for c in packed_chunks)
     return (final_messages, files_loaded, debug_payload) if return_debug else (final_messages, files_loaded)
 
 
