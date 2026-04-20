@@ -1452,8 +1452,13 @@ def _build_context_from_plan(
                 "raw_candidates": list(planned_files),
                 "selected_candidates": [],
                 "authoritative_files_detected": [],
+                "authoritative_files_required": [],
                 "authoritative_files_retrieved": [],
                 "authoritative_files_missing": [],
+                "forced_authoritative_file": False,
+                "authority_selection_reason": "",
+                "authority_retrieval_mode": "",
+                "declaration_answer_mode": "",
                 "chunks_per_file": {},
                 "coverage": {},
                 "cache_hit": False,
@@ -1473,8 +1478,43 @@ def _build_context_from_plan(
         authoritative_files.extend(workspace.get("manifests", []) or [])
         authoritative_files.extend((workspace.get("config_graph", {}) or {}).get("config_files", []) or [])
     authoritative_files = sorted(set(authoritative_files))
+
+    def _matches_authoritative(path: str) -> bool:
+        if path in authoritative_files:
+            return True
+        base = Path(path).name
+        return any(Path(p).name == base for p in authoritative_files)
+
+    def _set_planned_authority_modes(final_chunks: list[dict]) -> None:
+        if debug_payload is None or not decl_query:
+            return
+        retrieved = debug_payload["retrieval"].get("authoritative_files_retrieved", [])
+        missing = debug_payload["retrieval"].get("authoritative_files_missing", [])
+        has_runtime_or_inferred = any(
+            c.get("file")
+            and not _matches_authoritative(c.get("file", ""))
+            and c.get("source_type", "source_code") in {"source_code", "inferred"}
+            for c in (final_chunks or [])
+        )
+        if retrieved and not missing and not has_runtime_or_inferred:
+            debug_payload["retrieval"]["declaration_answer_mode"] = "declared_only"
+            debug_payload["retrieval"]["authority_retrieval_mode"] = "direct_chunk_load"
+        elif retrieved and has_runtime_or_inferred:
+            debug_payload["retrieval"]["declaration_answer_mode"] = "declared_plus_runtime"
+            debug_payload["retrieval"]["authority_retrieval_mode"] = "direct_chunk_load"
+        elif retrieved and missing and not has_runtime_or_inferred:
+            debug_payload["retrieval"]["declaration_answer_mode"] = "declared_partial_only"
+            debug_payload["retrieval"]["authority_retrieval_mode"] = "direct_chunk_load"
+        elif has_runtime_or_inferred:
+            debug_payload["retrieval"]["declaration_answer_mode"] = "runtime_only_fallback"
+            debug_payload["retrieval"]["authority_retrieval_mode"] = "runtime_fallback_used"
+        else:
+            debug_payload["retrieval"]["declaration_answer_mode"] = "missing_declarations"
+            debug_payload["retrieval"]["authority_retrieval_mode"] = "workspace_only_detected_not_indexed"
+
     if debug_payload is not None:
         debug_payload["retrieval"]["authoritative_files_detected"] = list(authoritative_files)
+        debug_payload["retrieval"]["authoritative_files_required"] = list(authoritative_files) if decl_query else []
         debug_payload["retrieval"]["authoritative_files_retrieved"] = []
         debug_payload["retrieval"]["authoritative_files_missing"] = list(authoritative_files)
 
@@ -1534,6 +1574,8 @@ def _build_context_from_plan(
             debug_payload["retrieval"]["authoritative_files_missing"] = [
                 p for p in authoritative_files if p not in authoritative_retrieved
             ]
+            debug_payload["retrieval"]["forced_authoritative_file"] = bool(authoritative_retrieved)
+            _set_planned_authority_modes([])
             debug_payload["final_context"]["files_used"] = list(files_loaded)
         if decl_query and authoritative_files and not authoritative_retrieved:
             audit.warning("authoritative retrieval failure (not packing failure)")
@@ -1587,9 +1629,11 @@ def _build_context_from_plan(
         debug_payload["retrieval"]["authoritative_files_missing"] = [
             p for p in authoritative_files if p not in authoritative_retrieved
         ]
+        debug_payload["retrieval"]["forced_authoritative_file"] = bool(authoritative_retrieved)
         if decl_query and authoritative_files and not authoritative_retrieved:
             audit.warning("authoritative retrieval failure (not packing failure)")
         packed_chunks = packing_info["packed_chunks_raw"]
+        _set_planned_authority_modes(packed_chunks)
         debug_payload["retrieval"]["chunks_per_file"] = {
             f: sum(1 for c in packed_chunks if c.get("file") == f) for f in sorted(set(files_loaded))
         }

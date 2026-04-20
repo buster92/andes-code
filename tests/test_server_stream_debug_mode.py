@@ -144,6 +144,37 @@ class TestServerStreamingDebugMode(unittest.TestCase):
         self.assertIn("planned_files", debug_payload["planning"])
         self.assertIn("files_used", debug_payload["final_context"])
 
+    def test_build_context_from_plan_reports_declared_plus_runtime_mode(self):
+        server = self.server
+        server.INDEXER_READY = True
+        server._indexer_module = types.SimpleNamespace(
+            _load_project_map=lambda: {"project": "demo", "file_symbols": {"src/a.py": ["run"]}},
+            _load_workspace_index=lambda: {
+                "manifests": [],
+                "config_graph": {"config_files": ["a/package.json", "b/pyproject.toml"]},
+            },
+            get_repo_fingerprint=lambda: "fp",
+            get_chunks_for_file=lambda fname: (
+                [{"file": fname, "content": "declared dep", "source_type": "dependency_file"}]
+                if fname == "a/package.json"
+                else []
+            ),
+        )
+        server.search_codebase = lambda *_args, **_kwargs: [
+            {"file": "src/runtime_usage.py", "content": "import pkg", "source_type": "source_code"},
+        ]
+
+        _messages, _files_loaded, debug_payload = server._build_context_from_plan(
+            [{"role": "user", "content": "what dependencies are declared"}],
+            ["src/a.py"],
+            "req-decl-runtime",
+            diagnosis={"intent": "dependency_or_build_inventory", "mode": "bugfix"},
+            debug_mode=True,
+            return_debug=True,
+        )
+        self.assertEqual(debug_payload["retrieval"]["declaration_answer_mode"], "declared_plus_runtime")
+        self.assertEqual(debug_payload["retrieval"]["authority_retrieval_mode"], "direct_chunk_load")
+
     def test_stream_direct_retrieval_emits_debug_event(self):
         server = self.server
         server._indexer_module = None
