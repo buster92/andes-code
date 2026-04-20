@@ -265,25 +265,26 @@ def missing_manifest_notice() -> dict:
     }
 
 
+DECLARATION_QUERY_KEYWORDS = (
+    "dependenc",
+    "declared",
+    "librar",
+    "version",
+    "manifest",
+    "permission",
+    "config",
+    "build",
+    "settings",
+    "requirements",
+    "package.json",
+    "pyproject",
+    "gradle",
+    "pom.xml",
+)
+
+
 def is_declaration_query(query: str, intent: str = "") -> bool:
     """Return True when user asks for config/build/dependency declarations."""
-    q = (query or "").lower()
-    declaration_keywords = (
-        "dependenc",
-        "declared",
-        "librar",
-        "version",
-        "manifest",
-        "permission",
-        "config",
-        "build",
-        "settings",
-        "requirements",
-        "package.json",
-        "pyproject",
-        "gradle",
-        "pom.xml",
-    )
     if intent in {
         "declaration_or_configuration",
         "dependency_or_build_inventory",
@@ -291,25 +292,12 @@ def is_declaration_query(query: str, intent: str = "") -> bool:
         "dependency_lookup",
     }:
         return True
-    return any(k in q for k in declaration_keywords)
+    return has_declaration_keywords(query)
 
 
 def has_declaration_keywords(query: str) -> bool:
     q = (query or "").lower()
-    return any(
-        k in q
-        for k in (
-            "dependenc",
-            "declared",
-            "librar",
-            "version",
-            "build",
-            "config",
-            "requirements",
-            "manifest",
-            "permission",
-        )
-    )
+    return any(k in q for k in DECLARATION_QUERY_KEYWORDS)
 
 
 def source_of_truth_guidance(query: str, intent: str = "") -> str:
