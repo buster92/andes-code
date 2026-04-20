@@ -70,6 +70,7 @@ def pack_chunks_to_budget(chunks: list[dict], budget_tokens: int) -> PackedConte
     tiers = sorted({int(chunk.get("tier", 999)) for chunk in chunks})
     for tier in tiers:
         tier_chunks = [c for c in chunks if int(c.get("tier", 999)) == tier]
+        tier_packed_count = 0
         tier_overflowed = False
         for chunk in tier_chunks:
             chunk_tokens = int(chunk.get("est_tokens", 0))
@@ -79,7 +80,11 @@ def pack_chunks_to_budget(chunks: list[dict], budget_tokens: int) -> PackedConte
                 continue
             packed.append(chunk)
             used_tokens += chunk_tokens
-        if tier_overflowed:
+            tier_packed_count += 1
+
+        # Preserve strict priority when this tier contributed context.
+        # Relax only when this tier contributed nothing (fit-or-fallback).
+        if tier_overflowed and tier_packed_count > 0:
             blocked_lower_tiers = True
             for chunk in chunks:
                 c_tier = int(chunk.get("tier", 999))

@@ -83,7 +83,7 @@ class TestContextBudgeting(unittest.TestCase):
             self.fail("fallback chunk should not survive before higher priority chunks")
         self.assertIn("ScheduleFragment.kt", context)
 
-    def test_strict_priority_does_not_allow_fallback_when_anchor_tier_overflows(self):
+    def test_fallback_allowed_when_top_tier_cannot_fit_any_chunk(self):
         server = self.server
         server.MODEL_CONTEXT_WINDOW = 820
         chunks = [
@@ -99,8 +99,29 @@ class TestContextBudgeting(unittest.TestCase):
             request_id="req-strict-priority",
         )
 
-        self.assertEqual(info["packed_chunks"], 0)
-        self.assertIn("fallback.py", info["dropped_files"])
+        self.assertGreater(info["packed_chunks"], 0)
+        self.assertIn("fallback.py", info["kept_files"])
+        self.assertNotIn("fallback.py", info["dropped_files"])
+
+    def test_strict_priority_blocks_fallback_when_anchor_tier_partially_fits(self):
+        server = self.server
+        server.MODEL_CONTEXT_WINDOW = 900
+        chunks = [
+            {"file": "src/ui/ScheduleFragment.kt", "content": "A" * 220},
+            {"file": "src/ui/ScheduleFragment.kt", "content": "A" * 1400},
+            {"file": "fallback.py", "content": "f" * 120},
+        ]
+
+        _context, info = server._pack_context_section(
+            query="Analyze ScheduleFragment.kt scroll update",
+            map_section="",
+            chunks=chunks,
+            anchor_files=["ScheduleFragment.kt"],
+            request_id="req-strict-priority-partial",
+        )
+
+        self.assertGreaterEqual(info["packed_chunks"], 1)
+        self.assertIn("src/ui/ScheduleFragment.kt", info["kept_files"])
         self.assertNotIn("fallback.py", info["kept_files"])
 
     def test_conversation_history_is_accounted_for_in_budget(self):
