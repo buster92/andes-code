@@ -487,7 +487,8 @@ class TestRouteIsolationAndFastPath(unittest.TestCase):
         src = Path("indexer.py").read_text()
         self.assertIn("def _fetch_exact_file(path: str, max_results: int = 60)", src)
         self.assertIn('exact = col.get(where={"file": path}, limit=max_results)', src)
-        self.assertIn('if doc and fallback["metadatas"][i].get("file", "") == path', src)
+        self.assertIn("_path_suffix_match(", src)
+        self.assertIn("_fetch_indexed_candidates_by_basename(path", src)
 
     def test_exact_path_retrieval_keeps_line_metadata_and_ordering(self):
         src = Path("indexer.py").read_text()
