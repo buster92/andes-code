@@ -727,13 +727,23 @@ def search(
                 c["score"] *= 0.8   # lower distance = better match
 
     ranked = _rerank(query, candidates, track_reasons=payload is not None)
+    final_ranked = ranked[:n_results]
     if decl_query and authoritative_files:
-        retrieved_authoritative = [c for c in ranked[:n_results] if _matches_authoritative(c.get("file", ""))]
-        if not retrieved_authoritative:
+        authoritative_ranked = [c for c in ranked if _matches_authoritative(c.get("file", ""))]
+        if not authoritative_ranked:
             logging.warning("authoritative retrieval failure (not packing failure)")
+        elif not any(_matches_authoritative(c.get("file", "")) for c in final_ranked):
+            # Preserve normal ranking, but reserve one slot for source-of-truth when available.
+            selected_authoritative = authoritative_ranked[0]
+            if n_results <= 0:
+                final_ranked = [selected_authoritative]
+            elif final_ranked:
+                final_ranked = final_ranked[:-1] + [selected_authoritative]
+            else:
+                final_ranked = [selected_authoritative]
 
     # Add coverage metadata — lets server tell model how much of each file it has
-    final = _add_coverage(ranked[:n_results])
+    final = _add_coverage(final_ranked)
     authority = "referenced" if intent == RUNTIME_USAGE_OR_REFERENCE else "inferred"
     final = annotate_sources(final, source_type="source_code", authority_level=authority)
     if repo_fp:

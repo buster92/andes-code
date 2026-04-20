@@ -1519,23 +1519,23 @@ def _build_context_from_plan(
         pass
 
     if not all_chunks:
+        authoritative_retrieved = sorted(
+            [
+                f for f in files_loaded
+                if f in authoritative_files or any(Path(p).name == Path(f).name for p in authoritative_files)
+            ]
+        )
         if debug_payload is not None:
             debug_payload["planning"]["files_loaded"] = list(files_loaded)
             debug_payload["planning"]["semantic_fallback_files"] = list(semantic_fallback_files)
             debug_payload["retrieval"]["files_retrieved"] = list(files_loaded)
             debug_payload["retrieval"]["selected_candidates"] = list(files_loaded)
-            authoritative_retrieved = sorted(
-                [
-                    f for f in files_loaded
-                    if f in authoritative_files or any(Path(p).name == Path(f).name for p in authoritative_files)
-                ]
-            )
             debug_payload["retrieval"]["authoritative_files_retrieved"] = authoritative_retrieved
             debug_payload["retrieval"]["authoritative_files_missing"] = [
                 p for p in authoritative_files if p not in authoritative_retrieved
             ]
             debug_payload["final_context"]["files_used"] = list(files_loaded)
-        if decl_query and authoritative_files:
+        if decl_query and authoritative_files and not authoritative_retrieved:
             audit.warning("authoritative retrieval failure (not packing failure)")
         return (messages, [], debug_payload) if return_debug else (messages, [])
 
