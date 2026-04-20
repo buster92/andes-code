@@ -237,6 +237,47 @@ class TestServerStreamingDebugMode(unittest.TestCase):
         built = server._build_context(messages, "req123", debug_mode=False, return_debug=False)
         self.assertIn("REASONING POLICY", built[0]["content"])
         self.assertIn("High-Signal Performance Analysis Mode", built[0]["content"])
+        self.assertIn("Analyze only the provided structured execution paths", built[0]["content"])
+
+    def test_extract_execution_paths_detects_rx_ui_and_metrics(self):
+        server = self.server
+        chunks = [
+            {
+                "file": "ScheduleFragment.kt",
+                "content": (
+                    "fun onScrolled() {\n"
+                    "  viewModel.model()\n"
+                    "    .flatMap { repo.getPointsOfInterest() }\n"
+                    "    .observeOn(AndroidSchedulers.mainThread())\n"
+                    "  adapter.submitList(items)\n"
+                    "}\n"
+                ),
+            }
+        ]
+        paths = server._extract_execution_paths(chunks, max_paths=5)
+        self.assertGreaterEqual(len(paths), 1)
+        self.assertEqual(paths[0]["frequency"], "per frame")
+        self.assertIn("main", paths[0]["thread"])
+        self.assertIn("flatMap", " ".join(paths[0]["steps"]))
+        self.assertEqual(paths[0]["risk"], "yes")
+
+    def test_pack_context_performance_query_prefers_structured_paths(self):
+        server = self.server
+        context, _info = server._pack_context_section(
+            query="Why is RecyclerView scroll janky?",
+            map_section="",
+            chunks=[
+                {
+                    "file": "ScheduleFragment.kt",
+                    "content": "fun onScrolled() { adapter.notifyDataSetChanged() }",
+                    "full_file": False,
+                }
+            ],
+            request_id="req-test",
+        )
+        self.assertIn("## Structured Execution Paths", context)
+        self.assertIn("execution frequency", context)
+        self.assertIn("risk (main-thread blocking)", context)
 
     def test_streaming_still_emits_incremental_answer_tokens(self):
         server = self.server
