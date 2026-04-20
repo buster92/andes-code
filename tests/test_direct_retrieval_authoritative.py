@@ -130,3 +130,95 @@ class TestDirectRetrievalAuthoritative(unittest.TestCase):
 
         self.assertTrue(chunks)
         self.assertEqual(chunks[0]["file"], "app/buildSrc/dependencies.kt")
+
+    def test_authoritative_file_missing_from_index_returns_explicit_limitation(self):
+        indexer = _import_indexer_with_stubs()
+        indexer._load_workspace_index = lambda: {
+            "manifests": [],
+            "config_graph": {"config_files": ["project/deps.toml"]},
+        }
+        indexer.classify_query_intent_details = lambda _q: {
+            "intent": "dependency_or_build_inventory",
+            "retrieval_route": "semantic",
+            "ambiguous": False,
+            "allow_runtime_fallback": False,
+            "strict_authority_mode": True,
+        }
+        indexer._structured_query_results = lambda _q: []
+        indexer._load_json = lambda _p: {}
+        indexer.get_repo_fingerprint = lambda: ""
+        indexer._fetch_exact_file = lambda *_args, **_kwargs: []
+        indexer._fetch_indexed_candidates_by_basename = lambda *_args, **_kwargs: {}
+
+        results, payload = indexer.search(
+            "what dependencies are declared",
+            n_results=2,
+            debug_mode=True,
+            return_debug=True,
+        )
+        self.assertTrue(results)
+        self.assertEqual(results[0].get("file"), "__source_of_truth_missing__")
+        self.assertIn("Authoritative file detected but not retrievable from index", results[0].get("content", ""))
+        self.assertEqual(payload["retrieval"]["authority_retrieval_mode"], "workspace_only_detected_not_indexed")
+        self.assertEqual(payload["retrieval"]["declaration_answer_mode"], "missing_declarations")
+
+    def test_multiple_authoritative_files_are_force_included(self):
+        indexer = _import_indexer_with_stubs()
+        indexer._load_workspace_index = lambda: {
+            "manifests": [],
+            "config_graph": {"config_files": ["a/package.json", "b/pyproject.toml"]},
+        }
+        indexer.classify_query_intent_details = lambda _q: {
+            "intent": "dependency_or_build_inventory",
+            "retrieval_route": "semantic",
+            "ambiguous": False,
+            "allow_runtime_fallback": False,
+            "strict_authority_mode": True,
+        }
+        indexer._structured_query_results = lambda _q: []
+        indexer._load_json = lambda _p: {}
+        indexer.get_repo_fingerprint = lambda: ""
+        indexer._fetch_exact_file = lambda path, max_results=6: [{"file": path, "content": f"{path} deps", "language": "", "symbols": ""}]
+        indexer._fetch_indexed_candidates_by_basename = lambda *_args, **_kwargs: {}
+        indexer._add_coverage = lambda chunks: chunks
+        indexer._rerank = lambda _q, candidates, track_reasons=False: sorted(candidates, key=lambda c: c.get("file", ""))
+
+        results = indexer.search("what dependencies are declared", n_results=1, debug_mode=False)
+        files = [r.get("file") for r in results]
+        self.assertIn("a/package.json", files)
+        self.assertIn("b/pyproject.toml", files)
+
+    def test_debug_payload_includes_authoritative_fields(self):
+        indexer = _import_indexer_with_stubs()
+        indexer._load_workspace_index = lambda: {
+            "manifests": [],
+            "config_graph": {"config_files": ["a/package.json"]},
+        }
+        indexer.classify_query_intent_details = lambda _q: {
+            "intent": "dependency_or_build_inventory",
+            "retrieval_route": "semantic",
+            "ambiguous": False,
+            "allow_runtime_fallback": False,
+            "strict_authority_mode": True,
+        }
+        indexer._structured_query_results = lambda _q: []
+        indexer._load_json = lambda _p: {}
+        indexer.get_repo_fingerprint = lambda: ""
+        indexer._fetch_exact_file = lambda path, max_results=6: [{"file": path, "content": "deps", "language": "", "symbols": ""}]
+        indexer._fetch_indexed_candidates_by_basename = lambda *_args, **_kwargs: {}
+        indexer._add_coverage = lambda chunks: chunks
+        indexer._rerank = lambda _q, candidates, track_reasons=False: candidates
+
+        _results, payload = indexer.search("what dependencies are declared", n_results=1, debug_mode=True, return_debug=True)
+        retrieval = payload["retrieval"]
+        for key in (
+            "authoritative_files_detected",
+            "authoritative_files_required",
+            "authoritative_files_retrieved",
+            "authoritative_files_missing",
+            "forced_authoritative_file",
+            "authority_selection_reason",
+            "authority_retrieval_mode",
+            "declaration_answer_mode",
+        ):
+            self.assertIn(key, retrieval)

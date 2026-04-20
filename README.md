@@ -344,6 +344,17 @@ Debug mode is off by default. You can enable it via:
 
 When enabled, AndesCode emits a deterministic debug payload with intent, source-of-truth selection, retrieval/ranking decisions, and failure signals. The web UI shows it in a collapsible panel.
 
+For declaration/config/dependency questions, debug payloads now include authoritative retrieval guarantees:
+- `authoritative_files_detected`: authoritative paths found in workspace metadata.
+- `authoritative_files_required`: authoritative paths that must be retrieved for this query.
+- `authoritative_files_retrieved` / `authoritative_files_missing`: explicit split of indexed vs missing authoritative sources.
+- `forced_authoritative_file`: whether authoritative context was force-included.
+- `authority_selection_reason`: why authoritative paths were selected.
+- `authority_retrieval_mode`: `direct_chunk_load`, `integrity_repair`, `workspace_only_detected_not_indexed`, `semantic_fallback_blocked`, or `runtime_fallback_used`.
+- `declaration_answer_mode`: `declared_only`, `declared_plus_runtime`, `runtime_only_fallback`, or `missing_declarations`.
+
+If AndesCode detects authoritative files in workspace metadata but cannot retrieve chunks from the index, it now emits an explicit limitation (`workspace_only_detected_not_indexed`) instead of silently degrading to inferred/runtime-only answers.
+
 **Is there a hosted version?**  
 No. That would defeat the purpose.
 

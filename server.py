@@ -1452,8 +1452,13 @@ def _build_context_from_plan(
                 "raw_candidates": list(planned_files),
                 "selected_candidates": [],
                 "authoritative_files_detected": [],
+                "authoritative_files_required": [],
                 "authoritative_files_retrieved": [],
                 "authoritative_files_missing": [],
+                "forced_authoritative_file": False,
+                "authority_selection_reason": "",
+                "authority_retrieval_mode": "",
+                "declaration_answer_mode": "",
                 "chunks_per_file": {},
                 "coverage": {},
                 "cache_hit": False,
@@ -1475,6 +1480,7 @@ def _build_context_from_plan(
     authoritative_files = sorted(set(authoritative_files))
     if debug_payload is not None:
         debug_payload["retrieval"]["authoritative_files_detected"] = list(authoritative_files)
+        debug_payload["retrieval"]["authoritative_files_required"] = list(authoritative_files) if decl_query else []
         debug_payload["retrieval"]["authoritative_files_retrieved"] = []
         debug_payload["retrieval"]["authoritative_files_missing"] = list(authoritative_files)
 
@@ -1534,6 +1540,10 @@ def _build_context_from_plan(
             debug_payload["retrieval"]["authoritative_files_missing"] = [
                 p for p in authoritative_files if p not in authoritative_retrieved
             ]
+            debug_payload["retrieval"]["forced_authoritative_file"] = bool(authoritative_retrieved)
+            if decl_query and authoritative_files and not authoritative_retrieved:
+                debug_payload["retrieval"]["authority_retrieval_mode"] = "workspace_only_detected_not_indexed"
+                debug_payload["retrieval"]["declaration_answer_mode"] = "missing_declarations"
             debug_payload["final_context"]["files_used"] = list(files_loaded)
         if decl_query and authoritative_files and not authoritative_retrieved:
             audit.warning("authoritative retrieval failure (not packing failure)")
@@ -1587,6 +1597,13 @@ def _build_context_from_plan(
         debug_payload["retrieval"]["authoritative_files_missing"] = [
             p for p in authoritative_files if p not in authoritative_retrieved
         ]
+        debug_payload["retrieval"]["forced_authoritative_file"] = bool(authoritative_retrieved)
+        if decl_query and authoritative_retrieved and not debug_payload["retrieval"]["authoritative_files_missing"]:
+            debug_payload["retrieval"]["authority_retrieval_mode"] = "direct_chunk_load"
+            debug_payload["retrieval"]["declaration_answer_mode"] = "declared_only"
+        elif decl_query and authoritative_files and not authoritative_retrieved:
+            debug_payload["retrieval"]["authority_retrieval_mode"] = "workspace_only_detected_not_indexed"
+            debug_payload["retrieval"]["declaration_answer_mode"] = "missing_declarations"
         if decl_query and authoritative_files and not authoritative_retrieved:
             audit.warning("authoritative retrieval failure (not packing failure)")
         packed_chunks = packing_info["packed_chunks_raw"]
