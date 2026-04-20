@@ -218,6 +218,7 @@ class TestServerStreamingDebugMode(unittest.TestCase):
         policy, query_type = server._reasoning_policy_for_query("Why is scroll jank on main thread?")
         self.assertEqual(query_type, "performance")
         self.assertIn("High-Signal Performance Analysis Mode", policy)
+        self.assertIn("PROVEN / INFERRED / SPECULATIVE", policy)
 
     def test_high_signal_output_validation_is_conservative_for_mixed_items(self):
         server = self.server
@@ -367,6 +368,30 @@ class TestServerStreamingDebugMode(unittest.TestCase):
         self.assertEqual(removed, 0)
         self.assertIn("Scroll diff churn", filtered)
         self.assertIn("frame drop", filtered)
+
+    def test_high_signal_validation_marks_thread_claims_as_inferred_by_default(self):
+        server = self.server
+        text = (
+            "Hot path finding:\n"
+            "- frequency: per frame\n"
+            "- thread: main\n"
+            "- cost: high\n"
+        )
+        filtered, removed = server._validate_high_signal_output(text, True)
+        self.assertEqual(removed, 0)
+        self.assertIn("INFERRED", filtered)
+        self.assertIn("Likely Main Thread", filtered)
+
+    def test_high_signal_validation_marks_ui_impact_as_speculative_without_measurements(self):
+        server = self.server
+        text = (
+            "Hot path finding:\n"
+            "Impact: Causes frame drops\n"
+        )
+        filtered, removed = server._validate_high_signal_output(text, True)
+        self.assertEqual(removed, 0)
+        self.assertIn("SPECULATIVE", filtered)
+        self.assertIn("may cause", filtered.lower())
 
     def test_high_signal_validation_filters_architecture_only_block_but_keeps_hot_path(self):
         server = self.server
