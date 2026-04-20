@@ -213,6 +213,141 @@ class TestServerStreamingDebugMode(unittest.TestCase):
         self.assertEqual(root["integrity_probe"], {})
         self.assertEqual(state["integrity_probe"], {})
 
+    def test_performance_query_enables_high_signal_policy(self):
+        server = self.server
+        policy, query_type = server._reasoning_policy_for_query("Why is scroll jank on main thread?")
+        self.assertEqual(query_type, "performance")
+        self.assertIn("High-Signal Performance Analysis Mode", policy)
+
+    def test_high_signal_output_validation_is_conservative_for_mixed_items(self):
+        server = self.server
+        text = (
+            "- Path A frequency: per frame, thread: main, cost: high\n"
+            "- Path B frequency: once, thread: background, cost: low\n"
+        )
+        filtered, removed = server._validate_high_signal_output(text, True)
+        self.assertEqual(removed, 0)
+        self.assertIn("Path A", filtered)
+        self.assertIn("Path B", filtered)
+
+    def test_build_context_injects_reasoning_policy_for_performance_query(self):
+        server = self.server
+        server.INDEXER_READY = False
+        messages = [{"role": "user", "content": "Investigate scroll lag in ScheduleFragment"}]
+        built = server._build_context(messages, "req123", debug_mode=False, return_debug=False)
+        self.assertIn("REASONING POLICY", built[0]["content"])
+        self.assertIn("High-Signal Performance Analysis Mode", built[0]["content"])
+
+    def test_streaming_still_emits_incremental_answer_tokens(self):
+        server = self.server
+        server._indexer_module = None
+        server.orchestration_plan = lambda _intent: {"skip_patch_plan": True, "skip_neighborhood": True}
+        server.classify_query_intent_details = lambda _query: {
+            "intent": "runtime_usage_or_reference",
+            "retrieval_route": "semantic",
+        }
+        server._build_context = lambda messages, request_id, debug_mode=False, return_debug=False: (
+            messages,
+            {"query": "q", "retrieval": {}, "orchestration_path": "direct_retrieval"},
+        )
+
+        class _TokenLlm:
+            def __call__(self, _prompt, max_tokens=0, stream=False, echo=False):
+                if stream:
+                    def _gen():
+                        yield {"choices": [{"text": "hot-path-1 "}]}
+                        yield {"choices": [{"text": "hot-path-2"}]}
+                    return _gen()
+                return {"choices": [{"text": "unused"}]}
+
+        server.llm = _TokenLlm()
+        events = _collect_stream(server, debug_mode=False)
+        hot_path_1_idx = next(i for i, e in enumerate(events) if "hot-path-1" in e)
+        hot_path_2_idx = next(i for i, e in enumerate(events) if "hot-path-2" in e)
+        done_idx = next(i for i, e in enumerate(events) if "[DONE]" in e)
+        self.assertLess(hot_path_1_idx, done_idx)
+        self.assertLess(hot_path_2_idx, done_idx)
+        self.assertLess(hot_path_1_idx, hot_path_2_idx)
+
+    def test_high_signal_validation_preserves_multiline_structured_finding(self):
+        server = self.server
+        text = (
+            "1. Scroll diff churn\n"
+            "   - frequency: per frame\n"
+            "   - thread: main\n"
+            "   - cost: high\n"
+            "   - data flow → execution → UI impact: VM emit → adapter submitList → bind storm → frame drop\n"
+        )
+        filtered, removed = server._validate_high_signal_output(text, True)
+        self.assertEqual(removed, 0)
+        self.assertIn("Scroll diff churn", filtered)
+        self.assertIn("frame drop", filtered)
+
+    def test_high_signal_validation_filters_architecture_only_block_but_keeps_hot_path(self):
+        server = self.server
+        text = (
+            "Architecture notes:\n"
+            "Use repository + use case with dependency injection for cleaner separation.\n\n"
+            "Hot path finding:\n"
+            "ViewModel emit → Fragment accept → adapter update → RecyclerView bind → frame drop.\n"
+            "frequency: per frame, thread: main, cost: high\n"
+        )
+        filtered, removed = server._validate_high_signal_output(text, True)
+        self.assertEqual(removed, 1)
+        self.assertNotIn("Architecture notes", filtered)
+        self.assertIn("Hot path finding", filtered)
+
+    def test_stream_performance_query_appends_refined_high_signal_summary(self):
+        server = self.server
+        server._indexer_module = None
+        server.orchestration_plan = lambda _intent: {"skip_patch_plan": True, "skip_neighborhood": True}
+        server.classify_query_intent_details = lambda _query: {
+            "intent": "runtime_usage_or_reference",
+            "retrieval_route": "semantic",
+        }
+        server._build_context = lambda messages, request_id, debug_mode=False, return_debug=False: (
+            messages,
+            {"query": "q", "retrieval": {}, "orchestration_path": "direct_retrieval"},
+        )
+
+        class _TokenLlm:
+            def __call__(self, _prompt, max_tokens=0, stream=False, echo=False):
+                if stream:
+                    def _gen():
+                        yield {"choices": [{"text": "raw-token-1 "}]}
+                        yield {"choices": [{"text": "raw-token-2"}]}
+                    return _gen()
+                return {"choices": [{"text": "unused"}]}
+
+        server.llm = _TokenLlm()
+        original_validator = server._validate_high_signal_output
+        try:
+            server._validate_high_signal_output = (
+                lambda text, enabled: ("Shaped hot-path summary", 1) if enabled else (text, 0)
+            )
+
+            async def _collect():
+                events = []
+                messages = [{"role": "user", "content": "Why is scroll lagging?"}]
+                async for event in server._stream(messages, 16, "req123", 0.0, debug_mode=False):
+                    events.append(event)
+                return events
+
+            events = asyncio.run(_collect())
+        finally:
+            server._validate_high_signal_output = original_validator
+
+        raw_1_idx = next(i for i, e in enumerate(events) if "raw-token-1" in e)
+        raw_2_idx = next(i for i, e in enumerate(events) if "token-2" in e)
+        refined_header_idx = next(i for i, e in enumerate(events) if "Refined high-signal summary" in e)
+        shaped_idx = next(i for i, e in enumerate(events) if "Shaped hot-path summary" in e)
+        done_idx = next(i for i, e in enumerate(events) if "[DONE]" in e)
+
+        self.assertLess(raw_1_idx, raw_2_idx)
+        self.assertLess(raw_2_idx, refined_header_idx)
+        self.assertLess(refined_header_idx, shaped_idx)
+        self.assertLess(shaped_idx, done_idx)
+
 
 if __name__ == "__main__":
     unittest.main()

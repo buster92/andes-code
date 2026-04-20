@@ -9,10 +9,12 @@ def build_prompt_sections(
     workspace_prefix: str,
     retrieval_context: str,
     user_turn: str,
+    reasoning_policy: str = "",
 ) -> dict:
     """Build deterministic section object for prompt rendering."""
     return {
         "system_prefix": system_prefix.strip(),
+        "reasoning_policy": reasoning_policy.strip(),
         "workspace_prefix": workspace_prefix.strip(),
         "retrieval_context": retrieval_context.strip(),
         "user_turn": user_turn.strip(),
@@ -23,6 +25,7 @@ def serialize_prompt_sections(sections: dict) -> str:
     """Render prompt with stable ordering and separators."""
     ordered = [
         ("SYSTEM PREFIX", sections.get("system_prefix", "")),
+        ("REASONING POLICY", sections.get("reasoning_policy", "")),
         ("WORKSPACE PREFIX", sections.get("workspace_prefix", "")),
         ("RETRIEVAL CONTEXT", sections.get("retrieval_context", "")),
         ("USER TURN", sections.get("user_turn", "")),

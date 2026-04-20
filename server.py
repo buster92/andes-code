@@ -78,6 +78,29 @@ _BASE_SYSTEM = (
     "- Be direct and precise — this is a professional dev environment"
 )
 
+_PERFORMANCE_QUERY_RE = re.compile(
+    r"\b(slow|lag|jank|main\s+thread|scroll|performance|frame|cpu|render)\b",
+    re.IGNORECASE,
+)
+
+_HIGH_SIGNAL_PERFORMANCE_POLICY = (
+    "High-Signal Performance Analysis Mode (auto-enforced for performance queries):\n"
+    "- Analyze only interaction-time code paths (scroll, gesture handling, frame updates).\n"
+    "- For each finding, explicitly include:\n"
+    "  a) execution frequency: once / per event / per frame\n"
+    "  b) thread: main / background\n"
+    "  c) relative cost: low / medium / high\n"
+    "- Ignore architecture-only explanations (DI, repository, use case) and lifecycle-only setup (onCreate/init/setup).\n"
+    "- Keep only hot paths: high frequency AND non-trivial cost.\n"
+    "- Rank findings by (frequency × cost × thread impact) in descending order.\n"
+    "- Return only top relevant items (3–5 max).\n"
+    "- Every finding must include a causal chain in this format:\n"
+    "  data flow → execution → UI impact\n"
+    "  Example: ViewModel emit → Fragment accept → adapter update → RecyclerView bind → frame drop.\n"
+    "- Before finalizing, remove any finding that is infrequent or negligible cost.\n"
+    "- If no high-signal findings remain, explicitly say: No high-signal hot paths found."
+)
+
 # ── Audit log ─────────────────────────────────────────────────────────────────
 audit = logging.getLogger("andescode.audit")
 audit.setLevel(logging.INFO)
@@ -107,6 +130,47 @@ def _phase_log(request_id: str, phase: str, **fields) -> None:
     if payload:
         message = f"{message} | {payload}"
     audit.info(message)
+
+
+def _is_performance_query(query: str) -> bool:
+    return bool(query and _PERFORMANCE_QUERY_RE.search(query))
+
+
+def _reasoning_policy_for_query(query: str) -> tuple[str, str]:
+    query_type = "performance" if _is_performance_query(query) else "general"
+    return (_HIGH_SIGNAL_PERFORMANCE_POLICY if query_type == "performance" else "", query_type)
+
+
+def _validate_high_signal_output(text: str, enabled: bool) -> tuple[str, int]:
+    if not enabled or not text.strip():
+        return text, 0
+    blocks = [b for b in re.split(r"\n\s*\n", text.strip()) if b.strip()]
+    if not blocks:
+        return text, 0
+
+    architecture_markers = (
+        "dependency injection", "di", "repository", "use case",
+        "clean architecture", "mvvm", "mvi", "oncreate", "init", "setup",
+    )
+    hot_path_markers = (
+        "per frame", "per event", "frame", "scroll", "jank", "render",
+        "recyclerview", "main thread", "cpu", "bind", "gesture",
+    )
+
+    kept_blocks: list[str] = []
+    filtered_out = 0
+    for block in blocks:
+        normalized = block.lower()
+        has_architecture = any(marker in normalized for marker in architecture_markers)
+        has_hot_path = any(marker in normalized for marker in hot_path_markers)
+        if has_architecture and not has_hot_path:
+            filtered_out += 1
+            continue
+        kept_blocks.append(block)
+
+    if not kept_blocks:
+        return "No high-signal hot paths found.", filtered_out
+    return "\n\n".join(kept_blocks).strip(), filtered_out
 
 
 def _index_phase_log(source: str, phase: str, **fields) -> None:
@@ -489,10 +553,18 @@ async def chat(request: Request):
     messages, debug_payload = _build_context(
         messages, request_id, debug_mode=debug_mode, return_debug=True
     )
+    user_query = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+    is_performance = _is_performance_query(user_query)
     prompt   = _messages_to_prompt(messages)
     try:
         result = llm(prompt, max_tokens=max_tokens, echo=False)
         text   = _strip_thinking(result["choices"][0]["text"], strip_edges=True)
+        text, filtered_out = _validate_high_signal_output(text, is_performance)
+        query_type = "performance" if is_performance else "general"
+        audit.info(
+            f"HIGH_SIGNAL {request_id} | query_type={query_type} | "
+            f"applied={is_performance} | filtered_out_items={filtered_out}"
+        )
     except Exception as e:
         audit.warning(f"INFERENCE_FAIL {request_id} | {_safe(e)}")
         return {"error": str(e)}, 500
@@ -593,9 +665,18 @@ def _build_context(
       2. Project map header (always present after indexing)
       3. Retrieved code chunks with coverage metadata
     """
+    query = next(
+        (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
+    )
+    reasoning_policy, query_type = _reasoning_policy_for_query(query)
+    audit.info(
+        f"HIGH_SIGNAL_MODE {request_id} | query_type={query_type} | "
+        f"applied={bool(reasoning_policy)}"
+    )
     if not INDEXER_READY:
         sections = build_prompt_sections(
             system_prefix=_BASE_SYSTEM,
+            reasoning_policy=reasoning_policy,
             workspace_prefix="",
             retrieval_context="",
             user_turn="",
@@ -605,9 +686,6 @@ def _build_context(
         ]
         return (base, None) if return_debug else base
 
-    query = next(
-        (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
-    )
     if not query:
         return (messages, None) if return_debug else messages
 
@@ -638,6 +716,7 @@ def _build_context(
         if not chunks:
             sections = build_prompt_sections(
                 system_prefix=_BASE_SYSTEM,
+                reasoning_policy=reasoning_policy,
                 workspace_prefix=map_section,
                 retrieval_context="",
                 user_turn="",
@@ -668,6 +747,7 @@ def _build_context(
 
         sections = build_prompt_sections(
             system_prefix=_BASE_SYSTEM,
+            reasoning_policy=reasoning_policy,
             workspace_prefix=map_section,
             retrieval_context=code_section,
             user_turn="",
@@ -966,6 +1046,11 @@ def _build_context_from_plan(
     query = next(
         (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
     )
+    reasoning_policy, query_type = _reasoning_policy_for_query(query)
+    audit.info(
+        f"HIGH_SIGNAL_MODE {request_id} | query_type={query_type} | "
+        f"applied={bool(reasoning_policy)}"
+    )
 
     pmap        = _indexer_module._load_project_map() if _indexer_module else {}
     workspace   = _indexer_module._load_workspace_index() if _indexer_module else {}
@@ -1057,6 +1142,7 @@ def _build_context_from_plan(
 
     sections = build_prompt_sections(
         system_prefix=_BASE_SYSTEM,
+        reasoning_policy=reasoning_policy,
         workspace_prefix=map_section,
         retrieval_context=code_section,
         user_turn="",
@@ -1102,11 +1188,14 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
     intent = "unknown"
     retrieval_route = "unknown"
     retrieval_signature = ""
+    filtered_out = 0
+    is_performance = False
     try:
         _phase_log(request_id, "request_received", max_tokens=max_tokens, message_count=len(messages))
         yield _make_chunk("⚙️ _Analyzing request..._", request_id)
 
         query = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+        is_performance = _is_performance_query(query)
         pmap = _indexer_module._load_project_map() if _indexer_module else {}
         phase = "intent_classified"
         decision = classify_query_intent_details(query)
@@ -1134,7 +1223,7 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
             if semantic_hit:
                 cached_semantic = True
                 yield _make_chunk("\n🧩 _Semantic cache hit (safe descriptive answer)_\n\n", request_id)
-                final_text = semantic_hit
+                final_text, filtered_out = _validate_high_signal_output(semantic_hit, is_performance)
                 yield _make_chunk(final_text, request_id)
 
         if not cached_semantic:
@@ -1203,7 +1292,7 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
             t_think_total = 0.0
             t_first_token = None
             token_count = 0
-            cleared = False
+            emitted_answer = False
 
             phase = "generation"
             for chunk in llm(prompt, max_tokens=max_tokens, stream=True, echo=False):
@@ -1215,9 +1304,9 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                     in_think = True
                     t_think_start = time.perf_counter()
                     if before.strip():
-                        if not cleared:
+                        if not emitted_answer:
                             yield _make_chunk("\n\n---\n\n", request_id)
-                            cleared = True
+                            emitted_answer = True
                         if t_first_token is None:
                             t_first_token = time.perf_counter()
                             _phase_log(request_id, "first_token_emitted", seconds=f"{t_first_token - t_start:.2f}")
@@ -1236,9 +1325,9 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                     emit = _strip_thinking(buffer[:-len(think_open)])
                     buffer = buffer[-len(think_open):]
                     if emit:
-                        if not cleared:
+                        if not emitted_answer:
                             yield _make_chunk("\n\n---\n\n", request_id)
-                            cleared = True
+                            emitted_answer = True
                         if t_first_token is None:
                             t_first_token = time.perf_counter()
                             _phase_log(request_id, "first_token_emitted", seconds=f"{t_first_token - t_start:.2f}")
@@ -1249,10 +1338,19 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
             if buffer and not in_think:
                 remainder = _strip_thinking(buffer)
                 if remainder:
-                    if not cleared:
+                    if not emitted_answer:
                         yield _make_chunk("\n\n---\n\n", request_id)
+                        emitted_answer = True
                     final_text += remainder
                     yield _make_chunk(remainder, request_id)
+
+            filtered_text, filtered_out = _validate_high_signal_output(final_text, is_performance)
+            if is_performance and filtered_text.strip() and filtered_text.strip() != final_text.strip():
+                yield _make_chunk(
+                    "\n\n🔎 Refined high-signal summary:\n",
+                    request_id,
+                )
+                yield _make_chunk(filtered_text, request_id)
 
             t_done = time.perf_counter()
             total_s = t_done - t_start
@@ -1272,13 +1370,20 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                 chunks=token_count,
             )
 
-        if cache and repo_fp and semantic_cache_allowed(intent, retrieval_route) and final_text.strip():
+        query_type = "performance" if is_performance else "general"
+        audit.info(
+            f"HIGH_SIGNAL {request_id} | query_type={query_type} | "
+            f"applied={is_performance} | filtered_out_items={filtered_out}"
+        )
+
+        cache_value = filtered_text if 'filtered_text' in locals() else final_text
+        if cache and repo_fp and semantic_cache_allowed(intent, retrieval_route) and cache_value.strip():
             cache.semantic_set(
                 repo_fp=repo_fp,
                 query=query,
                 retrieval_signature=retrieval_signature,
                 safe_class="descriptive",
-                value=final_text.strip(),
+                value=cache_value.strip(),
             )
             cache.flush_metrics()
         if debug_mode and debug_payload:
