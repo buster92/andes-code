@@ -308,6 +308,55 @@ class TestDirectRetrievalAuthoritative(unittest.TestCase):
         self.assertEqual([c.get("content") for c in first_results], ["dep_a", "dep_b", "dep_c"])
         self.assertEqual(first_payload["retrieval"]["declaration_answer_mode"], second_payload["retrieval"]["declaration_answer_mode"])
         self.assertTrue(second_payload["retrieval"]["cache_hit"])
+        self.assertEqual(len(second_payload["retrieval"]["selected_candidates"]), 3)
+
+    def test_cache_hit_non_authoritative_respects_smaller_n_results(self):
+        indexer = _import_indexer_with_stubs()
+        indexer._load_workspace_index = lambda: {"manifests": [], "config_graph": {"config_files": []}}
+        indexer.classify_query_intent_details = lambda _q: {
+            "intent": "runtime_usage_or_reference",
+            "retrieval_route": "semantic",
+            "ambiguous": False,
+            "allow_runtime_fallback": False,
+            "strict_authority_mode": True,
+        }
+        indexer._structured_query_results = lambda _q: []
+        indexer._load_json = lambda _p: {}
+        indexer.get_repo_fingerprint = lambda: "repo-fp-runtime"
+        indexer._add_coverage = lambda chunks: chunks
+        indexer._rerank = lambda _q, candidates, track_reasons=False: candidates
+
+        cache_store = {}
+
+        def _cache_get(repo_fp, query, index_version, intent, retrieval_route):  # noqa: ARG001
+            return cache_store.get((repo_fp, query, intent, retrieval_route))
+
+        def _cache_set(repo_fp, query, index_version, value, intent, retrieval_route):  # noqa: ARG001
+            cache_store[(repo_fp, query, intent, retrieval_route)] = list(value)
+
+        indexer.CACHE = SimpleNamespace(retrieval_get=_cache_get, retrieval_set=_cache_set)
+
+        first_results, first_payload = indexer.search(
+            "what libraries are used",
+            n_results=2,
+            debug_mode=True,
+            return_debug=True,
+        )
+        second_results, second_payload = indexer.search(
+            "what libraries are used",
+            n_results=1,
+            debug_mode=True,
+            return_debug=True,
+        )
+
+        self.assertEqual(len(first_results), 2)
+        self.assertEqual(len(second_results), 1)
+        self.assertTrue(second_payload["retrieval"]["cache_hit"])
+        self.assertEqual(len(second_payload["retrieval"]["selected_candidates"]), 1)
+        self.assertIn(
+            second_payload["retrieval"]["declaration_answer_mode"],
+            {"", "declared_only", "declared_plus_runtime", "declared_partial_only", "runtime_only_fallback", "missing_declarations"},
+        )
 
     def test_debug_payload_includes_authoritative_fields(self):
         indexer = _import_indexer_with_stubs()

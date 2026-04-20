@@ -565,25 +565,38 @@ def search(
         )
         if cached:
             cached_final = list(cached)
+            authoritative_source_types = {"manifest", "build_file", "dependency_file", "config_file"}
+            authoritative_cached = [
+                c
+                for c in cached_final
+                if c.get("source_type") in authoritative_source_types
+                or _matches_authoritative(c.get("file", ""))
+            ]
+            preserve_authoritative_overflow = (
+                decl_query
+                and len(cached_final) > n_results
+                and len(authoritative_cached) > n_results
+            )
+            cached_visible = cached_final if preserve_authoritative_overflow else cached_final[:n_results]
             if payload is not None:
                 payload = populate_retrieval_snapshot(
                     payload,
-                    chunks=cached_final,
-                    raw_candidates=[c.get("file", "") for c in cached_final],
+                    chunks=cached_visible,
+                    raw_candidates=[c.get("file", "") for c in cached_visible],
                     cache_hit=True,
                 )
-                _update_authoritative_debug(cached_final, mode="direct_chunk_load", reason="cache hit")
-                payload_out = finalize_payload(payload, cached_final)
+                _update_authoritative_debug(cached_visible, mode="direct_chunk_load", reason="cache hit")
+                payload_out = finalize_payload(payload, cached_visible)
                 payload_out = apply_failure_signals(
                     payload_out,
                     query=query,
                     intent=intent,
                     retrieval_route=retrieval_route,
                     top_score=None,
-                    final_chunks=cached_final,
+                    final_chunks=cached_visible,
                 )
-                return _ret(cached_final, payload_out)
-            return _ret(cached_final)
+                return _ret(cached_visible, payload_out)
+            return _ret(cached_visible)
 
     if retrieval_route == "source_of_truth":
         final = _retrieve_config_first(
