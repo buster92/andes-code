@@ -392,5 +392,59 @@ class TestDirectRetrievalAuthoritative(unittest.TestCase):
             "authority_selection_reason",
             "authority_retrieval_mode",
             "declaration_answer_mode",
+            "declaration_query_trigger_reason",
         ):
             self.assertIn(key, retrieval)
+        self.assertEqual(retrieval["declaration_query_trigger_reason"], "intent")
+
+    def test_keyword_fallback_marks_declaration_trigger_reason(self):
+        indexer = _import_indexer_with_stubs()
+        indexer._load_workspace_index = lambda: {
+            "manifests": [],
+            "config_graph": {"config_files": ["a/package.json"]},
+        }
+        indexer.classify_query_intent_details = lambda _q: {
+            "intent": "runtime_usage_or_reference",
+            "retrieval_route": "runtime_usage",
+            "ambiguous": False,
+            "allow_runtime_fallback": True,
+            "strict_authority_mode": False,
+        }
+        indexer._structured_query_results = lambda _q: []
+        indexer._load_json = lambda _p: {}
+        indexer.get_repo_fingerprint = lambda: ""
+        indexer._fetch_exact_file = lambda path, max_results=6: [{"file": path, "content": "deps", "language": "", "symbols": ""}]
+        indexer._fetch_indexed_candidates_by_basename = lambda *_args, **_kwargs: {}
+        indexer._add_coverage = lambda chunks: chunks
+        indexer._rerank = lambda _q, candidates, track_reasons=False: candidates
+
+        _results, payload = indexer.search("what libraries does this project use", n_results=1, debug_mode=True, return_debug=True)
+        retrieval = payload["retrieval"]
+        self.assertEqual(retrieval["declaration_query_trigger_reason"], "keyword_fallback")
+        self.assertTrue(retrieval["authoritative_files_required"])
+
+    def test_keyword_fallback_reason_is_stable_for_package_json_query(self):
+        indexer = _import_indexer_with_stubs()
+        indexer._load_workspace_index = lambda: {
+            "manifests": [],
+            "config_graph": {"config_files": ["package.json"]},
+        }
+        indexer.classify_query_intent_details = lambda _q: {
+            "intent": "runtime_usage_or_reference",
+            "retrieval_route": "runtime_usage",
+            "ambiguous": False,
+            "allow_runtime_fallback": True,
+            "strict_authority_mode": False,
+        }
+        indexer._structured_query_results = lambda _q: []
+        indexer._load_json = lambda _p: {}
+        indexer.get_repo_fingerprint = lambda: ""
+        indexer._fetch_exact_file = lambda path, max_results=6: [{"file": path, "content": "deps", "language": "", "symbols": ""}]
+        indexer._fetch_indexed_candidates_by_basename = lambda *_args, **_kwargs: {}
+        indexer._add_coverage = lambda chunks: chunks
+        indexer._rerank = lambda _q, candidates, track_reasons=False: candidates
+
+        _results, payload = indexer.search("what dependencies are declared in package.json", n_results=1, debug_mode=True, return_debug=True)
+        retrieval = payload["retrieval"]
+        self.assertEqual(retrieval["declaration_query_trigger_reason"], "keyword_fallback")
+        self.assertTrue(retrieval["authoritative_files_required"])

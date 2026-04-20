@@ -20,6 +20,7 @@ from andes_cache.source_of_truth import (
     authority_level_for_source,
     wants_runtime_usage,
     is_declaration_query,
+    has_declaration_keywords,
     source_of_truth_guidance,
 )
 from andes_cache.manager import AndesCacheManager
@@ -111,6 +112,16 @@ class TestSourceOfTruthBehavior(unittest.TestCase):
     def test_dependency_queries_are_treated_as_declaration_questions(self):
         self.assertTrue(is_declaration_query("what dependencies and versions are configured"))
         self.assertTrue(is_declaration_query("where are build settings declared"))
+        self.assertTrue(is_declaration_query("what dependencies are declared"))
+        self.assertTrue(is_declaration_query("what libraries does this project use"))
+        self.assertTrue(is_declaration_query("where is config defined"))
+
+    def test_declaration_keyword_helper_matches_shared_keyword_set(self):
+        self.assertTrue(has_declaration_keywords("what is declared in package.json"))
+        self.assertTrue(has_declaration_keywords("show dependencies in pyproject.toml"))
+        self.assertTrue(has_declaration_keywords("what does gradle declare"))
+        self.assertTrue(has_declaration_keywords("list versions from pom.xml"))
+        self.assertTrue(has_declaration_keywords("where are build settings declared"))
 
     def test_guidance_requires_declared_and_inferred_sections(self):
         guidance = source_of_truth_guidance("what dependencies are declared in package.json")

@@ -34,7 +34,7 @@ from andes_cache import (
     pack_chunks_to_budget,
 )
 from andes_cache.debug import resolve_debug_mode, env_debug_mode, format_debug_sse_event
-from andes_cache.source_of_truth import source_of_truth_guidance, is_declaration_query
+from andes_cache.source_of_truth import source_of_truth_guidance, is_declaration_query, has_declaration_keywords
 from andes_cache.routing import (
     classify_query_intent,
     classify_query_intent_details,
@@ -1459,6 +1459,7 @@ def _build_context_from_plan(
                 "authority_selection_reason": "",
                 "authority_retrieval_mode": "",
                 "declaration_answer_mode": "",
+                "declaration_query_trigger_reason": "",
                 "chunks_per_file": {},
                 "coverage": {},
                 "cache_hit": False,
@@ -1472,12 +1473,22 @@ def _build_context_from_plan(
             "final_context": {"files_used": [], "context_size": 0},
         }
 
-    decl_query = is_declaration_query(query, intent=(diagnosis or {}).get("intent", ""))
+    intent = (diagnosis or {}).get("intent", "")
+    decl_query = is_declaration_query(query, intent=intent)
+    declaration_query_trigger_reason = ""
+    if intent in {"dependency_or_build_inventory", "config_lookup", "dependency_lookup"}:
+        declaration_query_trigger_reason = "intent"
+    elif has_declaration_keywords(query):
+        declaration_query_trigger_reason = "keyword_fallback"
     authoritative_files = []
     if workspace:
         authoritative_files.extend(workspace.get("manifests", []) or [])
         authoritative_files.extend((workspace.get("config_graph", {}) or {}).get("config_files", []) or [])
     authoritative_files = sorted(set(authoritative_files))
+
+    if not decl_query and authoritative_files and has_declaration_keywords(query):
+        decl_query = True
+        declaration_query_trigger_reason = "workspace_signal"
 
     def _matches_authoritative(path: str) -> bool:
         if path in authoritative_files:
@@ -1517,6 +1528,7 @@ def _build_context_from_plan(
         debug_payload["retrieval"]["authoritative_files_required"] = list(authoritative_files) if decl_query else []
         debug_payload["retrieval"]["authoritative_files_retrieved"] = []
         debug_payload["retrieval"]["authoritative_files_missing"] = list(authoritative_files)
+        debug_payload["retrieval"]["declaration_query_trigger_reason"] = declaration_query_trigger_reason
 
     # Fetch full content from planned files + deterministic neighborhood expansion.
     expanded_files = []
