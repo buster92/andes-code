@@ -213,6 +213,31 @@ class TestServerStreamingDebugMode(unittest.TestCase):
         self.assertEqual(root["integrity_probe"], {})
         self.assertEqual(state["integrity_probe"], {})
 
+    def test_performance_query_enables_high_signal_policy(self):
+        server = self.server
+        policy, query_type = server._reasoning_policy_for_query("Why is scroll jank on main thread?")
+        self.assertEqual(query_type, "performance")
+        self.assertIn("High-Signal Performance Analysis Mode", policy)
+
+    def test_high_signal_output_validation_filters_low_signal_items(self):
+        server = self.server
+        text = (
+            "- Path A frequency: per frame, thread: main, cost: high\n"
+            "- Path B frequency: once, thread: background, cost: low\n"
+        )
+        filtered, removed = server._validate_high_signal_output(text, True)
+        self.assertEqual(removed, 1)
+        self.assertIn("Path A", filtered)
+        self.assertNotIn("Path B", filtered)
+
+    def test_build_context_injects_reasoning_policy_for_performance_query(self):
+        server = self.server
+        server.INDEXER_READY = False
+        messages = [{"role": "user", "content": "Investigate scroll lag in ScheduleFragment"}]
+        built = server._build_context(messages, "req123", debug_mode=False, return_debug=False)
+        self.assertIn("REASONING POLICY", built[0]["content"])
+        self.assertIn("High-Signal Performance Analysis Mode", built[0]["content"])
+
 
 if __name__ == "__main__":
     unittest.main()
