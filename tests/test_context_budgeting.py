@@ -162,6 +162,62 @@ class TestContextBudgeting(unittest.TestCase):
         )
         self.assertEqual(candidates[0]["tier"], 0)
 
+
+    def test_declaration_query_prioritizes_authoritative_over_runtime_usage(self):
+        server = self.server
+        candidates = server._prioritize_chunk_candidates(
+            [
+                {"file": "src/runtime_usage.py", "content": "import requests", "source_type": "source_code"},
+                {"file": "pyproject.toml", "content": "[tool.poetry.dependencies]", "source_type": "dependency_file"},
+            ],
+            query="what dependencies are declared",
+        )
+        self.assertEqual(candidates[0]["file"], "pyproject.toml")
+        self.assertEqual(candidates[0]["authority_rank"], 0)
+        self.assertEqual(candidates[1]["authority_rank"], 1)
+
+    def test_declaration_guidance_is_injected_when_authoritative_chunks_are_missing(self):
+        server = self.server
+        context, _info = server._pack_context_section(
+            query="what dependencies are declared",
+            map_section="",
+            chunks=[
+                {"file": "src/runtime_usage.py", "content": "import requests", "source_type": "source_code"},
+            ],
+            request_id="req-decl-missing-auth",
+        )
+        self.assertIn("## Source-of-Truth Guidance", context)
+        self.assertIn("Declared", context)
+        self.assertIn("Inferred from usage", context)
+        self.assertIn("state declaration files are missing", context)
+
+    def test_dependency_context_packing_prefers_build_or_dependency_chunk_over_usage(self):
+        server = self.server
+        server.MODEL_CONTEXT_WINDOW = 960
+        chunks = [
+            {
+                "file": "src/runtime_usage.py",
+                "content": "u" * 520,
+                "source_type": "source_code",
+            },
+            {
+                "file": "build.gradle.kts",
+                "content": "d" * 520,
+                "source_type": "build_file",
+            },
+        ]
+
+        _context, info = server._pack_context_section(
+            query="what dependencies are declared",
+            map_section="",
+            chunks=chunks,
+            request_id="req-decl-pack-priority",
+        )
+
+        self.assertGreaterEqual(info["packed_chunks"], 1)
+        self.assertIn("build.gradle.kts", info["kept_files"])
+        self.assertNotIn("src/runtime_usage.py", info["kept_files"])
+
     def test_build_context_with_long_history_still_packs_without_overflow(self):
         server = self.server
         server.MODEL_CONTEXT_WINDOW = 1100
