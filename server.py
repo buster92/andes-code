@@ -1451,6 +1451,9 @@ def _build_context_from_plan(
                 "files_retrieved": [],
                 "raw_candidates": list(planned_files),
                 "selected_candidates": [],
+                "authoritative_files_detected": [],
+                "authoritative_files_retrieved": [],
+                "authoritative_files_missing": [],
                 "chunks_per_file": {},
                 "coverage": {},
                 "cache_hit": False,
@@ -1463,6 +1466,17 @@ def _build_context_from_plan(
             },
             "final_context": {"files_used": [], "context_size": 0},
         }
+
+    decl_query = is_declaration_query(query, intent=(diagnosis or {}).get("intent", ""))
+    authoritative_files = []
+    if workspace:
+        authoritative_files.extend(workspace.get("manifests", []) or [])
+        authoritative_files.extend((workspace.get("config_graph", {}) or {}).get("config_files", []) or [])
+    authoritative_files = sorted(set(authoritative_files))
+    if debug_payload is not None:
+        debug_payload["retrieval"]["authoritative_files_detected"] = list(authoritative_files)
+        debug_payload["retrieval"]["authoritative_files_retrieved"] = []
+        debug_payload["retrieval"]["authoritative_files_missing"] = list(authoritative_files)
 
     # Fetch full content from planned files + deterministic neighborhood expansion.
     expanded_files = []
@@ -1479,6 +1493,18 @@ def _build_context_from_plan(
                 files_loaded.append(fname)
         except Exception as e:
             audit.warning(f"FILE_FETCH_FAIL {request_id} | {fname} | {e}")
+
+    if decl_query and authoritative_files:
+        for fname in authoritative_files:
+            if fname in files_loaded:
+                continue
+            try:
+                file_chunks = _indexer_module.get_chunks_for_file(fname)
+                if file_chunks:
+                    all_chunks.extend(file_chunks)
+                    files_loaded.append(fname)
+            except Exception as e:
+                audit.warning(f"AUTHORITATIVE_FETCH_FAIL {request_id} | {fname} | {e}")
 
     # Always add semantic search results to catch anything the planner missed
     try:
@@ -1498,14 +1524,22 @@ def _build_context_from_plan(
             debug_payload["planning"]["semantic_fallback_files"] = list(semantic_fallback_files)
             debug_payload["retrieval"]["files_retrieved"] = list(files_loaded)
             debug_payload["retrieval"]["selected_candidates"] = list(files_loaded)
+            authoritative_retrieved = sorted(
+                [
+                    f for f in files_loaded
+                    if f in authoritative_files or any(Path(p).name == Path(f).name for p in authoritative_files)
+                ]
+            )
+            debug_payload["retrieval"]["authoritative_files_retrieved"] = authoritative_retrieved
+            debug_payload["retrieval"]["authoritative_files_missing"] = [
+                p for p in authoritative_files if p not in authoritative_retrieved
+            ]
             debug_payload["final_context"]["files_used"] = list(files_loaded)
+        if decl_query and authoritative_files:
+            audit.warning("authoritative retrieval failure (not packing failure)")
         return (messages, [], debug_payload) if return_debug else (messages, [])
 
     anchor_files = _extract_anchor_files(query)
-    authoritative_files = []
-    if workspace:
-        authoritative_files.extend(workspace.get("manifests", []) or [])
-        authoritative_files.extend((workspace.get("config_graph", {}) or {}).get("config_files", []) or [])
     code_section, packing_info = _pack_context_section(
         query=query,
         map_section=map_section,
@@ -1543,6 +1577,18 @@ def _build_context_from_plan(
         debug_payload["planning"]["semantic_fallback_files"] = list(semantic_fallback_files)
         debug_payload["retrieval"]["files_retrieved"] = list(files_loaded)
         debug_payload["retrieval"]["selected_candidates"] = list(files_loaded)
+        authoritative_retrieved = sorted(
+            [
+                f for f in files_loaded
+                if f in authoritative_files or any(Path(p).name == Path(f).name for p in authoritative_files)
+            ]
+        )
+        debug_payload["retrieval"]["authoritative_files_retrieved"] = authoritative_retrieved
+        debug_payload["retrieval"]["authoritative_files_missing"] = [
+            p for p in authoritative_files if p not in authoritative_retrieved
+        ]
+        if decl_query and authoritative_files and not authoritative_retrieved:
+            audit.warning("authoritative retrieval failure (not packing failure)")
         packed_chunks = packing_info["packed_chunks_raw"]
         debug_payload["retrieval"]["chunks_per_file"] = {
             f: sum(1 for c in packed_chunks if c.get("file") == f) for f in sorted(set(files_loaded))
