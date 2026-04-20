@@ -34,6 +34,7 @@ from andes_cache import (
     pack_chunks_to_budget,
 )
 from andes_cache.debug import resolve_debug_mode, env_debug_mode, format_debug_sse_event
+from andes_cache.source_of_truth import source_of_truth_guidance
 from andes_cache.routing import (
     classify_query_intent,
     classify_query_intent_details,
@@ -1110,12 +1111,12 @@ def _pack_context_section(
     if packed.truncated:
         code_section += "\n_Context truncated to fit model window; highest-priority files were kept first._\n"
     has_authoritative = any(
-        c["chunk"].get("source_type") in {"manifest", "build_file", "config_file"}
+        c["chunk"].get("source_type") in {"manifest", "build_file", "dependency_file", "config_file"}
         for c in packed.chunks
     )
     source_instruction = ""
     if has_authoritative:
-        source_instruction = (
+        source_instruction = source_of_truth_guidance(query, intent="") or (
             "## Source-of-Truth Guidance\n"
             "- Prefer declared/config/build sources before code references.\n"
             "- Distinguish declared vs referenced vs inferred facts.\n"

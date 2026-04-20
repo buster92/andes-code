@@ -265,6 +265,44 @@ def missing_manifest_notice() -> dict:
     }
 
 
+def is_declaration_query(query: str, intent: str = "") -> bool:
+    """Return True when user asks for config/build/dependency declarations."""
+    q = (query or "").lower()
+    if intent in {"declaration_or_configuration", "dependency_or_build_inventory"}:
+        return True
+    return any(
+        k in q
+        for k in (
+            "dependenc",
+            "librar",
+            "version",
+            "manifest",
+            "permission",
+            "config",
+            "build",
+            "settings",
+            "requirements",
+            "package.json",
+            "pyproject",
+            "gradle",
+            "pom.xml",
+        )
+    )
+
+
+def source_of_truth_guidance(query: str, intent: str = "") -> str:
+    """Prompt guidance for declaration/config/build questions."""
+    if not is_declaration_query(query, intent):
+        return ""
+    return (
+        "## Source-of-Truth Guidance\n"
+        "- Prioritize authoritative declaration/config/build files first.\n"
+        "- Prefer explicit declarations over inference from runtime code usage.\n"
+        "- Downgrade inferred statements unless declaration files are missing.\n"
+        "- Format the final answer in two sections: `Declared` and `Inferred from usage`.\n"
+        "- If declaration files are missing, state that explicitly before any inferred findings.\n\n"
+    )
+
 def _is_authoritative_candidate(path: str) -> bool:
     p = (path or "").lower()
     if not p:
