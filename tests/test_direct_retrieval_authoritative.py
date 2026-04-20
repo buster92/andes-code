@@ -2,6 +2,7 @@ import importlib
 import sys
 import types
 import unittest
+from types import SimpleNamespace
 
 
 class _FakeEmbedding:
@@ -254,6 +255,59 @@ class TestDirectRetrievalAuthoritative(unittest.TestCase):
         self.assertEqual(payload["retrieval"]["authoritative_files_retrieved"], ["a/package.json"])
         self.assertEqual(payload["retrieval"]["authoritative_files_missing"], ["b/pyproject.toml"])
         self.assertEqual(payload["retrieval"]["declaration_answer_mode"], "declared_partial_only")
+
+    def test_cache_hit_preserves_multichunk_authoritative_shape(self):
+        indexer = _import_indexer_with_stubs()
+        indexer._load_workspace_index = lambda: {
+            "manifests": [],
+            "config_graph": {"config_files": ["a/package.json"]},
+        }
+        indexer.classify_query_intent_details = lambda _q: {
+            "intent": "dependency_or_build_inventory",
+            "retrieval_route": "semantic",
+            "ambiguous": False,
+            "allow_runtime_fallback": False,
+            "strict_authority_mode": True,
+        }
+        indexer._structured_query_results = lambda _q: []
+        indexer._load_json = lambda _p: {}
+        indexer.get_repo_fingerprint = lambda: "repo-fp"
+        indexer._fetch_exact_file = lambda path, max_results=6: [
+            {"file": path, "content": "dep_a", "line": 1, "language": "", "symbols": ""},
+            {"file": path, "content": "dep_b", "line": 2, "language": "", "symbols": ""},
+            {"file": path, "content": "dep_c", "line": 3, "language": "", "symbols": ""},
+        ]
+        indexer._fetch_indexed_candidates_by_basename = lambda *_args, **_kwargs: {}
+        indexer._add_coverage = lambda chunks: chunks
+        indexer._rerank = lambda _q, candidates, track_reasons=False: candidates
+
+        cache_store = {}
+
+        def _cache_get(repo_fp, query, index_version, intent, retrieval_route):  # noqa: ARG001
+            return cache_store.get((repo_fp, query, intent, retrieval_route))
+
+        def _cache_set(repo_fp, query, index_version, value, intent, retrieval_route):  # noqa: ARG001
+            cache_store[(repo_fp, query, intent, retrieval_route)] = list(value)
+
+        indexer.CACHE = SimpleNamespace(retrieval_get=_cache_get, retrieval_set=_cache_set)
+
+        first_results, first_payload = indexer.search(
+            "what dependencies are declared",
+            n_results=1,
+            debug_mode=True,
+            return_debug=True,
+        )
+        second_results, second_payload = indexer.search(
+            "what dependencies are declared",
+            n_results=1,
+            debug_mode=True,
+            return_debug=True,
+        )
+
+        self.assertEqual(first_results, second_results)
+        self.assertEqual([c.get("content") for c in first_results], ["dep_a", "dep_b", "dep_c"])
+        self.assertEqual(first_payload["retrieval"]["declaration_answer_mode"], second_payload["retrieval"]["declaration_answer_mode"])
+        self.assertTrue(second_payload["retrieval"]["cache_hit"])
 
     def test_debug_payload_includes_authoritative_fields(self):
         indexer = _import_indexer_with_stubs()

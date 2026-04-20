@@ -564,25 +564,26 @@ def search(
             retrieval_route=retrieval_route,
         )
         if cached:
+            cached_final = list(cached)
             if payload is not None:
                 payload = populate_retrieval_snapshot(
                     payload,
-                    chunks=cached[:n_results],
-                    raw_candidates=[c.get("file", "") for c in cached[:n_results]],
+                    chunks=cached_final,
+                    raw_candidates=[c.get("file", "") for c in cached_final],
                     cache_hit=True,
                 )
-                _update_authoritative_debug(cached[:n_results], mode="direct_chunk_load", reason="cache hit")
-                payload_out = finalize_payload(payload, cached[:n_results])
+                _update_authoritative_debug(cached_final, mode="direct_chunk_load", reason="cache hit")
+                payload_out = finalize_payload(payload, cached_final)
                 payload_out = apply_failure_signals(
                     payload_out,
                     query=query,
                     intent=intent,
                     retrieval_route=retrieval_route,
                     top_score=None,
-                    final_chunks=cached[:n_results],
+                    final_chunks=cached_final,
                 )
-                return _ret(cached[:n_results], payload_out)
-            return _ret(cached[:n_results])
+                return _ret(cached_final, payload_out)
+            return _ret(cached_final)
 
     if retrieval_route == "source_of_truth":
         final = _retrieve_config_first(
