@@ -662,6 +662,7 @@ def _build_context(
             map_section=map_section,
             chunks=chunks,
             anchor_files=anchor_files,
+            conversation_messages=[m for m in messages if m.get("role") != "system"],
             request_id=request_id,
         )
 
@@ -722,14 +723,21 @@ def _prioritize_chunk_candidates(
     anchor_set = set(anchor_files or [])
     planned_set = set(planned_files or [])
     neighbor_set = set(neighbor_files or [])
+
+    def _matches(target_file: str, candidates: set[str]) -> bool:
+        if target_file in candidates:
+            return True
+        target_basename = Path(target_file).name
+        return any(Path(candidate).name == target_basename for candidate in candidates)
+
     prioritized = []
     for idx, chunk in enumerate(chunks):
         fname = chunk.get("file", "")
-        if fname in anchor_set:
+        if _matches(fname, anchor_set):
             tier = 0
-        elif fname in planned_set:
+        elif _matches(fname, planned_set):
             tier = 1
-        elif fname in neighbor_set:
+        elif _matches(fname, neighbor_set):
             tier = 2
         else:
             tier = 3
@@ -768,12 +776,16 @@ def _pack_context_section(
     anchor_files: list[str] | None = None,
     planned_files: list[str] | None = None,
     neighbor_files: list[str] | None = None,
+    conversation_messages: list[dict] | None = None,
     request_id: str,
 ) -> tuple[str, dict]:
+    conversation_text = _messages_to_prompt(
+        [{"role": m.get("role"), "content": m.get("content", "")} for m in (conversation_messages or []) if m.get("role") != "system"]
+    )
     budget = compute_context_budget(
         system_prompt=_BASE_SYSTEM,
         workspace_prefix=map_section,
-        user_query=query,
+        user_query=conversation_text or query,
         total_ctx=MODEL_CONTEXT_WINDOW,
         reserved_response=CONTEXT_RESERVED_RESPONSE_TOKENS,
         safety_margin=CONTEXT_SAFETY_MARGIN_TOKENS,
@@ -1039,6 +1051,7 @@ def _build_context_from_plan(
         anchor_files=anchor_files,
         planned_files=planned_files,
         neighbor_files=neighbor_files,
+        conversation_messages=[m for m in messages if m.get("role") != "system"],
         request_id=request_id,
     )
 

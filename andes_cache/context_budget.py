@@ -65,18 +65,31 @@ def pack_chunks_to_budget(chunks: list[dict], budget_tokens: int) -> PackedConte
     used_tokens = 0
     packed: list[dict] = []
     dropped: list[dict] = []
+    blocked_lower_tiers = False
 
-    for chunk in chunks:
-        chunk_tokens = int(chunk.get("est_tokens", 0))
-        if used_tokens + chunk_tokens > budget_tokens:
-            dropped.append(chunk)
-            continue
-        packed.append(chunk)
-        used_tokens += chunk_tokens
+    tiers = sorted({int(chunk.get("tier", 999)) for chunk in chunks})
+    for tier in tiers:
+        tier_chunks = [c for c in chunks if int(c.get("tier", 999)) == tier]
+        tier_overflowed = False
+        for chunk in tier_chunks:
+            chunk_tokens = int(chunk.get("est_tokens", 0))
+            if used_tokens + chunk_tokens > budget_tokens:
+                dropped.append(chunk)
+                tier_overflowed = True
+                continue
+            packed.append(chunk)
+            used_tokens += chunk_tokens
+        if tier_overflowed:
+            blocked_lower_tiers = True
+            for chunk in chunks:
+                c_tier = int(chunk.get("tier", 999))
+                if c_tier > tier and chunk not in dropped and chunk not in packed:
+                    dropped.append(chunk)
+            break
 
     packed_files = sorted({c.get("file", "") for c in packed if c.get("file")})
     dropped_files = sorted({c.get("file", "") for c in dropped if c.get("file") and c.get("file") not in packed_files})
-    truncated = len(packed) < len(chunks)
+    truncated = blocked_lower_tiers or len(packed) < len(chunks)
 
     return PackedContext(
         chunks=packed,

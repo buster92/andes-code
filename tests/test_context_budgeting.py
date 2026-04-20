@@ -83,6 +83,88 @@ class TestContextBudgeting(unittest.TestCase):
             self.fail("fallback chunk should not survive before higher priority chunks")
         self.assertIn("ScheduleFragment.kt", context)
 
+    def test_strict_priority_does_not_allow_fallback_when_anchor_tier_overflows(self):
+        server = self.server
+        server.MODEL_CONTEXT_WINDOW = 820
+        chunks = [
+            {"file": "src/ui/ScheduleFragment.kt", "content": "A" * 1400},
+            {"file": "fallback.py", "content": "f" * 120},
+        ]
+
+        _context, info = server._pack_context_section(
+            query="Analyze ScheduleFragment.kt scroll update",
+            map_section="",
+            chunks=chunks,
+            anchor_files=["ScheduleFragment.kt"],
+            request_id="req-strict-priority",
+        )
+
+        self.assertEqual(info["packed_chunks"], 0)
+        self.assertIn("fallback.py", info["dropped_files"])
+        self.assertNotIn("fallback.py", info["kept_files"])
+
+    def test_conversation_history_is_accounted_for_in_budget(self):
+        server = self.server
+        server.MODEL_CONTEXT_WINDOW = 1050
+        chunks = [{"file": f"src/f{i}.py", "content": "x" * 450} for i in range(8)]
+        short_messages = [{"role": "user", "content": "quick question"}]
+        long_messages = [
+            {"role": "user", "content": "long context " + ("u" * 1400)},
+            {"role": "assistant", "content": "prior answer " + ("a" * 1400)},
+            {"role": "user", "content": "follow-up " + ("q" * 1200)},
+        ]
+
+        _short_context, short_info = server._pack_context_section(
+            query="analyze flow",
+            map_section="",
+            chunks=chunks,
+            conversation_messages=short_messages,
+            request_id="req-short-history",
+        )
+        long_context, long_info = server._pack_context_section(
+            query="analyze flow",
+            map_section="",
+            chunks=chunks,
+            conversation_messages=long_messages,
+            request_id="req-long-history",
+        )
+
+        self.assertGreater(short_info["packed_chunks"], long_info["packed_chunks"])
+        self.assertTrue(long_info["truncated"])
+        self.assertIn("Context truncated to fit model window", long_context)
+
+    def test_anchor_basename_matching_works(self):
+        server = self.server
+        candidates = server._prioritize_chunk_candidates(
+            [{"file": "app/feature/ScheduleFragment.kt", "content": "render()"}],
+            anchor_files=["ScheduleFragment.kt"],
+        )
+        self.assertEqual(candidates[0]["tier"], 0)
+
+    def test_build_context_with_long_history_still_packs_without_overflow(self):
+        server = self.server
+        server.MODEL_CONTEXT_WINDOW = 1100
+        server.INDEXER_READY = True
+        server._indexer_module = types.SimpleNamespace(
+            _load_project_map=lambda: {},
+            _load_workspace_index=lambda: {},
+            get_repo_fingerprint=lambda: "",
+            CACHE=None,
+        )
+        server.search_codebase = lambda *_args, **_kwargs: [
+            {"file": f"src/file_{i}.py", "content": "line\n" * 260} for i in range(6)
+        ]
+        messages = [
+            {"role": "user", "content": "previous question " + ("u" * 1200)},
+            {"role": "assistant", "content": "previous answer " + ("a" * 1200)},
+            {"role": "user", "content": "trace ScheduleFragment.kt event flow"},
+        ]
+
+        result = server._build_context(messages, "req-long-convo")
+        system_prompt = result[0]["content"]
+
+        self.assertIn("Context truncated to fit model window", system_prompt)
+
     def test_planned_context_overflow_regression_stream_completes(self):
         server = self.server
         server.MODEL_CONTEXT_WINDOW = 1100
