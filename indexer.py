@@ -36,6 +36,7 @@ from andes_cache.source_of_truth import (
     classify_source_type,
     authority_level_for_source,
     wants_runtime_usage,
+    is_declaration_query,
 )
 from andes_cache.integrity import (
     INTEGRITY_HEALTHY,
@@ -485,9 +486,43 @@ def search(
     decision = classify_query_intent_details(query)
     intent = decision["intent"]
     retrieval_route = decision["retrieval_route"]
-    payload = debug_payload or (initialize_payload(query, decision, _load_workspace_index()) if debug_enabled else None)
+    workspace_index = _load_workspace_index()
+    payload = debug_payload or (initialize_payload(query, decision, workspace_index) if debug_enabled else None)
+    authoritative_files = (
+        sorted(
+            {
+                *(workspace_index.get("manifests", []) or []),
+                *((workspace_index.get("config_graph", {}) or {}).get("config_files", []) or []),
+            }
+        )
+        if isinstance(workspace_index, dict)
+        else []
+    )
+    decl_query = is_declaration_query(query, intent)
+
+    def _matches_authoritative(path: str) -> bool:
+        if path in authoritative_files:
+            return True
+        base = Path(path).name
+        return any(Path(p).name == base for p in authoritative_files)
+
+    def _update_authoritative_debug(final_chunks: list[dict]) -> None:
+        if payload is None:
+            return
+        retrieved = sorted(
+            {
+                c.get("file", "")
+                for c in (final_chunks or [])
+                if c.get("file") and _matches_authoritative(c.get("file", ""))
+            }
+        )
+        payload["retrieval"]["authoritative_files_detected"] = list(authoritative_files)
+        payload["retrieval"]["authoritative_files_retrieved"] = retrieved
+        payload["retrieval"]["authoritative_files_missing"] = [p for p in authoritative_files if p not in retrieved]
+
     if payload is not None:
         payload["retrieval"]["route_taken"] = retrieval_route
+        _update_authoritative_debug([])
     repo_fp = get_repo_fingerprint()
     if repo_fp:
         cached = CACHE.retrieval_get(
@@ -505,6 +540,7 @@ def search(
                     raw_candidates=[c.get("file", "") for c in cached[:n_results]],
                     cache_hit=True,
                 )
+                _update_authoritative_debug(cached[:n_results])
                 payload_out = finalize_payload(payload, cached[:n_results])
                 payload_out = apply_failure_signals(
                     payload_out,
@@ -542,6 +578,7 @@ def search(
                 chunks=final,
                 raw_candidates=payload.get("source_of_truth", {}).get("priority_files", []),
             )
+            _update_authoritative_debug(final)
             payload_out = finalize_payload(payload, final)
             payload_out = apply_failure_signals(
                 payload_out,
@@ -579,6 +616,7 @@ def search(
                     chunks=final,
                     raw_candidates=[c.get("file", "") for c in results],
                 )
+                _update_authoritative_debug(final)
                 payload_out = finalize_payload(payload, final)
                 payload_out = apply_failure_signals(
                     payload_out,
@@ -609,6 +647,7 @@ def search(
                 chunks=final,
                 raw_candidates=[c.get("file", "") for c in structured],
             )
+            _update_authoritative_debug(final)
             payload_out = finalize_payload(payload, final)
             payload_out = apply_failure_signals(
                 payload_out,
@@ -657,6 +696,29 @@ def search(
         }
         for i, doc in enumerate(results["documents"][0])
     ]
+    if decl_query and authoritative_files:
+        existing_files = {c.get("file", "") for c in candidates if c.get("file")}
+        for authoritative_path in authoritative_files:
+            if authoritative_path in existing_files:
+                continue
+            file_chunks = _fetch_exact_file(authoritative_path, max_results=3)
+            if not file_chunks:
+                continue
+            source_type = classify_source_type(authoritative_path)
+            authority = authority_level_for_source(intent, source_type)
+            annotate_sources(file_chunks, source_type=source_type, authority_level=authority)
+            for ch in file_chunks:
+                candidates.append(
+                    {
+                        "content": ch.get("content", ""),
+                        "file": ch.get("file", authoritative_path),
+                        "language": ch.get("language", ""),
+                        "symbols": ch.get("symbols", ""),
+                        # declaration candidates are deterministic source-of-truth injections
+                        "score": -1.0,
+                    }
+                )
+            existing_files.add(authoritative_path)
 
     # Boost candidates from symbol-matched files
     if symidx and matched_files:
@@ -665,9 +727,23 @@ def search(
                 c["score"] *= 0.8   # lower distance = better match
 
     ranked = _rerank(query, candidates, track_reasons=payload is not None)
+    final_ranked = ranked[:n_results]
+    if decl_query and authoritative_files:
+        authoritative_ranked = [c for c in ranked if _matches_authoritative(c.get("file", ""))]
+        if not authoritative_ranked:
+            logging.warning("authoritative retrieval failure (not packing failure)")
+        elif not any(_matches_authoritative(c.get("file", "")) for c in final_ranked):
+            # Preserve normal ranking, but reserve one slot for source-of-truth when available.
+            selected_authoritative = authoritative_ranked[0]
+            if n_results <= 0:
+                final_ranked = [selected_authoritative]
+            elif final_ranked:
+                final_ranked = final_ranked[:-1] + [selected_authoritative]
+            else:
+                final_ranked = [selected_authoritative]
 
     # Add coverage metadata — lets server tell model how much of each file it has
-    final = _add_coverage(ranked[:n_results])
+    final = _add_coverage(final_ranked)
     authority = "referenced" if intent == RUNTIME_USAGE_OR_REFERENCE else "inferred"
     final = annotate_sources(final, source_type="source_code", authority_level=authority)
     if repo_fp:
@@ -685,6 +761,7 @@ def search(
             chunks=final,
             raw_candidates=[c.get("file", "") for c in candidates],
         )
+        _update_authoritative_debug(final)
         top = []
         for rank, c in enumerate(ranked[: min(5, len(ranked))], start=1):
             top.append({

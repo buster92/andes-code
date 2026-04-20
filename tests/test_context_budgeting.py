@@ -247,6 +247,48 @@ class TestContextBudgeting(unittest.TestCase):
         self.assertIn("dependencies.kt", context)
         self.assertEqual(info.get("forced_authoritative_file"), "app/buildSrc/dependencies.kt")
 
+    def test_planned_context_injects_authoritative_candidates_before_packing(self):
+        server = self.server
+        server.INDEXER_READY = True
+        seen_chunks = {}
+        original_pack = server._pack_context_section
+
+        def _capture_pack(**kwargs):
+            seen_chunks["files"] = [c.get("file") for c in kwargs.get("chunks", [])]
+            return "ctx", {
+                "packed_chunks": 1,
+                "kept_files": ["app/buildSrc/dependencies.kt"],
+                "packed_chunks_raw": [{"file": "app/buildSrc/dependencies.kt", "content": "deps"}],
+            }
+
+        try:
+            server._pack_context_section = _capture_pack
+            server.search_codebase = lambda *_args, **_kwargs: [{"file": "src/runtime_usage.kt", "content": "runtime"}]
+            server._indexer_module = types.SimpleNamespace(
+                _load_project_map=lambda: {},
+                _load_workspace_index=lambda: {
+                    "import_graph": {"samples": {}},
+                    "file_to_module_map": {},
+                    "manifests": [],
+                    "config_graph": {"config_files": ["app/buildSrc/dependencies.kt"]},
+                },
+                get_repo_fingerprint=lambda: "",
+                get_chunks_for_file=lambda fname: (
+                    [{"file": fname, "content": "implementation(\"x:y:1.0\")", "source_type": "dependency_file"}]
+                    if fname == "app/buildSrc/dependencies.kt"
+                    else []
+                ),
+                CACHE=None,
+            )
+
+            messages = [{"role": "user", "content": "what dependencies are declared"}]
+            _msg, files_loaded = server._build_context_from_plan(messages, ["src/runtime_usage.kt"], "req-plan-auth")
+
+            self.assertIn("app/buildSrc/dependencies.kt", seen_chunks.get("files", []))
+            self.assertIn("app/buildSrc/dependencies.kt", files_loaded)
+        finally:
+            server._pack_context_section = original_pack
+
     def test_build_context_with_long_history_still_packs_without_overflow(self):
         server = self.server
         server.MODEL_CONTEXT_WINDOW = 1100
