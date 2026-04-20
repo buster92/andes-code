@@ -237,7 +237,7 @@ class TestServerStreamingDebugMode(unittest.TestCase):
         built = server._build_context(messages, "req123", debug_mode=False, return_debug=False)
         self.assertIn("REASONING POLICY", built[0]["content"])
         self.assertIn("High-Signal Performance Analysis Mode", built[0]["content"])
-        self.assertIn("Analyze only the provided structured execution paths", built[0]["content"])
+        self.assertIn("candidate hot-path hints", built[0]["content"])
 
     def test_extract_execution_paths_detects_rx_ui_and_metrics(self):
         server = self.server
@@ -261,7 +261,7 @@ class TestServerStreamingDebugMode(unittest.TestCase):
         self.assertIn("flatMap", " ".join(paths[0]["steps"]))
         self.assertEqual(paths[0]["risk"], "yes")
 
-    def test_pack_context_performance_query_prefers_structured_paths(self):
+    def test_pack_context_performance_query_keeps_structured_paths_and_raw_code_validation(self):
         server = self.server
         context, _info = server._pack_context_section(
             query="Why is RecyclerView scroll janky?",
@@ -276,8 +276,52 @@ class TestServerStreamingDebugMode(unittest.TestCase):
             request_id="req-test",
         )
         self.assertIn("## Structured Execution Paths", context)
+        self.assertIn("candidate execution-path hints", context)
         self.assertIn("execution frequency", context)
         self.assertIn("risk (main-thread blocking)", context)
+        self.assertIn("## Retrieved Code (Validation Context)", context)
+        self.assertIn("notifyDataSetChanged", context)
+
+    def test_pack_context_preserves_code_when_path_extraction_is_incomplete(self):
+        server = self.server
+        context, _info = server._pack_context_section(
+            query="Investigate performance and thread behavior",
+            map_section="",
+            chunks=[
+                {
+                    "file": "PoiRepository.kt",
+                    "content": (
+                        "fun loadPoi(): Observable<List<Poi>> {\n"
+                        "  return dataSource.fetchPoi()\n"
+                        "    .observeOn(AndroidSchedulers.mainThread())\n"
+                        "    .doOnNext { analytics.log(it.size) }\n"
+                        "}\n"
+                    ),
+                    "full_file": False,
+                }
+            ],
+            request_id="req-incomplete-path",
+        )
+        self.assertIn("## Retrieved Code (Validation Context)", context)
+        self.assertIn("AndroidSchedulers.mainThread", context)
+        self.assertIn("analytics.log", context)
+
+    def test_generic_call_heavy_code_does_not_mark_high_risk_source_of_truth(self):
+        server = self.server
+        chunks = [
+            {
+                "file": "Utils.kt",
+                "content": (
+                    "fun normalize(input: String): String {\n"
+                    "  return parse(trim(lowercase(hash(input))))\n"
+                    "}\n"
+                ),
+            }
+        ]
+        paths = server._extract_execution_paths(chunks, max_paths=5)
+        self.assertGreaterEqual(len(paths), 1)
+        self.assertEqual(paths[0]["risk"], "no")
+        self.assertNotIn("main (proven)", paths[0]["thread"])
 
     def test_streaming_still_emits_incremental_answer_tokens(self):
         server = self.server

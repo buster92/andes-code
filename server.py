@@ -85,8 +85,8 @@ _PERFORMANCE_QUERY_RE = re.compile(
 
 _HIGH_SIGNAL_PERFORMANCE_POLICY = (
     "High-Signal Performance Analysis Mode (auto-enforced for performance queries):\n"
-    "- Analyze only the provided structured execution paths.\n"
-    "- Do NOT reason from unstated code or architecture assumptions.\n"
+    "- Use structured execution paths first as candidate hot-path hints.\n"
+    "- Validate each candidate path against the supporting retrieved code snippets before final claims.\n"
     "- For each path finding, explicitly include:\n"
     "  a) execution frequency: once / per event / per frame\n"
     "  b) thread: main / background (mark proven vs inferred)\n"
@@ -934,7 +934,7 @@ def _render_execution_path_context(paths: list[dict]) -> str:
     lines = [
         "## Structured Execution Paths",
         "",
-        "_Use these paths as the sole basis for runtime/performance reasoning._",
+        "_These are candidate execution-path hints; verify with retrieved code context below._",
         "",
     ]
     for idx, path in enumerate(paths, start=1):
@@ -1037,15 +1037,9 @@ def _pack_context_section(
     packed = pack_chunks_to_budget(candidates, budget.context_budget_tokens)
     extracted_paths = _extract_execution_paths([c["chunk"] for c in packed.chunks], max_paths=5)
     path_section = _render_execution_path_context(extracted_paths) if _is_performance_query(query) else ""
-    code_section = path_section + "## Retrieved Code\n\n"
-    if extracted_paths:
-        for c in packed.chunks:
-            snippet = (c["chunk"].get("content", "") or "").strip().splitlines()
-            compact = "\n".join(snippet[: min(10, len(snippet))])
-            code_section += f"```{c['file']}\n{compact}\n```\n\n"
-    else:
-        for c in packed.chunks:
-            code_section += c["text"]
+    code_section = path_section + "## Retrieved Code (Validation Context)\n\n"
+    for c in packed.chunks:
+        code_section += c["text"]
     if packed.truncated:
         code_section += "\n_Context truncated to fit model window; highest-priority files were kept first._\n"
     has_authoritative = any(
