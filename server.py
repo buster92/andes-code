@@ -34,6 +34,7 @@ from andes_cache import (
     pack_chunks_to_budget,
 )
 from andes_cache.debug import resolve_debug_mode, env_debug_mode, format_debug_sse_event
+from andes_cache.source_of_truth import source_of_truth_guidance, is_declaration_query
 from andes_cache.routing import (
     classify_query_intent,
     classify_query_intent_details,
@@ -1021,6 +1022,8 @@ def _render_execution_path_context(paths: list[dict]) -> str:
 def _prioritize_chunk_candidates(
     chunks: list[dict],
     *,
+    query: str = "",
+    intent: str = "",
     anchor_files: list[str] | None = None,
     planned_files: list[str] | None = None,
     neighbor_files: list[str] | None = None,
@@ -1036,6 +1039,8 @@ def _prioritize_chunk_candidates(
         return any(Path(candidate).name == target_basename for candidate in candidates)
 
     prioritized = []
+    declaration_query = is_declaration_query(query, intent)
+    authoritative_source_types = {"manifest", "build_file", "dependency_file", "config_file"}
     for idx, chunk in enumerate(chunks):
         fname = chunk.get("file", "")
         if _matches(fname, anchor_set):
@@ -1059,9 +1064,14 @@ def _prioritize_chunk_candidates(
         full_file_note = f"_Full file retrieved: {fname}_\n" if chunk.get("full_file") else ""
         formatted = f"```{fname}\n{content}\n```\n\n"
         section_text = partial_note + full_file_note + formatted
+        authority_rank = 1
+        if declaration_query and chunk.get("source_type") in authoritative_source_types:
+            authority_rank = 0
+
         prioritized.append(
             {
                 "tier": tier,
+                "authority_rank": authority_rank,
                 "rank": idx,
                 "file": fname,
                 "chunk": chunk,
@@ -1069,7 +1079,7 @@ def _prioritize_chunk_candidates(
                 "est_tokens": estimate_tokens(section_text),
             }
         )
-    prioritized.sort(key=lambda c: (c["tier"], c["rank"], c["file"]))
+    prioritized.sort(key=lambda c: (c["tier"], c["authority_rank"], c["rank"], c["file"]))
     return prioritized
 
 
@@ -1095,8 +1105,11 @@ def _pack_context_section(
         reserved_response=CONTEXT_RESERVED_RESPONSE_TOKENS,
         safety_margin=CONTEXT_SAFETY_MARGIN_TOKENS,
     )
+    decl_query = is_declaration_query(query, intent="")
     candidates = _prioritize_chunk_candidates(
         chunks,
+        query=query,
+        intent="",
         anchor_files=anchor_files,
         planned_files=planned_files,
         neighbor_files=neighbor_files,
@@ -1110,11 +1123,23 @@ def _pack_context_section(
     if packed.truncated:
         code_section += "\n_Context truncated to fit model window; highest-priority files were kept first._\n"
     has_authoritative = any(
-        c["chunk"].get("source_type") in {"manifest", "build_file", "config_file"}
+        c["chunk"].get("source_type") in {"manifest", "build_file", "dependency_file", "config_file"}
         for c in packed.chunks
     )
     source_instruction = ""
-    if has_authoritative:
+    if decl_query:
+        source_instruction = source_of_truth_guidance(query, intent="") or (
+            "## Source-of-Truth Guidance\n"
+            "- Prefer declared/config/build sources before code references.\n"
+            "- Distinguish declared vs referenced vs inferred facts.\n"
+            "- If source-of-truth files are missing, state that explicitly.\n\n"
+        )
+        if not has_authoritative:
+            source_instruction += (
+                "- No authoritative declaration/config/build chunks were retrieved in this context; "
+                "state declaration files are missing before any inferred findings.\n\n"
+            )
+    elif has_authoritative:
         source_instruction = (
             "## Source-of-Truth Guidance\n"
             "- Prefer declared/config/build sources before code references.\n"

@@ -19,6 +19,8 @@ from andes_cache.source_of_truth import (
     classify_source_type,
     authority_level_for_source,
     wants_runtime_usage,
+    is_declaration_query,
+    source_of_truth_guidance,
 )
 from andes_cache.manager import AndesCacheManager
 from andes_cache.integrity import (
@@ -104,6 +106,17 @@ class TestSourceOfTruthBehavior(unittest.TestCase):
         self.assertIn("no androidmanifest.xml", msg)
         self.assertIn("cannot be confirmed", msg)
         self.assertIn("inferences", msg)
+
+
+    def test_dependency_queries_are_treated_as_declaration_questions(self):
+        self.assertTrue(is_declaration_query("what dependencies and versions are configured"))
+        self.assertTrue(is_declaration_query("where are build settings declared"))
+
+    def test_guidance_requires_declared_and_inferred_sections(self):
+        guidance = source_of_truth_guidance("what dependencies are declared in package.json")
+        self.assertIn("`Declared`", guidance)
+        self.assertIn("`Inferred from usage`", guidance)
+        self.assertIn("declaration files are missing", guidance)
 
     def test_runtime_fallback_requires_explicit_runtime_wording(self):
         self.assertFalse(wants_runtime_usage("what config does this service use"))
