@@ -309,6 +309,7 @@ class TestDirectRetrievalAuthoritative(unittest.TestCase):
         self.assertEqual(first_payload["retrieval"]["declaration_answer_mode"], second_payload["retrieval"]["declaration_answer_mode"])
         self.assertTrue(second_payload["retrieval"]["cache_hit"])
         self.assertEqual(len(second_payload["retrieval"]["selected_candidates"]), 3)
+        self.assertEqual(second_payload["retrieval"]["authority_retrieval_mode"], "direct_chunk_load")
 
     def test_cache_hit_non_authoritative_respects_smaller_n_results(self):
         indexer = _import_indexer_with_stubs()
@@ -353,6 +354,7 @@ class TestDirectRetrievalAuthoritative(unittest.TestCase):
         self.assertEqual(len(second_results), 1)
         self.assertTrue(second_payload["retrieval"]["cache_hit"])
         self.assertEqual(len(second_payload["retrieval"]["selected_candidates"]), 1)
+        self.assertEqual(second_payload["retrieval"]["authority_retrieval_mode"], "runtime_fallback_used")
         self.assertIn(
             second_payload["retrieval"]["declaration_answer_mode"],
             {"", "declared_only", "declared_plus_runtime", "declared_partial_only", "runtime_only_fallback", "missing_declarations"},

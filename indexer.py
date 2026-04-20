@@ -578,6 +578,11 @@ def search(
                 and len(authoritative_cached) > n_results
             )
             cached_visible = cached_final if preserve_authoritative_overflow else cached_final[:n_results]
+            cache_mode = "runtime_fallback_used"
+            if any(c.get("file") in {"__source_of_truth_missing__", "__source_of_truth_integrity__"} for c in cached_visible):
+                cache_mode = "workspace_only_detected_not_indexed"
+            elif authoritative_cached:
+                cache_mode = "direct_chunk_load"
             if payload is not None:
                 payload = populate_retrieval_snapshot(
                     payload,
@@ -585,7 +590,7 @@ def search(
                     raw_candidates=[c.get("file", "") for c in cached_visible],
                     cache_hit=True,
                 )
-                _update_authoritative_debug(cached_visible, mode="direct_chunk_load", reason="cache hit")
+                _update_authoritative_debug(cached_visible, mode=cache_mode, reason="cache hit")
                 payload_out = finalize_payload(payload, cached_visible)
                 payload_out = apply_failure_signals(
                     payload_out,
