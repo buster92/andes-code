@@ -807,12 +807,17 @@ def _build_context(
             return (base, retrieval_debug) if return_debug else base
 
         anchor_files = _extract_anchor_files(query)
+        authoritative_files = []
+        if ws:
+            authoritative_files.extend(ws.get("manifests", []) or [])
+            authoritative_files.extend((ws.get("config_graph", {}) or {}).get("config_files", []) or [])
         code_section, packing_info = _pack_context_section(
             query=query,
             map_section=map_section,
             chunks=chunks,
             anchor_files=anchor_files,
             conversation_messages=[m for m in messages if m.get("role") != "system"],
+            authoritative_files=authoritative_files,
             request_id=request_id,
         )
 
@@ -1083,6 +1088,111 @@ def _prioritize_chunk_candidates(
     return prioritized
 
 
+def _file_matches_authoritative(path: str, authoritative_files: set[str]) -> bool:
+    if not path or not authoritative_files:
+        return False
+    if path in authoritative_files:
+        return True
+    base = Path(path).name
+    return any(Path(p).name == base for p in authoritative_files)
+
+
+def _authoritative_preference_key(path: str, source_type: str) -> tuple[int, int, int, int, str]:
+    lower = (path or "").lower()
+    is_shared = 1 if "buildsrc/" in lower else 0
+    is_module_local = 0 if "/" in (path or "").replace("\\", "/") else 1
+    is_build_like = 0 if source_type in {"build_file", "dependency_file"} else 1
+    depth = lower.count("/")
+    return (is_shared, is_module_local, is_build_like, depth, lower)
+
+
+def _make_forced_authoritative_candidate(candidate: dict, max_chars: int = 1200) -> dict:
+    """Force-packable authoritative candidate: partial chunk if original is too large."""
+    out = dict(candidate)
+    chunk = dict(candidate.get("chunk", {}))
+    text = chunk.get("content", "") or ""
+    if len(text) > max_chars:
+        chunk["content"] = text[:max_chars]
+        chunk["coverage"] = {
+            "partial": True,
+            "returned": 1,
+            "total": max(chunk.get("coverage", {}).get("total", 1), 2),
+        }
+        out["chunk"] = chunk
+        forced_text = (
+            "⚠️ Partial authoritative excerpt forced into context to preserve declaration source-of-truth.\n"
+            f"```{chunk.get('file', '')}\n{chunk['content']}\n```\n\n"
+        )
+        out["text"] = forced_text
+        out["est_tokens"] = estimate_tokens(forced_text)
+    out["tier"] = -1
+    out["authority_rank"] = -1
+    return out
+
+
+def _enforce_authoritative_candidate(
+    *,
+    candidates: list[dict],
+    authoritative_files: list[str] | None,
+    budget_tokens: int,
+) -> tuple[list[dict], dict | None]:
+    authoritative_set = set(authoritative_files or [])
+    authoritative_candidates = [
+        c
+        for c in candidates
+        if c.get("chunk", {}).get("source_type") in {"manifest", "build_file", "dependency_file", "config_file"}
+        and (
+            not authoritative_set
+            or _file_matches_authoritative(c.get("file", ""), authoritative_set)
+        )
+    ]
+    if not authoritative_candidates:
+        # If project-map authoritative set exists but retrieval didn't return any, this is a true retrieval miss.
+        return candidates, None
+
+    selected = sorted(
+        authoritative_candidates,
+        key=lambda c: _authoritative_preference_key(c.get("file", ""), c.get("chunk", {}).get("source_type", "")),
+    )[0]
+    forced = _make_forced_authoritative_candidate(selected, max_chars=1200)
+    if budget_tokens > 0:
+        for max_chars in (420, 180, 80, 24):
+            if forced.get("est_tokens", 0) <= budget_tokens:
+                break
+            forced = _make_forced_authoritative_candidate(selected, max_chars=max_chars)
+        if forced.get("est_tokens", 0) > budget_tokens:
+            chunk = dict(selected.get("chunk", {}))
+            chunk["content"] = (chunk.get("content", "") or "")[:24]
+            forced_text = (
+                "⚠️ Authoritative declaration file forced into context (minimal excerpt).\n"
+                f"`{chunk.get('file', '')}`\n\n"
+            )
+            forced = {
+                **selected,
+                "chunk": chunk,
+                "text": forced_text,
+                "est_tokens": estimate_tokens(forced_text),
+                "tier": -1,
+                "authority_rank": -1,
+            }
+        forced["est_tokens"] = min(int(forced.get("est_tokens", 1)), max(1, budget_tokens))
+    updated: list[dict] = []
+    replaced = False
+    for c in candidates:
+        if (
+            not replaced
+            and c.get("file") == selected.get("file")
+            and c.get("rank") == selected.get("rank")
+        ):
+            updated.append(forced)
+            replaced = True
+        else:
+            updated.append(c)
+    if not replaced:
+        updated = [forced] + candidates
+    return updated, forced.get("chunk", {})
+
+
 def _pack_context_section(
     *,
     query: str,
@@ -1092,6 +1202,7 @@ def _pack_context_section(
     planned_files: list[str] | None = None,
     neighbor_files: list[str] | None = None,
     conversation_messages: list[dict] | None = None,
+    authoritative_files: list[str] | None = None,
     request_id: str,
 ) -> tuple[str, dict]:
     conversation_text = _messages_to_prompt(
@@ -1114,6 +1225,13 @@ def _pack_context_section(
         planned_files=planned_files,
         neighbor_files=neighbor_files,
     )
+    forced_authoritative_chunk = None
+    if decl_query:
+        candidates, forced_authoritative_chunk = _enforce_authoritative_candidate(
+            candidates=candidates,
+            authoritative_files=authoritative_files,
+            budget_tokens=budget.context_budget_tokens,
+        )
     packed = pack_chunks_to_budget(candidates, budget.context_budget_tokens)
     extracted_paths = _extract_execution_paths([c["chunk"] for c in packed.chunks], max_paths=5)
     path_section = _render_execution_path_context(extracted_paths) if _is_performance_query(query) else ""
@@ -1126,6 +1244,8 @@ def _pack_context_section(
         c["chunk"].get("source_type") in {"manifest", "build_file", "dependency_file", "config_file"}
         for c in packed.chunks
     )
+    if decl_query and forced_authoritative_chunk and not has_authoritative:
+        has_authoritative = True
     source_instruction = ""
     if decl_query:
         source_instruction = source_of_truth_guidance(query, intent="") or (
@@ -1168,6 +1288,7 @@ def _pack_context_section(
         "kept_files": packed.kept_files,
         "dropped_files": packed.dropped_files,
         "packed_chunks_raw": [c["chunk"] for c in packed.chunks],
+        "forced_authoritative_file": (forced_authoritative_chunk or {}).get("file"),
     }
 
 def _plan_files(query: str, pmap: dict) -> list[str]:
@@ -1381,6 +1502,10 @@ def _build_context_from_plan(
         return (messages, [], debug_payload) if return_debug else (messages, [])
 
     anchor_files = _extract_anchor_files(query)
+    authoritative_files = []
+    if workspace:
+        authoritative_files.extend(workspace.get("manifests", []) or [])
+        authoritative_files.extend((workspace.get("config_graph", {}) or {}).get("config_files", []) or [])
     code_section, packing_info = _pack_context_section(
         query=query,
         map_section=map_section,
@@ -1389,6 +1514,7 @@ def _build_context_from_plan(
         planned_files=planned_files,
         neighbor_files=neighbor_files,
         conversation_messages=[m for m in messages if m.get("role") != "system"],
+        authoritative_files=authoritative_files,
         request_id=request_id,
     )
 

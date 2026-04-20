@@ -218,6 +218,35 @@ class TestContextBudgeting(unittest.TestCase):
         self.assertIn("build.gradle.kts", info["kept_files"])
         self.assertNotIn("src/runtime_usage.py", info["kept_files"])
 
+    def test_declaration_queries_force_include_authoritative_chunk_before_trim(self):
+        server = self.server
+        server.MODEL_CONTEXT_WINDOW = 860
+        chunks = [
+            {
+                "file": "app/src/runtime_usage.kt",
+                "content": "u" * 320,
+                "source_type": "source_code",
+            },
+            {
+                "file": "app/buildSrc/dependencies.kt",
+                "content": "d" * 5000,
+                "source_type": "dependency_file",
+            },
+        ]
+
+        context, info = server._pack_context_section(
+            query="what dependencies are declared for this module",
+            map_section="",
+            chunks=chunks,
+            authoritative_files=["app/buildSrc/dependencies.kt"],
+            request_id="req-force-authoritative",
+        )
+
+        self.assertGreaterEqual(info["packed_chunks"], 1)
+        self.assertIn("app/buildSrc/dependencies.kt", info["kept_files"])
+        self.assertIn("dependencies.kt", context)
+        self.assertEqual(info.get("forced_authoritative_file"), "app/buildSrc/dependencies.kt")
+
     def test_build_context_with_long_history_still_packs_without_overflow(self):
         server = self.server
         server.MODEL_CONTEXT_WINDOW = 1100
