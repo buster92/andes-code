@@ -88,15 +88,26 @@ _HIGH_SIGNAL_PERFORMANCE_POLICY = (
     "- Analyze only interaction-time code paths (scroll, gesture handling, frame updates).\n"
     "- For each finding, explicitly include:\n"
     "  a) execution frequency: once / per event / per frame\n"
-    "  b) thread: main / background\n"
+    "  b) thread: include evidence class\n"
     "  c) relative cost: low / medium / high\n"
+    "  d) evidence class tags on claims: PROVEN / INFERRED / SPECULATIVE\n"
+    "- Classification rules (strict):\n"
+    "  * PROVEN = directly visible in retrieved code.\n"
+    "  * INFERRED = framework behavior or partial evidence.\n"
+    "  * SPECULATIVE = requires runtime confirmation or missing context.\n"
+    "  * Thread execution MUST NOT be PROVEN unless full Rx/Coroutine chain is visible.\n"
+    "  * If thread is inferred from patterns (e.g., observeOn(AndroidSchedulers.mainThread())), mark INFERRED.\n"
+    "  * Any performance impact claim (frame drops/jank/etc.) is SPECULATIVE unless measured evidence is shown.\n"
     "- Ignore architecture-only explanations (DI, repository, use case) and lifecycle-only setup (onCreate/init/setup).\n"
     "- Keep only hot paths: high frequency AND non-trivial cost.\n"
     "- Rank findings by (frequency × cost × thread impact) in descending order.\n"
     "- Return only top relevant items (3–5 max).\n"
-    "- Every finding must include a causal chain in this format:\n"
-    "  data flow → execution → UI impact\n"
-    "  Example: ViewModel emit → Fragment accept → adapter update → RecyclerView bind → frame drop.\n"
+    "- Every finding must include a causal chain with explicit separation:\n"
+    "  Code path: data flow → execution\n"
+    "  Predicted UI impact: <impact> (SPECULATIVE unless measured)\n"
+    "  Example:\n"
+    "  Code path: ViewModel emit (PROVEN) → adapter update (PROVEN) → RecyclerView bind (INFERRED)\n"
+    "  Predicted UI impact: May drop frames (SPECULATIVE, depends on runtime profile).\n"
     "- Before finalizing, remove any finding that is infrequent or negligible cost.\n"
     "- If no high-signal findings remain, explicitly say: No high-signal hot paths found."
 )
@@ -166,11 +177,67 @@ def _validate_high_signal_output(text: str, enabled: bool) -> tuple[str, int]:
         if has_architecture and not has_hot_path:
             filtered_out += 1
             continue
-        kept_blocks.append(block)
+        kept_blocks.append(_annotate_high_signal_block(block))
 
     if not kept_blocks:
         return "No high-signal hot paths found.", filtered_out
     return "\n\n".join(kept_blocks).strip(), filtered_out
+
+
+def _annotate_high_signal_block(block: str) -> str:
+    """Nudge performance findings toward explicit evidence-class labeling."""
+    lines = block.splitlines()
+    out: list[str] = []
+    class_marker_re = re.compile(r"\b(PROVEN|INFERRED|SPECULATIVE)\b", re.IGNORECASE)
+    thread_line_re = re.compile(r"^(\s*[-*]?\s*thread\s*:\s*)(.+)$", re.IGNORECASE)
+    impact_line_re = re.compile(r"^(\s*[-*]?\s*(?:impact|ui impact|predicted ui impact)\s*:\s*)(.+)$", re.IGNORECASE)
+    impact_keywords_re = re.compile(r"\b(frame\s*drops?|jank|stutter|slow|lag|fps)\b", re.IGNORECASE)
+    main_thread_hint_re = re.compile(r"\b(main|ui)\s*thread\b|\bmain\b|\bui\b", re.IGNORECASE)
+
+    for line in lines:
+        if class_marker_re.search(line):
+            out.append(line)
+            continue
+
+        thread_match = thread_line_re.match(line)
+        if thread_match:
+            prefix, value = thread_match.groups()
+            if main_thread_hint_re.search(value):
+                out.append(
+                    f"{prefix}Likely Main Thread (INFERRED from thread-affinity pattern; full Rx/Coroutine chain not fully visible)"
+                )
+            else:
+                out.append(
+                    f"{prefix}Likely {value.strip()} (INFERRED from partial code evidence)"
+                )
+            continue
+
+        impact_match = impact_line_re.match(line)
+        if impact_match:
+            prefix, value = impact_match.groups()
+            candidate = value.strip()
+            if candidate:
+                lowered = candidate.lower()
+                if lowered.startswith("causes "):
+                    candidate = f"May cause {candidate[7:]}"
+                elif lowered.startswith("cause "):
+                    candidate = f"May cause {candidate[6:]}"
+                elif not lowered.startswith("may "):
+                    candidate = f"May {candidate[0].lower() + candidate[1:]}"
+            else:
+                candidate = "May impact UI smoothness"
+            out.append(
+                f"{prefix}{candidate} (SPECULATIVE, requires runtime profiling/measurement)"
+            )
+            continue
+
+        if impact_keywords_re.search(line):
+            out.append(f"{line} (SPECULATIVE, predicted UI impact)")
+            continue
+
+        out.append(line)
+
+    return "\n".join(out)
 
 
 def _index_phase_log(source: str, phase: str, **fields) -> None:
