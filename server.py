@@ -84,13 +84,15 @@ _PERFORMANCE_QUERY_RE = re.compile(
 )
 
 _HIGH_SIGNAL_PERFORMANCE_POLICY = (
-    "High-Signal Performance Analysis Mode (auto-enforced for performance queries):\n"
-    "- Analyze only interaction-time code paths (scroll, gesture handling, frame updates).\n"
-    "- For each finding, explicitly include:\n"
+      "High-Signal Performance Analysis Mode (auto-enforced for performance queries):\n"
+    "- Use structured execution paths first as candidate hot-path hints.\n"
+    "- Validate each candidate path against the supporting retrieved code snippets before final claims.\n"
+    "- For each path finding, explicitly include:\n"
     "  a) execution frequency: once / per event / per frame\n"
-    "  b) thread: include evidence class\n"
+    "  b) thread: main / background (mark proven vs inferred)\n"
     "  c) relative cost: low / medium / high\n"
-    "  d) evidence class tags on claims: PROVEN / INFERRED / SPECULATIVE\n"
+    "  d) risk: main-thread blocking risk yes/no with rationale\n"
+    "  e) evidence class tags on claims: PROVEN / INFERRED / SPECULATIVE\n"
     "- Classification rules (strict):\n"
     "  * PROVEN = directly visible in retrieved code.\n"
     "  * INFERRED = framework behavior or partial evidence.\n"
@@ -98,6 +100,7 @@ _HIGH_SIGNAL_PERFORMANCE_POLICY = (
     "  * Thread execution MUST NOT be PROVEN unless full Rx/Coroutine chain is visible.\n"
     "  * If thread is inferred from patterns (e.g., observeOn(AndroidSchedulers.mainThread())), mark INFERRED.\n"
     "  * Any performance impact claim (frame drops/jank/etc.) is SPECULATIVE unless measured evidence is shown.\n"
+    "- Explicitly map each path step to cost contribution (which step is expensive and why).\n"
     "- Ignore architecture-only explanations (DI, repository, use case) and lifecycle-only setup (onCreate/init/setup).\n"
     "- Keep only hot paths: high frequency AND non-trivial cost.\n"
     "- Rank findings by (frequency × cost × thread impact) in descending order.\n"
@@ -846,6 +849,20 @@ def _build_context(
 # ── Two-step planning ─────────────────────────────────────────────────────────
 
 _FILENAME_HINT_RE = re.compile(r"[\w./-]+\.(?:py|kt|java|js|ts|tsx|jsx|go|rs|swift|cpp|c|h|hpp|json|yaml|yml|toml|gradle|xml|md)")
+_CALL_RE = re.compile(r"(?<!\w)([A-Za-z_]\w*)\s*\(")
+_RX_CHAIN_RE = re.compile(r"\.(map|flatMap|zip|observeOn|subscribeOn)\s*(?:\(|\{)")
+_UI_UPDATE_RE = re.compile(
+    r"\b("
+    r"submitList|notifyDataSetChanged|notifyItem(?:Inserted|Removed|Changed|RangeChanged)"
+    r"|setText|setVisibility|setImage|setAdapter|invalidate|requestLayout|postInvalidate"
+    r")\b"
+)
+_ENTRYPOINT_RE = re.compile(r"\b(onScroll|onScrolled|onTouch|onClick|onBindViewHolder|onChanged|doFrame)\b")
+_MAIN_THREAD_RE = re.compile(r"AndroidSchedulers\.mainThread|Dispatchers\.Main|runOnUiThread")
+_BACKGROUND_THREAD_RE = re.compile(r"Schedulers\.(io|computation|newThread)|Dispatchers\.(IO|Default)")
+_EXCLUDED_CALL_NAMES = {
+    "if", "for", "while", "switch", "catch", "return", "when", "else", "try", "synchronized", "super", "this"
+}
 
 
 def _extract_anchor_files(query: str) -> list[str]:
@@ -858,6 +875,147 @@ def _extract_anchor_files(query: str) -> list[str]:
             seen.add(match)
             anchors.append(match)
     return anchors
+
+
+def _clean_step_name(raw: str) -> str:
+    return raw.strip().split(".")[-1].strip()
+
+
+def _derive_path_metrics(steps: list[str], snippet_blob: str) -> tuple[str, str, str, str]:
+    normalized = " ".join(steps).lower() + " " + snippet_blob.lower()
+    if any(k in normalized for k in ("onscroll", "onscrolled", "doframe", "onbindviewholder", "recyclerview", "bind")):
+        frequency = "per frame"
+    elif any(k in normalized for k in ("onclick", "ontouch", "gesture", "input", "onchanged")):
+        frequency = "per event"
+    elif any(k in normalized for k in ("oncreate", "init", "setup")):
+        frequency = "once"
+    else:
+        frequency = "per event"
+
+    if _MAIN_THREAD_RE.search(snippet_blob):
+        thread = "main (proven)"
+        thread_main = True
+    elif _BACKGROUND_THREAD_RE.search(snippet_blob):
+        thread = "background (proven)"
+        thread_main = False
+    elif any(_UI_UPDATE_RE.search(step) for step in steps):
+        thread = "main (inferred)"
+        thread_main = True
+    else:
+        thread = "background (inferred)"
+        thread_main = False
+
+    has_rx = any(("flatmap" in s.lower()) or ("zip" in s.lower()) for s in steps)
+    has_ui_heavy = any(k in normalized for k in ("notifydatasetchanged", "onbindviewholder", "submitlist", "bind"))
+    if frequency == "per frame" and (has_rx or has_ui_heavy or len(steps) >= 4):
+        cost = "high"
+    elif has_rx or has_ui_heavy or len(steps) >= 4:
+        cost = "medium"
+    else:
+        cost = "low"
+
+    risk = "yes" if thread_main and cost in {"medium", "high"} and frequency in {"per frame", "per event"} else "no"
+    return frequency, thread, cost, risk
+
+
+def _extract_execution_paths(chunks: list[dict], *, max_paths: int = 5) -> list[dict]:
+    paths: list[dict] = []
+    for chunk in chunks:
+        content = chunk.get("content", "")
+        if not content:
+            continue
+        file_name = chunk.get("file", "unknown")
+        steps: list[str] = []
+        snippets: list[str] = []
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            if _ENTRYPOINT_RE.search(line):
+                entry = _ENTRYPOINT_RE.search(line).group(0)
+                steps.append(entry)
+                snippets.append(raw_line[:160])
+
+            for rx in _RX_CHAIN_RE.findall(line):
+                steps.append(rx)
+                snippets.append(raw_line[:160])
+
+            if _UI_UPDATE_RE.search(line):
+                ui_step = _UI_UPDATE_RE.search(line).group(0)
+                steps.append(ui_step)
+                snippets.append(raw_line[:160])
+
+            if "->" in line:
+                parts = [p.strip() for p in line.split("->") if p.strip()]
+                steps.extend(parts[:2])
+                snippets.append(raw_line[:160])
+
+            for call in _CALL_RE.findall(line):
+                if call in _EXCLUDED_CALL_NAMES:
+                    continue
+                steps.append(call)
+                snippets.append(raw_line[:160])
+
+        dedup_steps: list[str] = []
+        seen_steps = set()
+        for step in steps:
+            cleaned = _clean_step_name(step)
+            key = cleaned.lower()
+            if not cleaned or key in seen_steps:
+                continue
+            seen_steps.add(key)
+            dedup_steps.append(cleaned)
+
+        if len(dedup_steps) < 2:
+            continue
+
+        path_steps = dedup_steps[:6]
+        snippet_text = content + "\n" + "\n".join(snippets[:4])
+        frequency, thread, cost, risk = _derive_path_metrics(path_steps, snippet_text)
+        paths.append(
+            {
+                "file": file_name,
+                "steps": path_steps,
+                "frequency": frequency,
+                "thread": thread,
+                "cost": cost,
+                "risk": risk,
+                "snippets": snippets[:3],
+            }
+        )
+
+    def _rank(path: dict) -> tuple[int, int, int]:
+        freq_rank = {"per frame": 3, "per event": 2, "once": 1}.get(path["frequency"], 1)
+        cost_rank = {"high": 3, "medium": 2, "low": 1}.get(path["cost"], 1)
+        risk_rank = 2 if path["risk"] == "yes" else 1
+        return (freq_rank, cost_rank, risk_rank)
+
+    paths.sort(key=_rank, reverse=True)
+    return paths[:max(3, min(max_paths, 5))]
+
+
+def _render_execution_path_context(paths: list[dict]) -> str:
+    if not paths:
+        return ""
+    lines = [
+        "## Structured Execution Paths",
+        "",
+        "_These are candidate execution-path hints; verify with retrieved code context below._",
+        "",
+    ]
+    for idx, path in enumerate(paths, start=1):
+        chain = " → ".join(path["steps"])
+        lines.append(f"Path {idx}: {chain}")
+        lines.append(f"- execution frequency: {path['frequency']}")
+        lines.append(f"- thread: {path['thread']}")
+        lines.append(f"- cost (relative): {path['cost']}")
+        lines.append(f"- risk (main-thread blocking): {path['risk']}")
+        lines.append("- supporting snippets:")
+        for snippet in path["snippets"]:
+            lines.append(f"  - `{snippet}`")
+        lines.append("")
+    return "\n".join(lines).strip() + "\n\n"
 
 
 def _prioritize_chunk_candidates(
@@ -944,7 +1102,9 @@ def _pack_context_section(
         neighbor_files=neighbor_files,
     )
     packed = pack_chunks_to_budget(candidates, budget.context_budget_tokens)
-    code_section = "## Retrieved Code\n\n"
+    extracted_paths = _extract_execution_paths([c["chunk"] for c in packed.chunks], max_paths=5)
+    path_section = _render_execution_path_context(extracted_paths) if _is_performance_query(query) else ""
+    code_section = path_section + "## Retrieved Code (Validation Context)\n\n"
     for c in packed.chunks:
         code_section += c["text"]
     if packed.truncated:
