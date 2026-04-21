@@ -113,6 +113,67 @@ class TestServerStreamingDebugMode(unittest.TestCase):
         try:
             self.assertTrue(self.server._resolve_request_debug_mode(True))
             self.assertFalse(self.server._resolve_request_debug_mode(False))
+            self.assertTrue(self.server._resolve_request_debug_mode("true"))
+            self.assertFalse(self.server._resolve_request_debug_mode("false"))
+        finally:
+            if prev is not None:
+                os.environ["ANDESCODE_DEBUG_MODE"] = prev
+
+    def test_env_debug_mode_enables_debug_payload_in_build_context(self):
+        server = self.server
+        prev = os.environ.get("ANDESCODE_DEBUG_MODE")
+        os.environ["ANDESCODE_DEBUG_MODE"] = "1"
+        try:
+            server.INDEXER_READY = True
+            server._indexer_module = types.SimpleNamespace(
+                _load_project_map=lambda: {},
+                _load_workspace_index=lambda: {},
+                get_repo_fingerprint=lambda: "",
+                CACHE=None,
+            )
+            server.search_codebase = lambda *_args, **_kwargs: (
+                [{"file": "src/main.py", "content": "print('ok')"}],
+                {"query": "inspect this path", "retrieval": {"files_retrieved": ["src/main.py"]}},
+            )
+            messages, debug_payload = server._build_context(
+                [{"role": "user", "content": "inspect this path"}],
+                "req123",
+                debug_mode=server._resolve_request_debug_mode(None),
+                return_debug=True,
+            )
+            self.assertTrue(messages)
+            self.assertIsNotNone(debug_payload)
+            self.assertEqual(debug_payload["query"], "inspect this path")
+        finally:
+            if prev is None:
+                os.environ.pop("ANDESCODE_DEBUG_MODE", None)
+            else:
+                os.environ["ANDESCODE_DEBUG_MODE"] = prev
+
+    def test_request_debug_flag_enables_debug_payload_in_build_context(self):
+        server = self.server
+        prev = os.environ.pop("ANDESCODE_DEBUG_MODE", None)
+        try:
+            server.INDEXER_READY = True
+            server._indexer_module = types.SimpleNamespace(
+                _load_project_map=lambda: {},
+                _load_workspace_index=lambda: {},
+                get_repo_fingerprint=lambda: "",
+                CACHE=None,
+            )
+            server.search_codebase = lambda *_args, **_kwargs: (
+                [{"file": "src/main.py", "content": "print('ok')"}],
+                {"query": "why is routing wrong", "retrieval": {"files_retrieved": ["src/main.py"]}},
+            )
+            messages, debug_payload = server._build_context(
+                [{"role": "user", "content": "why is routing wrong"}],
+                "req123",
+                debug_mode=server._resolve_request_debug_mode(True),
+                return_debug=True,
+            )
+            self.assertTrue(messages)
+            self.assertIsNotNone(debug_payload)
+            self.assertEqual(debug_payload["query"], "why is routing wrong")
         finally:
             if prev is not None:
                 os.environ["ANDESCODE_DEBUG_MODE"] = prev
