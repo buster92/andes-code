@@ -569,6 +569,14 @@ def search(
         payload["retrieval"]["route_taken"] = retrieval_route
         _update_authoritative_debug([], mode="semantic_fallback_blocked")
     repo_fp = get_repo_fingerprint()
+    # For declaration queries, check whether the startup integrity probe flagged
+    # the index as unhealthy. If so, skip the retrieval cache entirely so the
+    # live path can attempt repair/best-effort rather than serving a stale result.
+    _startup_probe_unhealthy = False
+    if decl_query:
+        _probe = get_startup_integrity_probe()
+        _startup_probe_unhealthy = bool(_probe.get("warning_active", False))
+
     if repo_fp:
         cached = CACHE.retrieval_get(
             repo_fp=repo_fp,
@@ -577,45 +585,58 @@ def search(
             intent=intent,
             retrieval_route=retrieval_route,
         )
+        if cached and _startup_probe_unhealthy:
+            cached = None  # index health signal overrides stale cache
         if cached:
             cached_final = list(cached)
-            authoritative_source_types = {"manifest", "build_file", "dependency_file", "config_file"}
-            authoritative_cached = [
-                c
-                for c in cached_final
-                if c.get("source_type") in authoritative_source_types
-                or _matches_authoritative(c.get("file", ""))
-            ]
-            preserve_authoritative_overflow = (
+            _failure_file_markers = {"__source_of_truth_missing__", "__source_of_truth_integrity__"}
+            # Bypass stale failure caches: if this is a declaration query and every cached
+            # chunk is a failure/limitation marker, skip the cache and retry live retrieval.
+            _cached_all_failures = (
                 decl_query
-                and len(cached_final) > n_results
-                and len(authoritative_cached) > n_results
+                and cached_final
+                and all(c.get("file") in _failure_file_markers for c in cached_final)
             )
-            cached_visible = cached_final if preserve_authoritative_overflow else cached_final[:n_results]
-            cache_mode = "runtime_fallback_used"
-            if any(c.get("file") in {"__source_of_truth_missing__", "__source_of_truth_integrity__"} for c in cached_visible):
-                cache_mode = "workspace_only_detected_not_indexed"
-            elif authoritative_cached:
-                cache_mode = "direct_chunk_load"
-            if payload is not None:
-                payload = populate_retrieval_snapshot(
-                    payload,
-                    chunks=cached_visible,
-                    raw_candidates=[c.get("file", "") for c in cached_visible],
-                    cache_hit=True,
+            if _cached_all_failures:
+                cached = None  # fall through to live retrieval below
+            else:
+                authoritative_source_types = {"manifest", "build_file", "dependency_file", "config_file"}
+                authoritative_cached = [
+                    c
+                    for c in cached_final
+                    if c.get("source_type") in authoritative_source_types
+                    or _matches_authoritative(c.get("file", ""))
+                ]
+                preserve_authoritative_overflow = (
+                    decl_query
+                    and len(cached_final) > n_results
+                    and len(authoritative_cached) > n_results
                 )
-                _update_authoritative_debug(cached_visible, mode=cache_mode, reason="cache hit")
-                payload_out = finalize_payload(payload, cached_visible)
-                payload_out = apply_failure_signals(
-                    payload_out,
-                    query=query,
-                    intent=intent,
-                    retrieval_route=retrieval_route,
-                    top_score=None,
-                    final_chunks=cached_visible,
-                )
-                return _ret(cached_visible, payload_out)
-            return _ret(cached_visible)
+                cached_visible = cached_final if preserve_authoritative_overflow else cached_final[:n_results]
+                cache_mode = "runtime_fallback_used"
+                if any(c.get("file") in _failure_file_markers for c in cached_visible):
+                    cache_mode = "workspace_only_detected_not_indexed"
+                elif authoritative_cached:
+                    cache_mode = "direct_chunk_load"
+                if payload is not None:
+                    payload = populate_retrieval_snapshot(
+                        payload,
+                        chunks=cached_visible,
+                        raw_candidates=[c.get("file", "") for c in cached_visible],
+                        cache_hit=True,
+                    )
+                    _update_authoritative_debug(cached_visible, mode=cache_mode, reason="cache hit")
+                    payload_out = finalize_payload(payload, cached_visible)
+                    payload_out = apply_failure_signals(
+                        payload_out,
+                        query=query,
+                        intent=intent,
+                        retrieval_route=retrieval_route,
+                        top_score=None,
+                        final_chunks=cached_visible,
+                    )
+                    return _ret(cached_visible, payload_out)
+                return _ret(cached_visible)
 
     if retrieval_route == "source_of_truth":
         final = _retrieve_config_first(
@@ -627,7 +648,9 @@ def search(
             strict_authority_mode=decision.get("strict_authority_mode", True),
             debug_payload=payload,
         )
-        if repo_fp and final:
+        _failure_markers = {"__source_of_truth_missing__", "__source_of_truth_integrity__"}
+        _result_is_failure = final and all(c.get("file") in _failure_markers for c in final)
+        if repo_fp and final and not _result_is_failure:
             CACHE.retrieval_set(
                 repo_fp=repo_fp,
                 query=query,
@@ -824,12 +847,12 @@ def search(
                 "_rank": 1.0,
                 "full_file": True,
                 "coverage": {"returned": 1, "total": 1, "partial": False},
-                "source_type": "inferred",
-                "authority_level": "inferred",
+                "source_type": "meta",
+                "authority_level": "notice",
             }
             final = [limitation]
             final = _add_coverage(final)
-            final = annotate_sources(final, source_type="inferred", authority_level="inferred")
+            final = annotate_sources(final, source_type="meta", authority_level="notice")
             if payload is not None:
                 payload = populate_retrieval_snapshot(
                     payload,
@@ -875,7 +898,7 @@ def search(
     if decl_query and not authoritative_files_required:
         _no_auth_notice = {
             "content": (
-                "# No Dependency Declaration Files Found in Workspace\n"
+                "# No Declaration Files\n"
                 "- No dependency declaration files (build.gradle, package.json, "
                 "requirements.txt, pyproject.toml, Cargo.toml, go.mod, pom.xml, etc.) "
                 "were discovered in the indexed workspace metadata.\n"
@@ -891,8 +914,8 @@ def search(
             "_rank": 1.0,
             "full_file": True,
             "coverage": {"returned": 1, "total": 1, "partial": False},
-            "source_type": "inferred",
-            "authority_level": "inferred",
+            "source_type": "meta",
+            "authority_level": "notice",
         }
         final_ranked = [_no_auth_notice] + final_ranked
         if payload is not None:
@@ -1657,7 +1680,7 @@ def _retrieve_config_first(
             # be slightly out of sync, but the declared data is real.
             stale_caveat = {
                 "content": (
-                    "# Index Integrity Notice\n"
+                    "# Source-of-Truth Limitation\n"
                     "- Dependency declaration files were retrieved from a potentially stale index.\n"
                     "- The content below is from authoritative build/manifest files and represents "
                     "declared dependencies, but the index should be refreshed for full accuracy.\n"
@@ -1669,8 +1692,8 @@ def _retrieve_config_first(
                 "_rank": 1.0,
                 "full_file": True,
                 "coverage": {"returned": 1, "total": 1, "partial": False},
-                "source_type": "inferred",
-                "authority_level": "inferred",
+                "source_type": "meta",
+                "authority_level": "notice",
             }
             if debug_payload is not None:
                 debug_payload["source_of_truth"]["integrity"]["best_effort_fallback"] = True
@@ -1682,7 +1705,7 @@ def _retrieve_config_first(
         # Genuine failure: discovered in workspace but not retrievable even with best-effort.
         limitation = {
             "content": (
-                "# Source-of-Truth Index Integrity Limitation\n"
+                "# Source-of-Truth Limitation\n"
                 "- The file was discovered in workspace metadata, but the current index could not retrieve it.\n"
                 "- The index appears stale or incomplete for authoritative file retrieval.\n"
                 "- AndesCode attempted targeted repair for authoritative files before returning this limitation.\n"
@@ -1694,8 +1717,8 @@ def _retrieve_config_first(
             "_rank": 1.0,
             "full_file": True,
             "coverage": {"returned": 1, "total": 1, "partial": False},
-            "source_type": "inferred",
-            "authority_level": "inferred",
+            "source_type": "meta",
+            "authority_level": "notice",
         }
         if debug_payload is not None:
             debug_payload["failure_signals"]["expected_but_missing_authority"] = True
@@ -1815,8 +1838,8 @@ def _retrieve_config_first(
         "_rank": 1.0,
         "full_file": True,
         "coverage": {"returned": 1, "total": 1, "partial": False},
-        "source_type": "inferred",
-        "authority_level": "inferred",
+        "source_type": "meta",
+        "authority_level": "notice",
     }
     if (
         not strict_authority_mode

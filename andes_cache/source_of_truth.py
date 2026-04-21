@@ -253,15 +253,15 @@ def wants_runtime_usage(query: str) -> bool:
 def missing_manifest_notice() -> dict:
     return {
         "content": (
-            "# Manifest Availability\n"
+            "# Source-of-Truth Limitation\n"
             "- No AndroidManifest.xml was found in indexed source-of-truth files.\n"
             "- Declared permissions cannot be confirmed.\n"
             "- Any fallback findings below are references/inferences, not declarations."
         ),
         "file": "__manifest_status__",
         "language": "meta",
-        "source_type": "inferred",
-        "authority_level": "inferred",
+        "source_type": "meta",
+        "authority_level": "notice",
     }
 
 
@@ -329,9 +329,12 @@ def source_of_truth_guidance(query: str, intent: str = "") -> str:
         "- NEVER omit the 'Inferred from Code Usage' section even when it is empty.\n"
         "- If a retrieved chunk is labelled `source_type: source_code` or "
         "`authority_level: inferred`, it belongs in 'Inferred from Code Usage' only.\n"
-        "- If the context contains a '# Source-of-Truth Limitation' or "
-        "'# No Declaration Files' notice, you MUST quote it verbatim at the top of "
-        "the 'Declared Dependencies' section before listing any inferred findings.\n\n"
+        "- If a retrieved chunk is labelled `source_type: meta` or `authority_level: notice`, "
+        "it is a system notice — NOT a dependency entry. Quote it verbatim at the very top "
+        "of your response, before either section header.\n"
+        "- The only recognized system notice markers are '# Source-of-Truth Limitation' and "
+        "'# No Declaration Files'. If either appears in the context, quote it verbatim at the "
+        "top of the response.\n\n"
     )
 
 def _is_authoritative_candidate(path: str) -> bool:
