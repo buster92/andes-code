@@ -1145,7 +1145,7 @@
       </div>
       <div class="input-footer">
         <span class="input-hint">⏎ send · ⇧⏎ newline</span>
-        <label class="debug-toggle"><input type="checkbox" id="debugMode"> debug mode</label>
+        <label class="debug-toggle"><input type="checkbox" id="debugMode"> debug mode <span id="debugModeSource"></span></label>
         <span class="char-count" id="charCount">0</span>
       </div>
     </div>
@@ -1163,6 +1163,8 @@ let indexedFiles  = null;
 let currentMsgEl  = null;
 let currentRawText = '';
 let debugMode = false;
+let envDebugMode = false;
+let manualDebugMode = false;
 
 // ── Init ─────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {
@@ -1180,9 +1182,24 @@ window.addEventListener('DOMContentLoaded', () => {
     document.getElementById('charCount').textContent = e.target.value.length;
   });
   document.getElementById('debugMode').addEventListener('change', (e) => {
-    debugMode = !!e.target.checked;
+    manualDebugMode = !!e.target.checked;
+    syncDebugToggleState();
   });
+  syncDebugToggleState();
 });
+
+function syncDebugToggleState() {
+  const debugToggle = document.getElementById('debugMode');
+  const sourceLabel = document.getElementById('debugModeSource');
+  const effectiveDebugMode = envDebugMode || manualDebugMode;
+
+  debugMode = effectiveDebugMode;
+  debugToggle.checked = effectiveDebugMode;
+
+  if (sourceLabel) {
+    sourceLabel.textContent = envDebugMode ? '(env)' : (manualDebugMode ? '(manual)' : '');
+  }
+}
 
 // ── Server status ─────────────────────────────────────────────────────────
 async function checkStatus() {
@@ -1192,6 +1209,9 @@ async function checkStatus() {
     const r = await fetch(`${API}/`);
     const d = await r.json();
     dot.className = 'status-dot online';
+
+    envDebugMode = !!d.debug_mode;
+    syncDebugToggleState();
 
     const count = d.doc_count || 0;
 
@@ -1709,7 +1729,7 @@ async function streamResponse(userText) {
         ${failureReason}<br><span style="color:var(--text-dim)">Check server logs for phase failure details.</span>
       </div>`;
     }
-    if (debugPayload && debugMode) {
+    if (debugPayload) {
       renderDebugPanel(msgEl, debugPayload);
     }
 

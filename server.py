@@ -574,6 +574,7 @@ def root():
         "indexer":   INDEXER_READY,
         "doc_count": doc_count,
         "cache":     f"{CACHE_SIZE_GB:.0f}GB",
+        "debug_mode": DEBUG_MODE_STARTUP,
         "auto_index": auto_state,
         "auto_index_message": auto_message,
         "integrity_probe": integrity_probe,

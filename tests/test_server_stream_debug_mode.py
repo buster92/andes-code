@@ -292,6 +292,8 @@ class TestServerStreamingDebugMode(unittest.TestCase):
         )
         root = server.root()
         state = server.index_state()
+        self.assertIn("debug_mode", root)
+        self.assertEqual(root["debug_mode"], server.DEBUG_MODE_STARTUP)
         self.assertIn("integrity_probe", root)
         self.assertTrue(root["integrity_probe"]["warning_active"])
         self.assertIn("integrity_probe", state)
