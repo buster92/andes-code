@@ -902,6 +902,26 @@
     color: #c4b5fd;
     opacity: 0.95;
   }
+  .debug-missing-marker {
+    margin-top: 6px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: #fbbf24;
+    opacity: 0.95;
+  }
+  .debug-summary {
+    margin-top: 8px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 4px 8px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-muted);
+  }
+  .debug-summary b {
+    color: var(--text);
+    font-weight: 600;
+  }
 
   .char-count {
     font-size: 11px;
@@ -1220,7 +1240,7 @@ async function checkStatus() {
     const d = await r.json();
     dot.className = 'status-dot online';
 
-    envDebugMode = !!d.debug_mode;
+    envDebugMode = !!(d.debug_mode_env_current ?? d.debug_mode);
     syncDebugToggleState();
 
     const count = d.doc_count || 0;
@@ -1797,6 +1817,8 @@ async function streamResponse(userText) {
       renderDebugReceivedMarker(msgEl);
       console.log('[AndesCode] Rendering debug panel');
       renderDebugPanel(msgEl, debugPayload);
+    } else if (debugMode) {
+      renderDebugMissingMarker(msgEl);
     } else {
       console.log('[AndesCode] DEBUG NOT RECEIVED');
     }
@@ -1847,6 +1869,18 @@ function renderDebugReceivedMarker(msgEl) {
   target.insertAdjacentElement('afterend', marker);
 }
 
+function renderDebugMissingMarker(msgEl) {
+  const target = getDebugInsertionTarget(msgEl);
+  if (!target) return;
+  const bodyEl = msgEl.content.parentElement;
+  const existing = bodyEl ? bodyEl.querySelector('.debug-missing-marker') : null;
+  if (existing) return;
+  const marker = document.createElement('div');
+  marker.className = 'debug-missing-marker';
+  marker.textContent = 'DEBUG ENABLED, NO DEBUG PAYLOAD RECEIVED';
+  target.insertAdjacentElement('afterend', marker);
+}
+
 function renderDebugPanel(msgEl, payload) {
   const target = getDebugInsertionTarget(msgEl);
   if (!target) {
@@ -1856,10 +1890,24 @@ function renderDebugPanel(msgEl, payload) {
   const bodyEl = msgEl.content.parentElement;
   const existing = bodyEl ? bodyEl.querySelector('.debug-panel') : null;
   if (existing) existing.remove();
+  const filesUsed = Array.isArray(payload?.final_context?.files_used) ? payload.final_context.files_used : [];
+  const path = payload?.stream_path || payload?.orchestration_path || payload?.retrieval?.route_taken || 'unknown';
+  const cacheHit = payload?.cache_hit ?? payload?.retrieval?.cache_hit;
+  const payloadKind = payload?.payload_kind || 'full';
+  const intent = payload?.intent || payload?.routing?.intent || 'unknown';
+  const route = payload?.retrieval_route || payload?.retrieval?.route_taken || payload?.routing?.retrieval_route || 'unknown';
   const details = document.createElement('details');
   details.className = 'debug-panel';
   details.innerHTML = `
     <summary>DEBUG PIPELINE</summary>
+    <div class="debug-summary">
+      <div>path: <b>${escapeHtml(String(path))}</b></div>
+      <div>cache: <b>${cacheHit ? 'hit' : 'miss'}</b></div>
+      <div>payload: <b>${escapeHtml(String(payloadKind))}</b></div>
+      <div>intent: <b>${escapeHtml(String(intent))}</b></div>
+      <div>route: <b>${escapeHtml(String(route))}</b></div>
+      <div>files: <b>${filesUsed.length}</b></div>
+    </div>
     <div class="debug-json">${escapeHtml(JSON.stringify(payload, null, 2))}</div>
   `;
   target.insertAdjacentElement('afterend', details);

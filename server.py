@@ -275,6 +275,40 @@ def _make_pipeline_error_event(request_id: str, phase: str, err: Exception | str
     }
     return f"data: {json.dumps(payload)}\n\n"
 
+
+def _minimal_debug_payload(
+    *,
+    query: str,
+    request_id: str,
+    stream_path: str,
+    reason: str,
+    cache_hit: bool = False,
+    intent: str = "unknown",
+    retrieval_route: str = "unknown",
+    final_context: dict | None = None,
+) -> dict:
+    """Fallback debug payload so debug-mode requests always produce one visible debug event."""
+    context_snapshot = final_context or {}
+    files_used = context_snapshot.get("files_used") or []
+    context_size = context_snapshot.get("context_size")
+    if context_size is None:
+        context_size = 0
+    return {
+        "query": query,
+        "debug_enabled": True,
+        "stream_path": stream_path or "unknown",
+        "cache_hit": bool(cache_hit),
+        "payload_kind": "fallback",
+        "reason": reason,
+        "request_id": request_id,
+        "intent": intent or "unknown",
+        "retrieval_route": retrieval_route or "unknown",
+        "final_context": {
+            "files_used": files_used,
+            "context_size": context_size,
+        },
+    }
+
 for _lib in ("httpx", "httpcore", "sentence_transformers", "transformers", "huggingface_hub"):
     logging.getLogger(_lib).setLevel(logging.ERROR)
 
@@ -567,6 +601,9 @@ def root():
     with _auto_status_lock:
         auto_message = _auto_status_message
     integrity_probe = _read_integrity_probe_from_indexer()
+    # Expose both startup snapshot and current env state so UI/debug tooling can
+    # distinguish "started with debug" from "debug is currently enabled now".
+    debug_mode_env_current = env_debug_mode()
     return {
         "status":    "running",
         "product":   "AndesCode",
@@ -574,7 +611,9 @@ def root():
         "indexer":   INDEXER_READY,
         "doc_count": doc_count,
         "cache":     f"{CACHE_SIZE_GB:.0f}GB",
-        "debug_mode": DEBUG_MODE_STARTUP,
+        "debug_mode_startup": DEBUG_MODE_STARTUP,
+        "debug_mode_env_current": debug_mode_env_current,
+        "debug_mode": debug_mode_env_current,
         "auto_index": auto_state,
         "auto_index_message": auto_message,
         "integrity_probe": integrity_probe,
@@ -1675,6 +1714,9 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
     filtered_out = 0
     is_performance = False
     stream_path = "direct_retrieval"
+    cached_semantic = False
+    debug_emitted = False
+    fallback_reason = "context build returned no payload"
     try:
         _phase_log(request_id, "request_received", max_tokens=max_tokens, message_count=len(messages))
         yield _make_chunk("⚙️ _Analyzing request..._", request_id)
@@ -1693,7 +1735,6 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
         cache = getattr(_indexer_module, "CACHE", None) if _indexer_module else None
         retrieval_signature = f"{retrieval_route}:{intent}:{query}:{CONTEXT_CHUNKS}"
         planned_files = []
-        cached_semantic = False
 
         if cache and repo_fp and semantic_cache_allowed(intent, retrieval_route):
             phase = "semantic_cache_lookup"
@@ -1708,7 +1749,10 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
             if semantic_hit:
                 cached_semantic = True
                 stream_path = "semantic_cache_hit"
-                audit.info(f"STREAM_DEBUG_BYPASS {request_id} | reason=semantic_cache_hit")
+                fallback_reason = "semantic cache hit without retrieval payload"
+                # Semantic cache skips retrieval/context assembly; we still emit
+                # fallback debug so debug-mode users get deterministic visibility.
+                audit.info(f"STREAM_DEBUG_BYPASS {request_id} | reason=semantic_cache_hit | user_visible_debug=fallback")
                 yield _make_chunk("\n🧩 _Semantic cache hit (safe descriptive answer)_\n\n", request_id)
                 final_text, filtered_out = _validate_high_signal_output(semantic_hit, is_performance)
                 yield _make_chunk(final_text, request_id)
@@ -1756,6 +1800,8 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                 audit.info(
                     f"STREAM_DEBUG_PAYLOAD {request_id} | generated={bool(debug_payload)} | path={stream_path}"
                 )
+                if not debug_payload:
+                    fallback_reason = "planned context build returned no payload"
             else:
                 status = "Loading source-of-truth config..." if is_fast_path_intent(intent) else "Searching codebase..."
                 yield _make_chunk(f"\n📂 _{status}_", request_id)
@@ -1772,6 +1818,8 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                 audit.info(
                     f"STREAM_DEBUG_PAYLOAD {request_id} | generated={bool(debug_payload)} | path={stream_path}"
                 )
+                if not debug_payload:
+                    fallback_reason = "context build returned no payload"
             _phase_log(request_id, "context_build_result")
 
             t_context = time.perf_counter()
@@ -1881,13 +1929,47 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
             )
             cache.flush_metrics()
         if debug_mode:
-            if debug_payload:
-                audit.info(f"STREAM_DEBUG_EMIT {request_id} | emitted=True")
-                yield format_debug_sse_event(debug_payload)
-            else:
-                audit.info(f"STREAM_DEBUG_EMIT {request_id} | emitted=False | reason=no_payload")
+            payload_to_emit = debug_payload
+            payload_kind = "full"
+            if not payload_to_emit:
+                payload_kind = "fallback"
+                payload_to_emit = _minimal_debug_payload(
+                    query=query,
+                    request_id=request_id,
+                    stream_path=stream_path if stream_path else "unknown",
+                    reason=fallback_reason,
+                    cache_hit=cached_semantic,
+                    intent=intent,
+                    retrieval_route=retrieval_route,
+                    final_context={
+                        "files_used": (debug_payload or {}).get("final_context", {}).get("files_used", []),
+                        "context_size": (debug_payload or {}).get("final_context", {}).get("context_size", 0),
+                    },
+                )
+            audit.info(
+                f"STREAM_DEBUG_EMIT {request_id} | emitted=True | payload_kind={payload_kind} | path={stream_path}"
+            )
+            yield format_debug_sse_event(payload_to_emit)
+            debug_emitted = True
     except Exception as e:
+        stream_path = "error"
+        fallback_reason = "pipeline exception"
         _phase_log(request_id, "pipeline_failed", failed_phase=phase, error=e)
+        if debug_mode and not debug_emitted:
+            error_payload = _minimal_debug_payload(
+                query=query,
+                request_id=request_id,
+                stream_path="error",
+                reason=f"{fallback_reason}: {phase}",
+                cache_hit=cached_semantic,
+                intent=intent,
+                retrieval_route=retrieval_route,
+            )
+            audit.info(
+                f"STREAM_DEBUG_EMIT {request_id} | emitted=True | payload_kind=fallback | path=error"
+            )
+            yield format_debug_sse_event(error_payload)
+            debug_emitted = True
         yield _make_pipeline_error_event(request_id, phase, e)
         yield _make_error_chunk(request_id, phase, e)
     finally:

@@ -272,11 +272,13 @@ class TestServerStreamingDebugMode(unittest.TestCase):
             server.audit.info = original_audit_info
 
         debug_events = [e for e in events if "event: debug" in e]
-        self.assertFalse(debug_events)
+        self.assertTrue(debug_events)
+        self.assertIn('"payload_kind": "fallback"', debug_events[-1])
+        self.assertIn('"stream_path": "direct_retrieval"', debug_events[-1])
         self.assertTrue(any("STREAM_DEBUG_PAYLOAD req123 | generated=False | path=direct_retrieval" in m for m in audit_messages))
-        self.assertTrue(any("STREAM_DEBUG_EMIT req123 | emitted=False | reason=no_payload" in m for m in audit_messages))
+        self.assertTrue(any("STREAM_DEBUG_EMIT req123 | emitted=True | payload_kind=fallback | path=direct_retrieval" in m for m in audit_messages))
 
-    def test_stream_semantic_cache_hit_logs_bypass(self):
+    def test_stream_semantic_cache_hit_emits_fallback_debug_event(self):
         server = self.server
 
         class _FakeCache:
@@ -308,9 +310,12 @@ class TestServerStreamingDebugMode(unittest.TestCase):
             server.audit.info = original_audit_info
 
         debug_events = [e for e in events if "event: debug" in e]
-        self.assertFalse(debug_events)
-        self.assertTrue(any("STREAM_DEBUG_BYPASS req123 | reason=semantic_cache_hit" in m for m in audit_messages))
-        self.assertTrue(any("STREAM_DEBUG_EMIT req123 | emitted=False | reason=no_payload" in m for m in audit_messages))
+        self.assertTrue(debug_events)
+        self.assertIn('"stream_path": "semantic_cache_hit"', debug_events[-1])
+        self.assertIn('"cache_hit": true', debug_events[-1])
+        self.assertIn('"payload_kind": "fallback"', debug_events[-1])
+        self.assertTrue(any("STREAM_DEBUG_BYPASS req123 | reason=semantic_cache_hit | user_visible_debug=fallback" in m for m in audit_messages))
+        self.assertTrue(any("STREAM_DEBUG_EMIT req123 | emitted=True | payload_kind=fallback | path=semantic_cache_hit" in m for m in audit_messages))
 
     def test_stream_planner_route_emits_debug_event(self):
         server = self.server
@@ -351,10 +356,28 @@ class TestServerStreamingDebugMode(unittest.TestCase):
         root = server.root()
         state = server.index_state()
         self.assertIn("debug_mode", root)
-        self.assertEqual(root["debug_mode"], server.DEBUG_MODE_STARTUP)
+        self.assertIn("debug_mode_startup", root)
+        self.assertIn("debug_mode_env_current", root)
+        self.assertEqual(root["debug_mode"], root["debug_mode_env_current"])
         self.assertIn("integrity_probe", root)
         self.assertTrue(root["integrity_probe"]["warning_active"])
         self.assertIn("integrity_probe", state)
+
+    def test_stream_debug_disabled_emits_no_debug_event(self):
+        server = self.server
+        server._indexer_module = None
+        server.orchestration_plan = lambda _intent: {"skip_patch_plan": True, "skip_neighborhood": True}
+        server.classify_query_intent_details = lambda _query: {
+            "intent": "runtime_usage_or_reference",
+            "retrieval_route": "semantic",
+        }
+        server._build_context = lambda messages, request_id, debug_mode=False, return_debug=False: (
+            messages,
+            {"query": "q", "retrieval": {}, "orchestration_path": "direct_retrieval"},
+        )
+        events = _collect_stream(server, debug_mode=False)
+        debug_events = [e for e in events if "event: debug" in e]
+        self.assertFalse(debug_events)
 
     def test_index_state_tolerates_missing_integrity_probe_getter(self):
         server = self.server
