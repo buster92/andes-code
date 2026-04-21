@@ -1584,15 +1584,17 @@ async function streamResponse(userText) {
   scrollToBottom();   // show status line immediately
 
   try {
+    const requestBody = {
+      messages:   conversation,
+      max_tokens: 1024,
+      stream:     true,
+    };
+    if (debugMode) requestBody.debug_mode = true;
+
     const resp = await fetch(`${API}/chat/completions`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        messages:   conversation,
-        max_tokens: 1024,
-        stream:     true,
-        debug_mode: debugMode,
-      }),
+      body: JSON.stringify(requestBody),
     });
 
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -1605,6 +1607,7 @@ async function streamResponse(userText) {
     let   inStatus    = true;   // still showing status messages
     let   sawDone      = false;
     let   sawErrorChunk = false;
+    let   sseEventType = '';
 
     while (true) {
       const { done, value } = await reader.read();
@@ -1615,6 +1618,14 @@ async function streamResponse(userText) {
       buf = lines.pop();
 
       for (const line of lines) {
+        if (line.startsWith('event:')) {
+          sseEventType = line.slice(6).trim();
+          continue;
+        }
+        if (!line.trim()) {
+          sseEventType = '';
+          continue;
+        }
         if (!line.startsWith('data:')) continue;
         const payload = line.slice(5).trim();
         if (payload === '[DONE]') {
@@ -1624,7 +1635,7 @@ async function streamResponse(userText) {
 
         try {
           const chunk   = JSON.parse(payload);
-          if (chunk.object === 'debug.payload') {
+          if (sseEventType === 'debug' || chunk.object === 'debug.payload') {
             debugPayload = chunk.debug || null;
             continue;
           }

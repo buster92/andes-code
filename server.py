@@ -62,9 +62,9 @@ CONTEXT_SAFETY_MARGIN_TOKENS = int(os.getenv("CONTEXT_SAFETY_MARGIN_TOKENS", 256
 DEBUG_MODE_STARTUP = env_debug_mode()
 
 
-def _resolve_request_debug_mode(api_debug: bool | None) -> bool:
+def _resolve_request_debug_mode(api_debug: bool | str | None) -> bool:
     """Resolve debug mode for each request: API checkbox/body flag > current env."""
-    return resolve_debug_mode(api_flag=api_debug, param_flag=env_debug_mode())
+    return resolve_debug_mode(request_flag=api_debug, env_flag=env_debug_mode())
 
 # Core system prompt — kept short and static for KV cache reuse
 _BASE_SYSTEM = (
@@ -612,6 +612,7 @@ async def chat(request: Request):
     t_start    = time.perf_counter()
 
     audit.info(f"REQUEST {request_id} | tokens={max_tokens} | messages={len(messages)}")
+    audit.info(f"DEBUG_MODE {request_id} | request_flag={api_debug!r} | enabled={debug_mode}")
 
     if stream:
         return StreamingResponse(
@@ -624,6 +625,7 @@ async def chat(request: Request):
     messages, debug_payload = _build_context(
         messages, request_id, debug_mode=debug_mode, return_debug=True
     )
+    audit.info(f"DEBUG_PAYLOAD {request_id} | generated={bool(debug_payload)}")
     user_query = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
     is_performance = _is_performance_query(user_query)
     prompt   = _messages_to_prompt(messages)
@@ -659,6 +661,7 @@ async def debug_explain(request: Request):
     n_results = int(body.get("n_results", CONTEXT_CHUNKS))
     api_debug = body.get("debug_mode")
     debug_mode = _resolve_request_debug_mode(api_debug)
+    audit.info(f"DEBUG_EXPLAIN | request_flag={api_debug!r} | enabled={debug_mode}")
     if not _indexer_module:
         return {"enabled": debug_mode, "error": "Indexer not available", "debug": None}
     if not query:

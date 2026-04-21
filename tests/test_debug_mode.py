@@ -33,6 +33,23 @@ class TestDebugMode(unittest.TestCase):
         self.assertIn("failure_signals", payload)
         self.assertTrue(payload["final_context"]["authoritative_files_present"])
 
+    def test_env_debug_mode_accepts_true_variants(self):
+        prev = os.environ.get("ANDESCODE_DEBUG_MODE")
+        try:
+            os.environ["ANDESCODE_DEBUG_MODE"] = "True"
+            self.assertTrue(env_debug_mode())
+            os.environ["ANDESCODE_DEBUG_MODE"] = "1"
+            self.assertTrue(env_debug_mode())
+        finally:
+            if prev is None:
+                os.environ.pop("ANDESCODE_DEBUG_MODE", None)
+            else:
+                os.environ["ANDESCODE_DEBUG_MODE"] = prev
+
+    def test_resolve_debug_mode_request_flag_string(self):
+        self.assertTrue(resolve_debug_mode(request_flag="true", env_flag=False))
+        self.assertFalse(resolve_debug_mode(request_flag="false", env_flag=True))
+
     def test_failure_flags_missing_manifest_and_wrong_route_and_empty(self):
         decision = {"intent": "declaration_or_configuration", "retrieval_route": "semantic", "ambiguous": True}
         workspace = {"repo_types": ["android"], "modules": [{"name": "app"}, {"name": "feature"}], "manifests": []}

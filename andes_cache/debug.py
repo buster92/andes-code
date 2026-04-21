@@ -8,17 +8,43 @@ from copy import deepcopy
 from andes_cache.routing import retrieval_route_for_intent
 
 
+def _coerce_debug_flag(value) -> bool | None:
+    """Normalize common debug flag representations into bool/None."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+        return None
+    return bool(value)
+
+
 def env_debug_mode() -> bool:
     """Global debug toggle from environment (off by default)."""
-    return str(os.getenv("ANDESCODE_DEBUG_MODE", "")).strip().lower() in {"1", "true", "yes", "on"}
+    return bool(_coerce_debug_flag(os.getenv("ANDESCODE_DEBUG_MODE", "")))
 
 
-def resolve_debug_mode(*, api_flag: bool | None = None, param_flag: bool | None = None) -> bool:
-    """Resolve debug mode with precedence: API flag > function param > env."""
-    if api_flag is not None:
-        return bool(api_flag)
-    if param_flag is not None:
-        return bool(param_flag)
+def resolve_debug_mode(
+    *,
+    api_flag: bool | str | None = None,
+    param_flag: bool | str | None = None,
+    request_flag: bool | str | None = None,
+    env_flag: bool | str | None = None,
+) -> bool:
+    """Resolve debug mode with precedence: request/API flag > explicit/env parameter > env."""
+    api_value = _coerce_debug_flag(api_flag if api_flag is not None else request_flag)
+    if api_value is not None:
+        return api_value
+    param_value = _coerce_debug_flag(param_flag if param_flag is not None else env_flag)
+    if param_value is not None:
+        return param_value
     return env_debug_mode()
 
 
