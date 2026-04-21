@@ -121,6 +121,8 @@ SUPPORTED_EXTENSIONS = {
     ".go", ".rs", ".java", ".cpp", ".c", ".h",
     ".rb", ".php", ".cs", ".swift", ".kt",
     ".gradle", ".xml",
+    ".toml",        # Rust Cargo.toml, Python pyproject.toml, Gradle version catalogs, etc.
+    ".properties",  # Java/Gradle/Spring project properties files
 }
 
 MANIFEST_FILES = {
@@ -866,6 +868,41 @@ def search(
             merged.append(c)
         final_ranked = merged
 
+    # Inject an explicit "no declaration files" notice when the workspace has no
+    # authoritative files at all and the query is asking for declared dependencies.
+    # Without this, the model receives only semantic/inferred results and no signal
+    # that declaration files are absent — a silent fallback that erodes trust.
+    if decl_query and not authoritative_files_required:
+        _no_auth_notice = {
+            "content": (
+                "# No Dependency Declaration Files Found in Workspace\n"
+                "- No dependency declaration files (build.gradle, package.json, "
+                "requirements.txt, pyproject.toml, Cargo.toml, go.mod, pom.xml, etc.) "
+                "were discovered in the indexed workspace metadata.\n"
+                "- Declared dependencies CANNOT be confirmed from any authoritative "
+                "source-of-truth file.\n"
+                "- The results below are inferred from code usage only — they are NOT "
+                "the same as declared dependencies.\n"
+            ),
+            "file": "__source_of_truth_missing__",
+            "language": "meta",
+            "symbols": "",
+            "score": 0.0,
+            "_rank": 1.0,
+            "full_file": True,
+            "coverage": {"returned": 1, "total": 1, "partial": False},
+            "source_type": "inferred",
+            "authority_level": "inferred",
+        }
+        final_ranked = [_no_auth_notice] + final_ranked
+        if payload is not None:
+            payload["failure_signals"]["expected_but_missing_authority"] = True
+            _update_authoritative_debug(
+                final_ranked,
+                mode="no_authority_files_in_workspace",
+                reason="declaration query but workspace metadata contains no manifest files",
+            )
+
     # Add coverage metadata — lets server tell model how much of each file it has
     final = _add_coverage(final_ranked)
     if decl_query and authoritative_files_required:
@@ -1599,6 +1636,50 @@ def _retrieve_config_first(
             "attempts": integrity_attempts,
         }
     if not selected_healthy_path:
+        # Integrity validation failed (DEGRADED or STALE) for every candidate, but the
+        # chunks may still be present in the index — a degraded index is far better than
+        # returning a hard "no data found" limitation chunk.  Attempt a best-effort direct
+        # fetch across all priority_files before giving up.
+        best_effort_collected: list[dict] = []
+        for fname in priority_files:
+            file_chunks = _fetch_all_from_file(fname, query=query, intent=intent, max_results=40)
+            if not file_chunks:
+                continue
+            source_type = classify_source_type(fname)
+            authority = authority_level_for_source(intent, source_type)
+            annotate_sources(file_chunks, source_type=source_type, authority_level=authority)
+            best_effort_collected.extend(file_chunks[:6])
+            if len(best_effort_collected) >= n_results:
+                break
+
+        if best_effort_collected:
+            # Prepend a stale-index caveat so the model (and user) knows the index may
+            # be slightly out of sync, but the declared data is real.
+            stale_caveat = {
+                "content": (
+                    "# Index Integrity Notice\n"
+                    "- Dependency declaration files were retrieved from a potentially stale index.\n"
+                    "- The content below is from authoritative build/manifest files and represents "
+                    "declared dependencies, but the index should be refreshed for full accuracy.\n"
+                ),
+                "file": "__source_of_truth_stale__",
+                "language": "meta",
+                "symbols": "",
+                "score": 0.0,
+                "_rank": 1.0,
+                "full_file": True,
+                "coverage": {"returned": 1, "total": 1, "partial": False},
+                "source_type": "inferred",
+                "authority_level": "inferred",
+            }
+            if debug_payload is not None:
+                debug_payload["source_of_truth"]["integrity"]["best_effort_fallback"] = True
+                debug_payload["source_of_truth"]["selected_files"] = [
+                    c.get("file", "") for c in best_effort_collected
+                ]
+            return [stale_caveat] + best_effort_collected[:n_results]
+
+        # Genuine failure: discovered in workspace but not retrievable even with best-effort.
         limitation = {
             "content": (
                 "# Source-of-Truth Index Integrity Limitation\n"
@@ -2185,11 +2266,24 @@ def evaluate_index_state(current_state: dict, stored_state: dict | None, repo_ch
 
 
 def _collect_files(root: Path) -> list:
+    """
+    Collect all indexable files: source files with supported extensions AND
+    authoritative manifest/build/dependency files by canonical basename.
+
+    Manifest files (requirements.txt, pyproject.toml, package.json, Cargo.toml,
+    go.mod, etc.) have non-standard extensions not in SUPPORTED_EXTENSIONS, but
+    MUST be indexed so that source-of-truth retrieval can fetch their content from
+    ChromaDB rather than returning an integrity-failure limitation chunk.
+    """
+    _manifest_basenames_lower = {m.lower() for m in MANIFEST_FILES}
     files = []
     for fp in root.rglob("*"):
-        if fp.is_file() and fp.suffix in SUPPORTED_EXTENSIONS:
-            if not any(s in fp.parts for s in SKIP_DIRS):
-                files.append(fp)
+        if not fp.is_file():
+            continue
+        if any(s in fp.parts for s in SKIP_DIRS):
+            continue
+        if fp.suffix in SUPPORTED_EXTENSIONS or fp.name.lower() in _manifest_basenames_lower:
+            files.append(fp)
     return sorted(files)
 
 
