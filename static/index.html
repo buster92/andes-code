@@ -874,16 +874,19 @@
   }
   .debug-panel {
     margin-top: 10px;
-    border: 1px solid var(--border2);
+    border: 1px solid #8b5cf6;
+    border-left: 4px solid #a78bfa;
     border-radius: 8px;
-    background: var(--surface2);
+    background: rgba(139, 92, 246, 0.12);
     padding: 8px 10px;
   }
   .debug-panel summary {
     cursor: pointer;
-    color: var(--warning);
+    color: #c4b5fd;
     font-family: var(--font-mono);
     font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.4px;
   }
   .debug-json {
     margin-top: 8px;
@@ -891,6 +894,13 @@
     font-family: var(--font-mono);
     font-size: 11px;
     color: var(--text);
+  }
+  .debug-received-marker {
+    margin-top: 6px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: #c4b5fd;
+    opacity: 0.95;
   }
 
   .char-count {
@@ -1629,91 +1639,145 @@ async function streamResponse(userText) {
     let   sawErrorChunk = false;
     let   sseEventType = '';
 
+    const processSseEvent = (eventType, dataPayload) => {
+      if (dataPayload === '[DONE]') {
+        sawDone = true;
+        return;
+      }
+
+      try {
+        const chunk = JSON.parse(dataPayload);
+        if (eventType === 'debug' || chunk.object === 'debug.payload') {
+          debugPayload = chunk.debug || chunk.payload || chunk || null;
+          console.log('[AndesCode] Debug payload received', {
+            eventType,
+            object: chunk.object,
+            isDebugObject: chunk.object === 'debug.payload',
+            payloadKeys: debugPayload && typeof debugPayload === 'object' ? Object.keys(debugPayload) : [],
+            payloadSizeBytes: JSON.stringify(debugPayload ?? '').length,
+          });
+          return;
+        }
+        if (chunk.object === 'andescode.error') {
+          sawErrorChunk = true;
+          if (statusEl.parentNode) statusEl.remove();
+          inStatus = false;
+          const phase = chunk.error?.phase || 'unknown';
+          const detail = chunk.error?.message || 'Unknown error';
+          msgEl.content.innerHTML = `<div style="color:var(--danger);font-family:var(--font-mono);font-size:12px;white-space:pre-wrap;">✗ AndesCode pipeline failed (${escapeHtml(phase)})\n${escapeHtml(detail)}</div>`;
+          return;
+        }
+        const content = chunk.choices?.[0]?.delta?.content ?? '';
+        if (!content) return;
+
+        currentRawText += content;
+
+        // First real token
+        if (ttft === null && content && !content.includes('Searching') && !content.includes('Thinking')) {
+          if (!content.includes('⚙️') && !content.includes('🧠')) {
+            ttft = (performance.now() - t0) / 1000;
+          }
+        }
+
+        // Detect status vs real content
+        if (content.includes('⚙️') || content.includes('📂') || content.includes('🧠') ||
+            content.includes('Analyzing') || content.includes('Planning') ||
+            content.includes('Loading') || content.includes('Thinking') ||
+            content.includes('Searching')) {
+          // Update status line with step info
+          const s = document.getElementById('statusMsg');
+          if (s) {
+            let cleaned = content.replace(/[_*]/g, '').trim();
+            // Map emoji prefixes to clear labels
+            if (cleaned.includes('⚙️') || cleaned.includes('Analyzing'))
+              cleaned = cleaned.replace('⚙️', '').trim();
+            else if (cleaned.includes('📂') || cleaned.includes('Loading'))
+              cleaned = cleaned.replace('📂', '').trim();
+            else if (cleaned.includes('🧠') || cleaned.includes('Thinking'))
+              cleaned = cleaned.replace('🧠', '').trim();
+            if (cleaned) s.textContent = cleaned;
+          }
+        } else if (content.trim() === '---') {
+          // Separator — remove status, start real content
+          if (inStatus) {
+            statusEl.remove();
+            inStatus = false;
+          }
+        } else {
+          if (inStatus && statusEl.parentNode) {
+            statusEl.remove();
+            inStatus = false;
+          }
+          realContent += content;
+          renderStreamingContent(msgEl, realContent);
+          scrollToBottom();
+        }
+      } catch {
+        /* malformed chunk */
+      }
+    };
+
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
 
       buf += decoder.decode(value, { stream: true });
-      const lines = buf.split('\n');
-      buf = lines.pop();
+      buf = buf.replace(/\r\n/g, '\n');
 
-      for (const line of lines) {
+      while (buf.includes('\n\n')) {
+        const blockEnd = buf.indexOf('\n\n');
+        const eventBlock = buf.slice(0, blockEnd);
+        buf = buf.slice(blockEnd + 2);
+        if (!eventBlock.trim()) continue;
+
+        const blockLines = eventBlock.split('\n');
+        const dataLines = [];
+        let sawEventLine = false;
+
+        for (const rawLine of blockLines) {
+          const line = rawLine.trimEnd();
+          if (line.startsWith('event:')) {
+            sseEventType = line.slice(6).trim();
+            sawEventLine = true;
+            console.log('[AndesCode] SSE event parsed', { eventType: sseEventType });
+            continue;
+          }
+          if (line.startsWith('data:')) {
+            dataLines.push(line.slice(5).trim());
+          }
+        }
+
+        if (!dataLines.length) {
+          if (sawEventLine) {
+            console.log('[AndesCode] SSE event had no data', { eventType: sseEventType });
+          }
+          continue;
+        }
+
+        processSseEvent(sseEventType, dataLines.join('\n'));
+        sseEventType = '';
+      }
+    }
+
+    if (buf.trim()) {
+      const trailingLines = buf.replace(/\r\n/g, '\n').split('\n');
+      const dataLines = [];
+      let sawEventLine = false;
+      for (const rawLine of trailingLines) {
+        const line = rawLine.trimEnd();
         if (line.startsWith('event:')) {
           sseEventType = line.slice(6).trim();
-          continue;
+          sawEventLine = true;
+          console.log('[AndesCode] SSE event parsed', { eventType: sseEventType });
+        } else if (line.startsWith('data:')) {
+          dataLines.push(line.slice(5).trim());
         }
-        if (!line.trim()) {
-          sseEventType = '';
-          continue;
-        }
-        if (!line.startsWith('data:')) continue;
-        const payload = line.slice(5).trim();
-        if (payload === '[DONE]') {
-          sawDone = true;
-          continue;
-        }
-
-        try {
-          const chunk   = JSON.parse(payload);
-          if (sseEventType === 'debug' || chunk.object === 'debug.payload') {
-            debugPayload = chunk.debug || null;
-            continue;
-          }
-          if (chunk.object === 'andescode.error') {
-            sawErrorChunk = true;
-            if (statusEl.parentNode) statusEl.remove();
-            inStatus = false;
-            const phase = chunk.error?.phase || 'unknown';
-            const detail = chunk.error?.message || 'Unknown error';
-            msgEl.content.innerHTML = `<div style="color:var(--danger);font-family:var(--font-mono);font-size:12px;white-space:pre-wrap;">✗ AndesCode pipeline failed (${escapeHtml(phase)})\n${escapeHtml(detail)}</div>`;
-            continue;
-          }
-          const content = chunk.choices?.[0]?.delta?.content ?? '';
-          if (!content) continue;
-
-          currentRawText += content;
-
-          // First real token
-          if (ttft === null && content && !content.includes('Searching') && !content.includes('Thinking')) {
-            if (!content.includes('⚙️') && !content.includes('🧠')) {
-              ttft = (performance.now() - t0) / 1000;
-            }
-          }
-
-          // Detect status vs real content
-          if (content.includes('⚙️') || content.includes('📂') || content.includes('🧠') ||
-              content.includes('Analyzing') || content.includes('Planning') ||
-              content.includes('Loading') || content.includes('Thinking') ||
-              content.includes('Searching')) {
-            // Update status line with step info
-            const s = document.getElementById('statusMsg');
-            if (s) {
-              let cleaned = content.replace(/[_*]/g, '').trim();
-              // Map emoji prefixes to clear labels
-              if (cleaned.includes('⚙️') || cleaned.includes('Analyzing'))
-                cleaned = cleaned.replace('⚙️', '').trim();
-              else if (cleaned.includes('📂') || cleaned.includes('Loading'))
-                cleaned = cleaned.replace('📂', '').trim();
-              else if (cleaned.includes('🧠') || cleaned.includes('Thinking'))
-                cleaned = cleaned.replace('🧠', '').trim();
-              if (cleaned) s.textContent = cleaned;
-            }
-          } else if (content.trim() === '---') {
-            // Separator — remove status, start real content
-            if (inStatus) {
-              statusEl.remove();
-              inStatus = false;
-            }
-          } else {
-            if (inStatus && statusEl.parentNode) {
-              statusEl.remove();
-              inStatus = false;
-            }
-            realContent += content;
-            renderStreamingContent(msgEl, realContent);
-            scrollToBottom();
-          }
-        } catch { /* malformed chunk */ }
+      }
+      if (sawEventLine && !dataLines.length) {
+        console.log('[AndesCode] SSE trailing event had no data', { eventType: sseEventType });
+      }
+      if (dataLines.length) {
+        processSseEvent(sseEventType, dataLines.join('\n'));
       }
     }
 
@@ -1730,7 +1794,11 @@ async function streamResponse(userText) {
       </div>`;
     }
     if (debugPayload) {
+      renderDebugReceivedMarker(msgEl);
+      console.log('[AndesCode] Rendering debug panel');
       renderDebugPanel(msgEl, debugPayload);
+    } else {
+      console.log('[AndesCode] DEBUG NOT RECEIVED');
     }
 
     // Update stats
@@ -1755,14 +1823,46 @@ async function streamResponse(userText) {
   }
 }
 
+function getDebugInsertionTarget(msgEl) {
+  if (!msgEl?.content) return null;
+  const bodyEl = msgEl.content.parentElement;
+  if (!bodyEl) return null;
+  return bodyEl.querySelector('.debug-received-marker') ||
+         bodyEl.querySelector('.msg-timing') ||
+         msgEl.content;
+}
+
+function renderDebugReceivedMarker(msgEl) {
+  const target = getDebugInsertionTarget(msgEl);
+  if (!target) {
+    console.log('[AndesCode] DEBUG RENDER TARGET MISSING');
+    return;
+  }
+  const bodyEl = msgEl.content.parentElement;
+  const existing = bodyEl ? bodyEl.querySelector('.debug-received-marker') : null;
+  if (existing) return;
+  const marker = document.createElement('div');
+  marker.className = 'debug-received-marker';
+  marker.textContent = 'DEBUG RECEIVED';
+  target.insertAdjacentElement('afterend', marker);
+}
+
 function renderDebugPanel(msgEl, payload) {
+  const target = getDebugInsertionTarget(msgEl);
+  if (!target) {
+    console.log('[AndesCode] DEBUG RENDER TARGET MISSING');
+    return;
+  }
+  const bodyEl = msgEl.content.parentElement;
+  const existing = bodyEl ? bodyEl.querySelector('.debug-panel') : null;
+  if (existing) existing.remove();
   const details = document.createElement('details');
   details.className = 'debug-panel';
   details.innerHTML = `
     <summary>DEBUG PIPELINE</summary>
     <div class="debug-json">${escapeHtml(JSON.stringify(payload, null, 2))}</div>
   `;
-  msgEl.content.after(details);
+  target.insertAdjacentElement('afterend', details);
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────
