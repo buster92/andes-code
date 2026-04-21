@@ -254,6 +254,64 @@ class TestServerStreamingDebugMode(unittest.TestCase):
         self.assertTrue(debug_events)
         self.assertIn('"orchestration_path": "direct_retrieval"', debug_events[-1])
 
+    def test_stream_debug_emit_logs_when_payload_missing(self):
+        server = self.server
+        server._indexer_module = None
+        server.orchestration_plan = lambda _intent: {"skip_patch_plan": True, "skip_neighborhood": True}
+        server.classify_query_intent_details = lambda _query: {
+            "intent": "runtime_usage_or_reference",
+            "retrieval_route": "semantic",
+        }
+        server._build_context = lambda messages, request_id, debug_mode=False, return_debug=False: (messages, None)
+        audit_messages = []
+        original_audit_info = server.audit.info
+        server.audit.info = lambda msg: audit_messages.append(msg)
+        try:
+            events = _collect_stream(server, debug_mode=True)
+        finally:
+            server.audit.info = original_audit_info
+
+        debug_events = [e for e in events if "event: debug" in e]
+        self.assertFalse(debug_events)
+        self.assertTrue(any("STREAM_DEBUG_PAYLOAD req123 | generated=False | path=direct_retrieval" in m for m in audit_messages))
+        self.assertTrue(any("STREAM_DEBUG_EMIT req123 | emitted=False | reason=no_payload" in m for m in audit_messages))
+
+    def test_stream_semantic_cache_hit_logs_bypass(self):
+        server = self.server
+
+        class _FakeCache:
+            def semantic_get(self, **_kwargs):
+                return "cached answer"
+
+            def semantic_set(self, **_kwargs):
+                return None
+
+            def flush_metrics(self):
+                return None
+
+        server._indexer_module = types.SimpleNamespace(
+            _load_project_map=lambda: {},
+            get_repo_fingerprint=lambda: "repo-fp",
+            CACHE=_FakeCache(),
+        )
+        server.classify_query_intent_details = lambda _query: {
+            "intent": "generic_semantic",
+            "retrieval_route": "semantic",
+        }
+        server.orchestration_plan = lambda _intent: {"skip_patch_plan": True, "skip_neighborhood": True}
+        audit_messages = []
+        original_audit_info = server.audit.info
+        server.audit.info = lambda msg: audit_messages.append(msg)
+        try:
+            events = _collect_stream(server, debug_mode=True)
+        finally:
+            server.audit.info = original_audit_info
+
+        debug_events = [e for e in events if "event: debug" in e]
+        self.assertFalse(debug_events)
+        self.assertTrue(any("STREAM_DEBUG_BYPASS req123 | reason=semantic_cache_hit" in m for m in audit_messages))
+        self.assertTrue(any("STREAM_DEBUG_EMIT req123 | emitted=False | reason=no_payload" in m for m in audit_messages))
+
     def test_stream_planner_route_emits_debug_event(self):
         server = self.server
         server.INDEXER_READY = True

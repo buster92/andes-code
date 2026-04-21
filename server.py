@@ -1674,6 +1674,7 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
     retrieval_signature = ""
     filtered_out = 0
     is_performance = False
+    stream_path = "direct_retrieval"
     try:
         _phase_log(request_id, "request_received", max_tokens=max_tokens, message_count=len(messages))
         yield _make_chunk("⚙️ _Analyzing request..._", request_id)
@@ -1706,6 +1707,8 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
             _phase_log(request_id, "semantic_cache_lookup_result", hit=bool(semantic_hit))
             if semantic_hit:
                 cached_semantic = True
+                stream_path = "semantic_cache_hit"
+                audit.info(f"STREAM_DEBUG_BYPASS {request_id} | reason=semantic_cache_hit")
                 yield _make_chunk("\n🧩 _Semantic cache hit (safe descriptive answer)_\n\n", request_id)
                 final_text, filtered_out = _validate_high_signal_output(semantic_hit, is_performance)
                 yield _make_chunk(final_text, request_id)
@@ -1734,7 +1737,8 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                 _phase_log(request_id, "planner_result", planned_files=planned_files)
 
             phase = "context_build"
-            _phase_log(request_id, "context_build_start", path="planned_context" if planned_files else "direct_retrieval")
+            stream_path = "planned_context" if planned_files else "direct_retrieval"
+            _phase_log(request_id, "context_build_start", path=stream_path)
             if planned_files and not orchestration["skip_neighborhood"]:
                 short_names = [f.split("/")[-1] for f in planned_files]
                 yield _make_chunk(f"\n📂 _Reading: {', '.join(short_names)}_", request_id)
@@ -1749,6 +1753,9 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                         return_debug=True,
                     ),
                 )
+                audit.info(
+                    f"STREAM_DEBUG_PAYLOAD {request_id} | generated={bool(debug_payload)} | path={stream_path}"
+                )
             else:
                 status = "Loading source-of-truth config..." if is_fast_path_intent(intent) else "Searching codebase..."
                 yield _make_chunk(f"\n📂 _{status}_", request_id)
@@ -1762,6 +1769,9 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                     retrieval = debug_payload.setdefault("retrieval", {})
                     retrieval.setdefault("orchestration_path", "direct_retrieval")
                     debug_payload["orchestration_path"] = "direct_retrieval"
+                audit.info(
+                    f"STREAM_DEBUG_PAYLOAD {request_id} | generated={bool(debug_payload)} | path={stream_path}"
+                )
             _phase_log(request_id, "context_build_result")
 
             t_context = time.perf_counter()
@@ -1870,8 +1880,12 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                 value=cache_value.strip(),
             )
             cache.flush_metrics()
-        if debug_mode and debug_payload:
-            yield format_debug_sse_event(debug_payload)
+        if debug_mode:
+            if debug_payload:
+                audit.info(f"STREAM_DEBUG_EMIT {request_id} | emitted=True")
+                yield format_debug_sse_event(debug_payload)
+            else:
+                audit.info(f"STREAM_DEBUG_EMIT {request_id} | emitted=False | reason=no_payload")
     except Exception as e:
         _phase_log(request_id, "pipeline_failed", failed_phase=phase, error=e)
         yield _make_pipeline_error_event(request_id, phase, e)
