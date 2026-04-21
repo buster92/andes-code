@@ -309,6 +309,51 @@ def _minimal_debug_payload(
         },
     }
 
+
+def _build_cache_debug_payload(
+    *,
+    query: str,
+    request_id: str,
+    repo_fp: str,
+    retrieval_signature: str,
+    intent: str,
+    retrieval_route: str,
+    semantic_hit,
+) -> dict:
+    """Build a minimal but structured debug payload for semantic cache short-circuits."""
+    metadata = {}
+    retrieved_chunks_count = 0
+    if isinstance(semantic_hit, dict):
+        metadata = semantic_hit.get("metadata", {}) or {}
+        cached_chunks = semantic_hit.get("retrieved_chunks") or semantic_hit.get("chunks") or []
+        if isinstance(cached_chunks, list):
+            retrieved_chunks_count = len(cached_chunks)
+    return {
+        "query": query,
+        "debug_enabled": True,
+        "request_id": request_id,
+        "stream_path": "semantic_cache_hit",
+        "orchestration_path": "semantic_cache_hit",
+        "payload_kind": "cache",
+        "cache_hit": True,
+        "retrieval_route": retrieval_route or "unknown",
+        "intent": intent or "unknown",
+        "retrieval": {
+            "route_taken": "semantic_cache_hit",
+            "retrieved_chunks_count": int(retrieved_chunks_count),
+            "source": "cache",
+        },
+        "cache": {
+            "repo_fp": repo_fp,
+            "retrieval_signature": retrieval_signature,
+            "metadata": metadata,
+        },
+        "final_context": {
+            "files_used": [],
+            "context_size": 0,
+        },
+    }
+
 for _lib in ("httpx", "httpcore", "sentence_transformers", "transformers", "huggingface_hub"):
     logging.getLogger(_lib).setLevel(logging.ERROR)
 
@@ -1749,10 +1794,20 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
             if semantic_hit:
                 cached_semantic = True
                 stream_path = "semantic_cache_hit"
-                fallback_reason = "semantic cache hit without retrieval payload"
-                # Semantic cache skips retrieval/context assembly; we still emit
-                # fallback debug so debug-mode users get deterministic visibility.
-                audit.info(f"STREAM_DEBUG_BYPASS {request_id} | reason=semantic_cache_hit | user_visible_debug=fallback")
+                fallback_reason = "semantic cache hit"
+                if debug_mode:
+                    debug_payload = _build_cache_debug_payload(
+                        query=query,
+                        request_id=request_id,
+                        repo_fp=repo_fp,
+                        retrieval_signature=retrieval_signature,
+                        intent=intent,
+                        retrieval_route=retrieval_route,
+                        semantic_hit=semantic_hit,
+                    )
+                audit.info(
+                    f"STREAM_DEBUG_PAYLOAD {request_id} | generated={bool(debug_payload)} | path=semantic_cache_hit"
+                )
                 yield _make_chunk("\n🧩 _Semantic cache hit (safe descriptive answer)_\n\n", request_id)
                 final_text, filtered_out = _validate_high_signal_output(semantic_hit, is_performance)
                 yield _make_chunk(final_text, request_id)
