@@ -236,7 +236,7 @@ def populate_retrieval_snapshot(
 def format_debug_sse_event(payload: dict) -> str:
     import json
 
-    return f"event: debug\\ndata: {json.dumps({'object': 'debug.payload', 'debug': payload})}\\n\\n"
+    return f"event: debug\ndata: {json.dumps({'object': 'debug.payload', 'debug': payload})}\n\n"
 
 
 def finalize_payload(payload: dict, final_chunks: list[dict]) -> dict:

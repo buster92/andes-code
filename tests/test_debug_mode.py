@@ -91,6 +91,13 @@ class TestDebugMode(unittest.TestCase):
         self.assertIn("event: debug", event)
         self.assertIn("\"object\": \"debug.payload\"", event)
         self.assertNotIn("[DEBUG_PAYLOAD]", event)
+        # Must be a valid SSE frame with real newlines (not literal "\n")
+        # so the browser's EventSource/fetch-stream parser can dispatch it.
+        self.assertNotIn("\\n", event)
+        self.assertTrue(event.endswith("\n\n"), "SSE event must end with a blank line")
+        lines = event.split("\n")
+        self.assertEqual(lines[0], "event: debug")
+        self.assertTrue(lines[1].startswith("data: "))
 
     def test_route_aware_low_confidence_source_of_truth(self):
         decision = {"intent": "declaration_or_configuration", "retrieval_route": "source_of_truth", "ambiguous": False}
