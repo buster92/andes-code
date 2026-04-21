@@ -254,6 +254,30 @@ class TestServerStreamingDebugMode(unittest.TestCase):
         self.assertTrue(debug_events)
         self.assertIn('"orchestration_path": "direct_retrieval"', debug_events[-1])
 
+    def test_build_cache_debug_payload_includes_route_and_metadata(self):
+        server = self.server
+        payload = server._build_cache_debug_payload(
+            query="how does this work?",
+            request_id="req123",
+            repo_fp="repo-fp",
+            retrieval_signature="semantic:generic_semantic:how does this work?:6",
+            intent="generic_semantic",
+            retrieval_route="semantic",
+            semantic_hit={
+                "answer": "cached",
+                "retrieved_chunks": [{"file": "a.py"}, {"file": "b.py"}],
+                "metadata": {"cache_version": "v1"},
+            },
+        )
+
+        self.assertEqual(payload["stream_path"], "semantic_cache_hit")
+        self.assertTrue(payload["cache_hit"])
+        self.assertEqual(payload["retrieval"]["route_taken"], "semantic_cache_hit")
+        self.assertEqual(payload["retrieval"]["retrieved_chunks_count"], 2)
+        self.assertEqual(payload["retrieval"]["source"], "cache")
+        self.assertEqual(payload["cache"]["repo_fp"], "repo-fp")
+        self.assertEqual(payload["cache"]["metadata"]["cache_version"], "v1")
+
     def test_stream_debug_emit_logs_when_payload_missing(self):
         server = self.server
         server._indexer_module = None
@@ -278,7 +302,7 @@ class TestServerStreamingDebugMode(unittest.TestCase):
         self.assertTrue(any("STREAM_DEBUG_PAYLOAD req123 | generated=False | path=direct_retrieval" in m for m in audit_messages))
         self.assertTrue(any("STREAM_DEBUG_EMIT req123 | emitted=True | payload_kind=fallback | path=direct_retrieval" in m for m in audit_messages))
 
-    def test_stream_semantic_cache_hit_emits_fallback_debug_event(self):
+    def test_stream_semantic_cache_hit_emits_cache_debug_event(self):
         server = self.server
 
         class _FakeCache:
@@ -313,9 +337,12 @@ class TestServerStreamingDebugMode(unittest.TestCase):
         self.assertTrue(debug_events)
         self.assertIn('"stream_path": "semantic_cache_hit"', debug_events[-1])
         self.assertIn('"cache_hit": true', debug_events[-1])
-        self.assertIn('"payload_kind": "fallback"', debug_events[-1])
-        self.assertTrue(any("STREAM_DEBUG_BYPASS req123 | reason=semantic_cache_hit | user_visible_debug=fallback" in m for m in audit_messages))
-        self.assertTrue(any("STREAM_DEBUG_EMIT req123 | emitted=True | payload_kind=fallback | path=semantic_cache_hit" in m for m in audit_messages))
+        self.assertIn('"payload_kind": "cache"', debug_events[-1])
+        self.assertIn('"route_taken": "semantic_cache_hit"', debug_events[-1])
+        self.assertIn('"retrieved_chunks_count": 0', debug_events[-1])
+        self.assertIn('"source": "cache"', debug_events[-1])
+        self.assertTrue(any("STREAM_DEBUG_PAYLOAD req123 | generated=True | path=semantic_cache_hit" in m for m in audit_messages))
+        self.assertTrue(any("STREAM_DEBUG_EMIT req123 | emitted=True | payload_kind=full | path=semantic_cache_hit" in m for m in audit_messages))
 
     def test_stream_planner_route_emits_debug_event(self):
         server = self.server
