@@ -84,7 +84,7 @@ def expected_authority_candidates(intent: str, query: str, manifests: list[str],
         ])
 
     # Query-focused expansions.
-    if any(k in q for k in ("permission", "permissions", "declared", "manifest")):
+    if any(k in q for k in ("permission", "permissions", "manifest")):
         intent_hints.extend(["androidmanifest.xml", "manifest"])
     if any(k in q for k in ("dependenc", "library", "package", "build", "module")):
         intent_hints.extend([
@@ -400,21 +400,48 @@ def dependency_authority_incomplete_limitation() -> dict:
     }
 
 
-DECLARATION_QUERY_KEYWORDS = (
-    "dependenc",
-    "declared",
-    "librar",
-    "version",
-    "manifest",
-    "permission",
-    "config",
-    "build",
-    "settings",
-    "requirements",
-    "package.json",
-    "pyproject",
-    "gradle",
-    "pom.xml",
+# ---------------------------------------------------------------------------
+# Declaration-domain keyword detection
+# ---------------------------------------------------------------------------
+# Rules for this regex:
+#
+#  1. Always use \b word-boundary anchors so that domain terms are never
+#     matched as sub-strings of unrelated words:
+#       "independence" must NOT trigger dependency routing.
+#       "misconfigured" must NOT trigger config routing.
+#
+#  2. Use prefix patterns (dependenc\w+, librar\w*, config\w*) to catch
+#     all inflected forms (dependency/dependencies, library/libraries,
+#     configured/configuration) with a single branch.
+#
+#  3. "declared" is intentionally EXCLUDED.  It is a common English
+#     adjective ("What variables are declared?", "What is declared vs
+#     defined?") and its presence alone is not evidence of a build-file /
+#     manifest query.  Dependency queries that happen to contain "declared"
+#     are correctly classified by the dependency-domain terms themselves
+#     ("dependenc\w+", "librar\w*", etc.).
+#
+# If you need to add a new ecosystem keyword, add it here (not in ad-hoc
+# `any(k in q for k in ...)` checks scattered in the codebase).
+# ---------------------------------------------------------------------------
+_DECL_KW_RE = re.compile(
+    r"\b(?:"
+    r"dependenc\w+"      # dependency, dependencies, dependent, …
+    r"|librar\w*"        # library, libraries
+    r"|version\w*"       # version, versions, versioned
+    r"|manifest"
+    r"|permission\w*"    # permission, permissions
+    r"|config\w*"        # config, configuration, configured, configs
+    r"|build\w*"         # build, builds, building, build.gradle
+    r"|setting\w*"       # setting, settings
+    r"|requirements"
+    r"|gradle\w*"
+    r"|pom"              # pom, pom.xml
+    r"|pyproject"
+    r"|package\.json"
+    r"|pom\.xml"
+    r")",
+    re.IGNORECASE,
 )
 
 
@@ -431,8 +458,7 @@ def is_declaration_query(query: str, intent: str = "") -> bool:
 
 
 def has_declaration_keywords(query: str) -> bool:
-    q = (query or "").lower()
-    return any(k in q for k in DECLARATION_QUERY_KEYWORDS)
+    return bool(_DECL_KW_RE.search(query or ""))
 
 
 def source_of_truth_guidance(query: str, intent: str = "") -> str:
@@ -542,7 +568,13 @@ def _rank_by_query_hints(paths: list[str], hints: list[str]) -> list[str]:
 
 
 def _intent_source_priority(intent: str, query: str, source_type: str, basename: str) -> int:
-    asks_dependency = any(k in query for k in ("dependenc", "library", "package", "build", "module"))
+    # Use word-tokenised set so that short terms never match mid-word
+    # (e.g. "config" must not fire inside "misconfigured").
+    _qw = set(re.findall(r"\w+", (query or "").lower()))
+    asks_dependency = bool(
+        _qw & {"library", "libraries", "package", "packages", "module", "modules"}
+        or re.search(r"\bdependenc\w+|\bbuild\w*", query, re.IGNORECASE)
+    )
     if intent == "dependency_or_build_inventory":
         if source_type == "dependency_file":
             return 70
@@ -552,8 +584,8 @@ def _intent_source_priority(intent: str, query: str, source_type: str, basename:
             return 20
         return 0
 
-    asks_manifest = any(k in query for k in ("permission", "permissions", "manifest"))
-    asks_config = any(k in query for k in ("config", "configured", "settings", "env", "environment"))
+    asks_manifest = bool(_qw & {"permission", "permissions", "manifest"})
+    asks_config = bool(_qw & {"config", "configured", "settings", "env", "environment"})
     if asks_manifest:
         if source_type == "manifest":
             return 80
@@ -578,9 +610,13 @@ def _intent_source_priority(intent: str, query: str, source_type: str, basename:
 
 
 def _candidate_match_factor(intent: str, query: str, source_type: str) -> float:
-    asks_manifest = any(k in query for k in ("permission", "permissions", "manifest"))
-    asks_config = any(k in query for k in ("config", "configured", "settings", "env", "environment"))
-    asks_dependency = any(k in query for k in ("dependenc", "library", "package", "build", "module"))
+    _qw = set(re.findall(r"\w+", (query or "").lower()))
+    asks_manifest = bool(_qw & {"permission", "permissions", "manifest"})
+    asks_config = bool(_qw & {"config", "configured", "settings", "env", "environment"})
+    asks_dependency = bool(
+        _qw & {"library", "libraries", "package", "packages", "module", "modules"}
+        or re.search(r"\bdependenc\w+|\bbuild\w*", query, re.IGNORECASE)
+    )
 
     if intent == "dependency_or_build_inventory":
         return 1.0 if source_type in {"dependency_file", "build_file"} else 0.25

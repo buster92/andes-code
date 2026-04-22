@@ -1307,8 +1307,12 @@ def _structured_query_results(query: str) -> list[dict]:
             "coverage": {"returned": 1, "total": 1, "partial": False},
         }
 
-    dep_intent = re.search(r"\b(dependenc|library|libraries|package|uses?|framework)\b", q)
-    cfg_intent = re.search(r"\b(config|manifest|permission|capabilit|build|gradle|docker|env)\b", q)
+    # Use prefix patterns (no trailing \b after a fragment) so that
+    # "dependenc\w+" matches "dependency"/"dependencies", and "capabilit\w+"
+    # matches "capability"/"capabilities".  A bare \bdependenc\b would never
+    # match because word-boundary after "dependenc" fails when "ies" follows.
+    dep_intent = re.search(r"\b(dependenc\w+|librar\w*|package\w*|uses?|framework\w*)", q)
+    cfg_intent = re.search(r"\b(config\w*|manifest|permission\w*|capabilit\w+|build|gradle|docker|env)\b", q)
     mod_intent = re.search(r"\b(module|monorepo|workspace|service|package|architecture|entry)\b", q)
 
     chunks = []
@@ -1874,7 +1878,7 @@ def _retrieve_config_first(
             return [_lim] + collected[:n_results]
 
     q = query.lower()
-    asks_permissions = any(k in q for k in ("permission", "permissions", "declared", "manifest"))
+    asks_permissions = any(k in q for k in ("permission", "permissions", "manifest"))
     if asks_permissions:
         permissions = summarize_declared_permissions(collected)
         if permissions:
