@@ -95,3 +95,23 @@ The remote inference server endpoint is `POST /v1/ask` and must build answer con
 - Protocol version is currently `andes.remote.v1`.
 - Embeddings, patch operations, and full repository uploads are intentionally out of scope for v1.
 - Validation is strict and explicit via schema checks to ensure payload compatibility between client and server.
+
+## Locality guarantees (REMOTE_INFERENCE mode)
+
+- Client remains source of truth for repository content and indexing.
+- Client performs retrieval locally and sends only selected retrieved context (`chunks`) plus structured metadata.
+- Server-side `/v1/ask` must answer from request payload only; it does not index or sync the full client repository.
+
+## Operational diagnostics (minimal v1 observability)
+
+- Client/proxy logs include `request_id`, remote mode enabled, `workspace_id`, branch/commit (if available), retrieved chunk count, and payload send outcomes.
+- Server `/v1/ask` logs include `request_id`, protocol version, chunk count, validation failures, generation lifecycle, and stream completion/failure.
+- Logs should stay metadata-only and avoid dumping raw chunk content.
+
+## Error conditions to expect
+
+- `remote_unreachable` (client could not reach remote inference server)
+- `validation_error` (payload schema mismatch)
+- `unsupported_protocol` (protocol version not supported)
+- `empty_retrieval` (no retrieved chunks provided)
+- `remote_stream_interrupted` (stream terminated before completion marker)

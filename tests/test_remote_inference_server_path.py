@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+import urllib.error
 from pathlib import Path
 
 
@@ -238,6 +239,30 @@ class TestRemoteInferenceServerPath(unittest.TestCase):
         self.assertEqual(result["object"], "chat.completion")
         self.assertEqual(result["choices"][0]["message"]["content"], "remote answer")
         self.assertEqual(captured["payload"]["options"]["stream"], False)
+
+    def test_chat_remote_inference_mode_non_stream_unreachable(self):
+        self.server.get_execution_mode = lambda: self.server.ExecutionMode.REMOTE_INFERENCE
+        self.server.INDEXER_READY = True
+        self.server._indexer_module = types.SimpleNamespace(_load_index_state=lambda: {}, ROOT=".")
+        self.server.search_codebase = lambda *_args, **_kwargs: [
+            {"file": "server.py", "content": "def a():\n  pass", "line": 1, "score": 0.7}
+        ]
+        self.server.subprocess.check_output = lambda *args, **kwargs: "stub"
+        self.server.url_request.urlopen = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            urllib.error.URLError("connection refused")
+        )
+
+        class _Req:
+            async def json(self):
+                return {
+                    "messages": [{"role": "user", "content": "what is a?"}],
+                    "stream": False,
+                    "max_tokens": 16,
+                }
+
+        result = asyncio.run(self.server.chat(_Req()))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"]["code"], "remote_unreachable")
 
 
 if __name__ == "__main__":

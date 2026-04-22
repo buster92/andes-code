@@ -293,6 +293,28 @@ For large projects or architectural questions, increase `CONTEXT_CHUNKS` to 7–
 - `REMOTE_INFERENCE`: local indexing + local retrieval remain on the client host. The client builds a strict structured payload (`query`, workspace metadata, retrieval metadata, retrieved chunks, options) and sends it to `${ANDESCODE_REMOTE_SERVER_URL}/v1/ask` for inference-only generation. Server-side `/v1/ask` answers only from that payload.
 - Remote payload contract reference: `docs/remote-inference-contract.md`.
 
+#### Remote inference v1 boundaries (explicit)
+
+- The **repository and index stay local on the client**.
+- AndesCode sends only **selected retrieved chunks + retrieval/workspace metadata** to the configured remote server.
+- AndesCode does **not** send the full repository to the server in `REMOTE_INFERENCE` mode.
+- v1 is inference-only (Q&A). **Code editing/patch application is not included**.
+
+#### Remote observability + failure handling
+
+When `ANDESCODE_EXECUTION_MODE=REMOTE_INFERENCE`, AndesCode emits lightweight metadata logs (no full chunk dumps) in `andes_cache/audit.log`:
+
+- Client/proxy path: `request_id`, execution mode enabled, `workspace_id`, branch/commit (if available), retrieved chunk count, payload send start/success/failure.
+- Server inference path (`/v1/ask`): `request_id`, protocol version, received chunk count, validation failures, generation start/end, stream completion/failure.
+
+Common remote error codes surfaced to clients:
+
+- `remote_unreachable` — remote server cannot be reached.
+- `validation_error` — payload failed schema validation.
+- `unsupported_protocol` — protocol mismatch (currently only `andes.remote.v1`).
+- `empty_retrieval` — no chunks available for remote inference.
+- `remote_stream_interrupted` — streaming ended unexpectedly.
+
 ---
 
 ## Supported Languages

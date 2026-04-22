@@ -733,6 +733,7 @@ async def chat(request: Request):
     )
 
     if execution_mode == ExecutionMode.REMOTE_INFERENCE:
+        _phase_log(request_id, "remote_mode_enabled", enabled=True)
         payload, client_debug = _collect_local_remote_payload(
             messages=messages,
             request_id=request_id,
@@ -741,15 +742,27 @@ async def chat(request: Request):
             stream=stream,
         )
         if payload is None:
+            _phase_log(request_id, "remote_payload_build_failed")
             return client_debug or _remote_error_payload(
                 "remote_payload_unavailable",
                 "Failed to build remote inference payload.",
                 request_id=request_id,
             )
+        workspace_meta = payload.get("workspace", {}) if isinstance(payload, dict) else {}
+        retrieval_meta = payload.get("retrieval", {}) if isinstance(payload, dict) else {}
+        _phase_log(
+            request_id,
+            "remote_payload_ready",
+            workspace_id=workspace_meta.get("workspace_id", "unknown"),
+            branch=workspace_meta.get("branch", "unknown"),
+            commit_hash=workspace_meta.get("commit_hash", "unknown"),
+            retrieved_chunks=retrieval_meta.get("retrieved_chunk_count", 0),
+        )
         endpoint = f"{REMOTE_INFERENCE_SERVER_URL}/v1/ask"
         serialized = json.dumps(payload).encode("utf-8")
         if stream:
             async def _proxy_stream():
+                saw_done = False
                 try:
                     req = url_request.Request(
                         endpoint,
@@ -757,19 +770,55 @@ async def chat(request: Request):
                         headers={"Content-Type": "application/json"},
                         method="POST",
                     )
+                    _phase_log(request_id, "remote_payload_send_started", endpoint=endpoint, stream=True)
                     with url_request.urlopen(req, timeout=180) as resp:
                         while True:
                             part = resp.read(4096)
                             if not part:
                                 break
-                            yield part.decode("utf-8", errors="ignore")
+                            decoded = part.decode("utf-8", errors="ignore")
+                            if "[DONE]" in decoded:
+                                saw_done = True
+                            yield decoded
+                    _phase_log(request_id, "remote_payload_send_succeeded", stream=True)
+                except url_error.URLError as exc:
+                    reason = getattr(exc, "reason", exc)
+                    _phase_log(request_id, "remote_payload_send_failed", stream=True, error=reason)
+                    yield _remote_proxy_sse_error(
+                        request_id,
+                        "remote_unreachable",
+                        f"Remote server unreachable: {reason}",
+                    )
+                    yield "data: [DONE]\n\n"
                 except url_error.HTTPError as exc:
                     detail = exc.read().decode("utf-8", errors="ignore")
-                    yield f'data: {json.dumps({"object":"andescode.error","error":{"phase":"remote_proxy","message":detail or str(exc)}})}\n\n'
+                    _phase_log(request_id, "remote_payload_send_failed", stream=True, status=exc.code)
+                    code = "remote_http_error"
+                    try:
+                        parsed = json.loads(detail) if detail else {}
+                        if isinstance(parsed, dict):
+                            code = (
+                                ((parsed.get("error") or {}).get("code"))
+                                or parsed.get("code")
+                                or code
+                            )
+                    except Exception:
+                        pass
+                    yield _remote_proxy_sse_error(request_id, code, detail or str(exc))
                     yield "data: [DONE]\n\n"
                 except Exception as exc:
-                    yield f'data: {json.dumps({"object":"andescode.error","error":{"phase":"remote_proxy","message":str(exc)}})}\n\n'
+                    _phase_log(request_id, "remote_payload_send_failed", stream=True, error=exc)
+                    yield _remote_proxy_sse_error(request_id, "remote_stream_interrupted", str(exc))
                     yield "data: [DONE]\n\n"
+                else:
+                    if not saw_done:
+                        _phase_log(request_id, "remote_stream_interrupted", reason="missing_done_event")
+                        yield _remote_proxy_sse_error(
+                            request_id,
+                            "remote_stream_interrupted",
+                            "Remote stream ended unexpectedly before completion marker.",
+                        )
+                        yield "data: [DONE]\n\n"
             return StreamingResponse(
                 _proxy_stream(),
                 media_type="text/event-stream",
@@ -777,8 +826,10 @@ async def chat(request: Request):
             )
         try:
             req = url_request.Request(endpoint, data=serialized, headers={"Content-Type": "application/json"}, method="POST")
+            _phase_log(request_id, "remote_payload_send_started", endpoint=endpoint, stream=False)
             with url_request.urlopen(req, timeout=180) as resp:
                 remote_response = json.loads(resp.read().decode("utf-8"))
+                _phase_log(request_id, "remote_payload_send_succeeded", stream=False)
                 if isinstance(remote_response, dict) and remote_response.get("ok") is False:
                     return remote_response
                 if not isinstance(remote_response, dict):
@@ -802,7 +853,17 @@ async def chat(request: Request):
                     }],
                     "debug": (remote_debug if debug_mode else None),
                 }
+        except url_error.URLError as exc:
+            reason = getattr(exc, "reason", exc)
+            _phase_log(request_id, "remote_payload_send_failed", stream=False, error=reason)
+            return _remote_error_payload(
+                "remote_unreachable",
+                f"Remote server unreachable: {reason}",
+                request_id=request_id,
+                details=client_debug,
+            )
         except Exception as exc:
+            _phase_log(request_id, "remote_payload_send_failed", stream=False, error=exc)
             return _remote_error_payload("remote_proxy_error", str(exc), request_id=request_id, details=client_debug)
 
     if stream:
@@ -861,12 +922,25 @@ async def remote_inference_ask(request: Request):
     try:
         remote_request = RemoteInferenceRequest.from_dict(body)
         request_id = remote_request.query.request_id
+        _phase_log(
+            request_id,
+            "remote_ask_received",
+            protocol_version=remote_request.client.protocol_version,
+            chunk_count=len(remote_request.chunks),
+        )
     except SchemaValidationError as exc:
+        _phase_log(request_id, "remote_ask_validation_failed", error=exc)
         return _remote_error_payload("validation_error", str(exc), request_id=request_id)
     except Exception as exc:
+        _phase_log(request_id, "remote_ask_invalid_payload", error=exc)
         return _remote_error_payload("invalid_payload", str(exc), request_id=request_id)
 
     if remote_request.client.protocol_version != RemoteProtocol.V1.value:
+        _phase_log(
+            request_id,
+            "remote_ask_unsupported_protocol",
+            received=remote_request.client.protocol_version,
+        )
         return _remote_error_payload(
             "unsupported_protocol",
             "Only protocol andes.remote.v1 is supported.",
@@ -874,9 +948,11 @@ async def remote_inference_ask(request: Request):
             details={"received": remote_request.client.protocol_version},
         )
     if not remote_request.chunks:
+        _phase_log(request_id, "remote_ask_empty_retrieval")
         return _remote_error_payload("empty_retrieval", "chunks must be non-empty", request_id=request_id)
 
     max_tokens = remote_request.options.max_answer_tokens or 1024
+    _phase_log(request_id, "remote_answer_generation_started", stream=remote_request.options.stream, max_tokens=max_tokens)
     prompt_messages, debug_payload = _build_remote_prompt_messages(remote_request)
     prompt = _messages_to_prompt(prompt_messages)
 
@@ -892,9 +968,12 @@ async def remote_inference_ask(request: Request):
                     yield _make_chunk(token, request_id)
                 if remote_request.options.debug:
                     yield format_debug_sse_event(debug_payload)
+                _phase_log(request_id, "remote_stream_completed", answer_chars=len(final_text))
             except Exception as exc:
-                yield f'data: {json.dumps({"object":"andescode.error","error":{"phase":"remote_inference","message":str(exc)}})}\n\n'
+                _phase_log(request_id, "remote_stream_failed", error=exc)
+                yield _remote_proxy_sse_error(request_id, "generation_failed", str(exc), phase="remote_inference")
             finally:
+                _phase_log(request_id, "remote_answer_generation_finished", stream=True)
                 yield "data: [DONE]\n\n"
         return StreamingResponse(
             _remote_stream(),
@@ -906,8 +985,10 @@ async def remote_inference_ask(request: Request):
         result = llm(prompt, max_tokens=max_tokens, echo=False, stream=False)
         text = result["choices"][0]["text"]
     except Exception as exc:
+        _phase_log(request_id, "remote_answer_generation_failed", stream=False, error=exc)
         return _remote_error_payload("generation_failed", str(exc), request_id=request_id)
 
+    _phase_log(request_id, "remote_answer_generation_finished", stream=False, answer_chars=len(text or ""))
     response = {
         "ok": True,
         "event": "final_answer",
@@ -1145,6 +1226,19 @@ def _remote_error_payload(code: str, message: str, *, request_id: str = "", deta
             "details": details or {},
         },
     }
+
+
+def _remote_proxy_sse_error(request_id: str, code: str, message: str, *, phase: str = "remote_proxy") -> str:
+    payload = {
+        "object": "andescode.error",
+        "error": {
+            "phase": phase,
+            "code": code,
+            "request_id": request_id or "unknown",
+            "message": message,
+        },
+    }
+    return f"data: {json.dumps(payload)}\n\n"
 
 
 def _authority_priority(authority: str) -> int:
