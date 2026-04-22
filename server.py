@@ -10,12 +10,18 @@ os.environ["TOKENIZERS_PARALLELISM"]            = "false"
 import contextlib
 import json
 import logging
+import platform
 import re
+import socket
+import subprocess
 import sys
 import time
 import uuid
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib import error as url_error
+from urllib import request as url_request
 
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
@@ -52,6 +58,11 @@ from ask_orchestrator import (
 )
 from execution_mode import ExecutionMode, execution_mode_env_key, get_execution_mode
 from local_retrieval import normalize_local_retrieval
+from remote_inference_schema import (
+    RemoteInferenceRequest,
+    RemoteProtocol,
+    SchemaValidationError,
+)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_DIR       = Path(__file__).parent
@@ -63,6 +74,7 @@ CACHE_SIZE_GB  = float(os.getenv("CACHE_SIZE_GB", 2.0))
 MODEL_CONTEXT_WINDOW = int(os.getenv("MODEL_CONTEXT_WINDOW", 8192))
 CONTEXT_RESERVED_RESPONSE_TOKENS = int(os.getenv("CONTEXT_RESERVED_RESPONSE_TOKENS", 1400))
 CONTEXT_SAFETY_MARGIN_TOKENS = int(os.getenv("CONTEXT_SAFETY_MARGIN_TOKENS", 256))
+REMOTE_INFERENCE_SERVER_URL = os.getenv("ANDESCODE_REMOTE_SERVER_URL", "http://127.0.0.1:8080").rstrip("/")
 # Snapshot for startup visibility only.
 # NOTE: If you change ANDESCODE_DEBUG_MODE in .env while the server is running,
 # this startup value will not change until restart. Request-level debug still
@@ -721,16 +733,53 @@ async def chat(request: Request):
     )
 
     if execution_mode == ExecutionMode.REMOTE_INFERENCE:
-        return {
-            "id": f"chatcmpl-{request_id}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": "andescode-gemma4-26b",
-            "error": {
-                "code": "remote_inference_not_wired",
-                "message": "REMOTE_INFERENCE mode is enabled but server-side remote payload flow is not wired yet.",
-            },
-        }
+        payload, client_debug = _collect_local_remote_payload(
+            messages=messages,
+            request_id=request_id,
+            max_tokens=max_tokens,
+            debug_mode=debug_mode,
+        )
+        if payload is None:
+            return client_debug or _remote_error_payload(
+                "remote_payload_unavailable",
+                "Failed to build remote inference payload.",
+                request_id=request_id,
+            )
+        endpoint = f"{REMOTE_INFERENCE_SERVER_URL}/v1/ask"
+        serialized = json.dumps(payload).encode("utf-8")
+        if stream:
+            async def _proxy_stream():
+                try:
+                    req = url_request.Request(
+                        endpoint,
+                        data=serialized,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with url_request.urlopen(req, timeout=180) as resp:
+                        while True:
+                            part = resp.read(4096)
+                            if not part:
+                                break
+                            yield part.decode("utf-8", errors="ignore")
+                except url_error.HTTPError as exc:
+                    detail = exc.read().decode("utf-8", errors="ignore")
+                    yield f'data: {json.dumps({"object":"andescode.error","error":{"phase":"remote_proxy","message":detail or str(exc)}})}\n\n'
+                    yield "data: [DONE]\n\n"
+                except Exception as exc:
+                    yield f'data: {json.dumps({"object":"andescode.error","error":{"phase":"remote_proxy","message":str(exc)}})}\n\n'
+                    yield "data: [DONE]\n\n"
+            return StreamingResponse(
+                _proxy_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+            )
+        try:
+            req = url_request.Request(endpoint, data=serialized, headers={"Content-Type": "application/json"}, method="POST")
+            with url_request.urlopen(req, timeout=180) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            return _remote_error_payload("remote_proxy_error", str(exc), request_id=request_id, details=client_debug)
 
     if stream:
         # TODO(phase3): streaming path not yet wrapped by LocalAskOrchestrator — bypasses orchestration boundary
@@ -779,6 +828,72 @@ async def chat(request: Request):
                      "finish_reason": "stop"}],
         "debug": (debug_payload if debug_mode else None),
     }
+
+
+@app.post("/v1/ask")
+async def remote_inference_ask(request: Request):
+    body = await request.json()
+    request_id = str(uuid.uuid4())[:8]
+    try:
+        remote_request = RemoteInferenceRequest.from_dict(body)
+        request_id = remote_request.query.request_id
+    except SchemaValidationError as exc:
+        return _remote_error_payload("validation_error", str(exc), request_id=request_id)
+    except Exception as exc:
+        return _remote_error_payload("invalid_payload", str(exc), request_id=request_id)
+
+    if remote_request.client.protocol_version != RemoteProtocol.V1.value:
+        return _remote_error_payload(
+            "unsupported_protocol",
+            "Only protocol andes.remote.v1 is supported.",
+            request_id=request_id,
+            details={"received": remote_request.client.protocol_version},
+        )
+    if not remote_request.chunks:
+        return _remote_error_payload("empty_retrieval", "chunks must be non-empty", request_id=request_id)
+
+    max_tokens = remote_request.options.max_answer_tokens or 1024
+    prompt_messages, debug_payload = _build_remote_prompt_messages(remote_request)
+    prompt = _messages_to_prompt(prompt_messages)
+
+    if remote_request.options.stream:
+        async def _remote_stream():
+            final_text = ""
+            try:
+                for chunk in llm(prompt, max_tokens=max_tokens, stream=True, echo=False):
+                    token = chunk["choices"][0]["text"]
+                    if not token:
+                        continue
+                    final_text += token
+                    yield _make_chunk(token, request_id)
+                if remote_request.options.debug:
+                    yield format_debug_sse_event(debug_payload)
+            except Exception as exc:
+                yield f'data: {json.dumps({"object":"andescode.error","error":{"phase":"remote_inference","message":str(exc)}})}\n\n'
+            finally:
+                yield "data: [DONE]\n\n"
+        return StreamingResponse(
+            _remote_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
+
+    try:
+        result = llm(prompt, max_tokens=max_tokens, echo=False, stream=False)
+        text = result["choices"][0]["text"]
+    except Exception as exc:
+        return _remote_error_payload("generation_failed", str(exc), request_id=request_id)
+
+    response = {
+        "ok": True,
+        "event": "final_answer",
+        "request_id": request_id,
+        "answer": _strip_thinking(text, strip_edges=True),
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if remote_request.options.debug:
+        response["debug"] = debug_payload
+    return response
 
 
 @app.post("/v1/debug/explain")
@@ -994,6 +1109,205 @@ def _build_context(
         audit.warning(f"CONTEXT_FAIL {request_id} | {_safe(e)}")
         return (messages, None) if return_debug else messages
 
+
+def _remote_error_payload(code: str, message: str, *, request_id: str = "", details: dict | None = None) -> dict:
+    return {
+        "ok": False,
+        "error": {
+            "event": "error",
+            "request_id": request_id or "unknown",
+            "code": code,
+            "message": message,
+            "details": details or {},
+        },
+    }
+
+
+def _authority_priority(authority: str) -> int:
+    normalized = (authority or "").lower()
+    if normalized == "declared":
+        return 0
+    if normalized == "referenced":
+        return 1
+    if normalized == "inferred":
+        return 2
+    return 3
+
+
+def _build_remote_prompt_messages(remote_request: RemoteInferenceRequest) -> tuple[list, dict]:
+    chunks_sorted = sorted(
+        remote_request.chunks,
+        key=lambda c: (_authority_priority(c.authority), -float(c.score), c.path, c.start_line),
+    )
+    query = remote_request.query.text
+    reasoning_policy, query_type = _reasoning_policy_for_query(query)
+    workspace_meta = remote_request.workspace
+    retrieval_meta = remote_request.retrieval
+    workspace_prefix = (
+        "Remote workspace metadata (client-reported):\n"
+        f"- Workspace ID: {workspace_meta.workspace_id}\n"
+        f"- Repository: {workspace_meta.repo_name}\n"
+        f"- Repo root: {workspace_meta.repo_root_name}\n"
+        f"- Branch: {workspace_meta.branch}\n"
+        f"- Commit: {workspace_meta.commit_hash}\n"
+        f"- Dirty working tree: {workspace_meta.is_dirty}\n"
+        f"- Retrieval strategy: {retrieval_meta.strategy}\n"
+        f"- Retrieved chunks: {retrieval_meta.retrieved_chunk_count}\n\n"
+        "Important: You only have the retrieved chunks below; never claim access to files that are not included."
+    )
+    retrieval_lines = []
+    for idx, chunk in enumerate(chunks_sorted, start=1):
+        retrieval_lines.append(
+            f"[{idx}] {chunk.path}:{chunk.start_line}-{chunk.end_line} "
+            f"(authority={chunk.authority}; source_type={chunk.source_type}; score={chunk.score:.3f})\n"
+            f"{chunk.content}"
+        )
+    retrieval_context = "\n\n".join(retrieval_lines)
+    sections = build_prompt_sections(
+        system_prefix=_BASE_SYSTEM,
+        reasoning_policy=reasoning_policy,
+        workspace_prefix=workspace_prefix,
+        retrieval_context=retrieval_context,
+        user_turn="",
+    )
+    prompt_messages = [
+        {"role": "system", "content": serialize_prompt_sections(sections)},
+        {"role": "user", "content": query},
+    ]
+    debug_payload = {
+        "mode": "remote_inference_server",
+        "protocol_version": remote_request.client.protocol_version,
+        "request_id": remote_request.query.request_id,
+        "query_type": query_type,
+        "workspace": {
+            "repo_name": workspace_meta.repo_name,
+            "branch": workspace_meta.branch,
+            "commit_hash": workspace_meta.commit_hash,
+            "is_dirty": workspace_meta.is_dirty,
+        },
+        "retrieval": {
+            "strategy": retrieval_meta.strategy,
+            "index_state": retrieval_meta.index_state,
+            "retrieved_chunk_count": retrieval_meta.retrieved_chunk_count,
+            "total_candidate_files": retrieval_meta.total_candidate_files,
+            "files_retrieved": sorted({c.path for c in chunks_sorted}),
+        },
+    }
+    return prompt_messages, debug_payload
+
+
+def _collect_local_remote_payload(*, messages: list, request_id: str, max_tokens: int, debug_mode: bool) -> tuple[dict | None, dict | None]:
+    query = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "").strip()
+    if not query:
+        return None, _remote_error_payload("validation_error", "query is required", request_id=request_id)
+    if not INDEXER_READY or not _indexer_module:
+        return None, _remote_error_payload(
+            "index_not_ready",
+            "Local index is required for REMOTE_INFERENCE mode retrieval.",
+            request_id=request_id,
+        )
+    index_state = _indexer_module._load_index_state() if hasattr(_indexer_module, "_load_index_state") else {}
+    retrieval_debug = None
+    if debug_mode:
+        chunks, retrieval_debug = search_codebase(
+            query,
+            n_results=CONTEXT_CHUNKS,
+            debug_mode=True,
+            return_debug=True,
+        )
+    else:
+        chunks = search_codebase(query, n_results=CONTEXT_CHUNKS, debug_mode=False)
+    normalized = normalize_local_retrieval(
+        query=query,
+        chunks=chunks,
+        strategy="remote_inference_client_payload",
+        top_k=CONTEXT_CHUNKS,
+        retrieval_mode=ExecutionMode.REMOTE_INFERENCE.value,
+        index_state=index_state if isinstance(index_state, dict) else {},
+    )
+    if not normalized.chunks:
+        return None, _remote_error_payload(
+            "empty_retrieval",
+            "No retrieved chunks were found for this query.",
+            request_id=request_id,
+        )
+    repo_name = "unknown"
+    branch = "unknown"
+    commit_hash = "unknown"
+    is_dirty = False
+    repo_root_name = "workspace"
+    if hasattr(_indexer_module, "ROOT"):
+        try:
+            root_path = Path(str(_indexer_module.ROOT)).resolve()
+            repo_root_name = root_path.name or "workspace"
+            repo_name = root_path.name or "unknown"
+        except Exception:
+            pass
+    try:
+        branch = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True, cwd=str(_indexer_module.ROOT)).strip()
+        commit_hash = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, cwd=str(_indexer_module.ROOT)).strip()
+        status = subprocess.check_output(["git", "status", "--porcelain"], text=True, cwd=str(_indexer_module.ROOT)).strip()
+        is_dirty = bool(status)
+    except Exception:
+        pass
+    payload = {
+        "client": {
+            "client_version": "andescode-local-client-v1",
+            "protocol_version": RemoteProtocol.V1.value,
+            "platform": f"{platform.system().lower()}-{platform.machine().lower()}",
+            "hostname": socket.gethostname(),
+        },
+        "workspace": {
+            "workspace_id": repo_name,
+            "repo_name": repo_name,
+            "repo_root_name": repo_root_name,
+            "branch": branch,
+            "commit_hash": commit_hash,
+            "is_dirty": is_dirty,
+        },
+        "query": {
+            "request_id": request_id,
+            "text": query,
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+        },
+        "retrieval": {
+            "strategy": normalized.summary.strategy,
+            "top_k": normalized.summary.top_k,
+            "indexed_at": normalized.summary.indexed_at or datetime.now(timezone.utc).isoformat(),
+            "index_state": normalized.summary.index_state,
+            "total_candidate_files": normalized.summary.total_candidate_files,
+            "retrieved_chunk_count": normalized.summary.retrieved_chunk_count,
+            "retrieval_mode": normalized.summary.retrieval_mode,
+        },
+        "chunks": [
+            {
+                "chunk_id": c.chunk_id,
+                "path": c.path,
+                "language": c.language,
+                "start_line": c.start_line,
+                "end_line": c.end_line,
+                "score": c.score,
+                "source_type": c.source_type,
+                "authority": c.authority,
+                "authority_reason": c.authority_reason,
+                "content": c.content,
+            }
+            for c in normalized.chunks
+        ],
+        "options": {
+            "stream": True,
+            "debug": debug_mode,
+            "max_answer_tokens": max_tokens,
+        },
+    }
+    client_debug = {
+        "mode": "remote_inference_client",
+        "request_id": request_id,
+        "remote_server_url": REMOTE_INFERENCE_SERVER_URL,
+        "retrieval": normalized.to_debug_dict(),
+        "retrieval_debug": retrieval_debug,
+    }
+    return payload, client_debug
 
 # ── Two-step planning ─────────────────────────────────────────────────────────
 

@@ -282,6 +282,7 @@ HF_DATASETS_OFFLINE=1
 HF_HUB_OFFLINE=1
 TOKENIZERS_PARALLELISM=false
 ANDESCODE_EXECUTION_MODE=LOCAL  # LOCAL (default) or REMOTE_INFERENCE
+ANDESCODE_REMOTE_SERVER_URL=http://127.0.0.1:8080  # used only in REMOTE_INFERENCE mode
 ```
 
 For large projects or architectural questions, increase `CONTEXT_CHUNKS` to 7–10. The retrieval pipeline automatically widens its candidate pool for broad queries — this setting controls how many final chunks land in the prompt.
@@ -289,7 +290,7 @@ For large projects or architectural questions, increase `CONTEXT_CHUNKS` to 7–
 ### Execution modes
 
 - `LOCAL` (default): existing end-to-end behavior (local indexing, retrieval, and inference).
-- `REMOTE_INFERENCE`: distributed rollout path. Retrieval output is now normalized in local mode as well (`query + retrieval summary + chunks with path/line/source authority metadata`) so both modes share the same retrieval result structure before server-side inference is enabled.
+- `REMOTE_INFERENCE`: local indexing + local retrieval remain on the client host. The client builds a strict structured payload (`query`, workspace metadata, retrieval metadata, retrieved chunks, options) and sends it to `${ANDESCODE_REMOTE_SERVER_URL}/v1/ask` for inference-only generation. Server-side `/v1/ask` answers only from that payload.
 - Remote payload contract reference: `docs/remote-inference-contract.md`.
 
 ---
@@ -323,7 +324,7 @@ However, users are responsible for validating their own environment and dependen
 ## FAQ
 
 **Does any code leave my machine?**  
-No. Inference is entirely local. The only outbound connections are the one-time model download (~16GB) and embedding weights (~90MB) from Hugging Face on first run. Both are cached permanently. Offline flags are enforced at the OS level so no library can phone home during inference.
+In `LOCAL` mode, no repository content leaves your machine during inference. In `REMOTE_INFERENCE` mode, AndesCode sends only the retrieved chunks and metadata required for answer generation to your configured remote server (`ANDESCODE_REMOTE_SERVER_URL`), not the full repository.
 
 **Does it integrate with VS Code, Cursor, or other IDEs?**  
 Not at this time. AndesCode is a standalone desktop app with its own interface. IDE plugin integration is on the roadmap but not currently supported.
