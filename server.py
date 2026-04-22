@@ -44,6 +44,13 @@ from andes_cache.routing import (
     orchestration_plan,
 )
 from auto_index import AutoIndexManager, ChangeBatch
+from ask_orchestrator import (
+    FunctionAnswerContextBuilder,
+    FunctionRetrievalProvider,
+    LlamaAnswerEngine,
+    LocalAskOrchestrator,
+)
+from execution_mode import ExecutionMode, execution_mode_env_key, get_execution_mode
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_DIR       = Path(__file__).parent
@@ -704,11 +711,28 @@ async def chat(request: Request):
     debug_mode = _resolve_request_debug_mode(api_debug)
     request_id = str(uuid.uuid4())[:8]
     t_start    = time.perf_counter()
+    execution_mode = get_execution_mode()
 
     audit.info(f"REQUEST {request_id} | tokens={max_tokens} | messages={len(messages)}")
     audit.info(f"DEBUG_MODE {request_id} | request_flag={api_debug!r} | enabled={debug_mode}")
+    audit.info(
+        f"EXECUTION_MODE {request_id} | mode={execution_mode.value} | source={execution_mode_env_key()}"
+    )
+
+    if execution_mode == ExecutionMode.REMOTE_INFERENCE:
+        return {
+            "id": f"chatcmpl-{request_id}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": "andescode-gemma4-26b",
+            "error": {
+                "code": "remote_inference_not_wired",
+                "message": "REMOTE_INFERENCE mode is enabled but server-side remote payload flow is not wired yet.",
+            },
+        }
 
     if stream:
+        # TODO(phase3): streaming path not yet wrapped by LocalAskOrchestrator — bypasses orchestration boundary
         return StreamingResponse(
             _stream(messages, max_tokens, request_id, t_start, debug_mode=debug_mode),
             media_type="text/event-stream",
@@ -716,17 +740,25 @@ async def chat(request: Request):
                      "X-Accel-Buffering": "no"},
         )
 
-    messages, debug_payload = _build_context(
-        messages, request_id, debug_mode=debug_mode, return_debug=True
+    orchestrator = LocalAskOrchestrator(
+        retrieval=FunctionRetrievalProvider(build_context_fn=_build_context),
+        context_builder=FunctionAnswerContextBuilder(to_prompt_fn=_messages_to_prompt),
+        answer_engine=LlamaAnswerEngine(llm=llm),
+        strip_thinking=_strip_thinking,
+        is_performance_query=_is_performance_query,
+        validate_high_signal_output=_validate_high_signal_output,
     )
-    audit.info(f"DEBUG_PAYLOAD {request_id} | generated={bool(debug_payload)}")
-    user_query = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
-    is_performance = _is_performance_query(user_query)
-    prompt   = _messages_to_prompt(messages)
     try:
-        result = llm(prompt, max_tokens=max_tokens, echo=False)
-        text   = _strip_thinking(result["choices"][0]["text"], strip_edges=True)
-        text, filtered_out = _validate_high_signal_output(text, is_performance)
+        text, debug_payload = orchestrator.run_non_stream(
+            messages=messages,
+            request_id=request_id,
+            max_tokens=max_tokens,
+            debug_mode=debug_mode,
+        )
+        audit.info(f"DEBUG_PAYLOAD {request_id} | generated={bool(debug_payload)}")
+        user_query = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+        is_performance = _is_performance_query(user_query)
+        _, filtered_out = _validate_high_signal_output(text, is_performance)
         query_type = "performance" if is_performance else "general"
         audit.info(
             f"HIGH_SIGNAL {request_id} | query_type={query_type} | "
