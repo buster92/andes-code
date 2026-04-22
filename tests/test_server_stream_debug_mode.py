@@ -718,7 +718,7 @@ class TestServerStreamingDebugMode(unittest.TestCase):
             else:
                 os.environ["ANDESCODE_EXECUTION_MODE"] = prev_mode
 
-    def test_chat_non_stream_remote_inference_placeholder_contract(self):
+    def test_chat_non_stream_remote_inference_requires_local_retrieval_payload(self):
         server = self.server
         prev_mode = os.environ.get("ANDESCODE_EXECUTION_MODE")
         os.environ["ANDESCODE_EXECUTION_MODE"] = "REMOTE_INFERENCE"
@@ -737,8 +737,8 @@ class TestServerStreamingDebugMode(unittest.TestCase):
                     "max_tokens": 16,
                 },
             )
-            self.assertEqual(response["object"], "chat.completion")
-            self.assertEqual(response["error"]["code"], "remote_inference_not_wired")
+            self.assertFalse(response["ok"])
+            self.assertEqual(response["error"]["code"], "index_not_ready")
             self.assertTrue(response["error"]["message"])
         finally:
             server.LocalAskOrchestrator = original_orchestrator

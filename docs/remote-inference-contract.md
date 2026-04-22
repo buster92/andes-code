@@ -3,6 +3,7 @@
 AndesCode now includes typed request/response schemas for distributed inference payloads in `remote_inference_schema.py`.
 In LOCAL mode, retrieval is now normalized into this same shape internally before prompt packing so local and remote inference paths share the same retrieval result structure.
 Some LOCAL summary fields (for example `total_candidate_files`) may be approximate when only local retrieved chunks are available.
+The remote inference server endpoint is `POST /v1/ask` and must build answer context from the payload only.
 
 ## Request model (`RemoteInferenceRequest`)
 
