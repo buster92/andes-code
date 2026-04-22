@@ -738,6 +738,7 @@ async def chat(request: Request):
             request_id=request_id,
             max_tokens=max_tokens,
             debug_mode=debug_mode,
+            stream=stream,
         )
         if payload is None:
             return client_debug or _remote_error_payload(
@@ -777,7 +778,30 @@ async def chat(request: Request):
         try:
             req = url_request.Request(endpoint, data=serialized, headers={"Content-Type": "application/json"}, method="POST")
             with url_request.urlopen(req, timeout=180) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                remote_response = json.loads(resp.read().decode("utf-8"))
+                if isinstance(remote_response, dict) and remote_response.get("ok") is False:
+                    return remote_response
+                if not isinstance(remote_response, dict):
+                    return _remote_error_payload(
+                        "remote_proxy_error",
+                        "Remote response was not a JSON object",
+                        request_id=request_id,
+                        details=client_debug,
+                    )
+                answer_text = str(remote_response.get("answer") or "")
+                remote_debug = remote_response.get("debug")
+                return {
+                    "id": f"chatcmpl-{request_id}",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": "andescode-gemma4-26b",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": answer_text},
+                        "finish_reason": "stop",
+                    }],
+                    "debug": (remote_debug if debug_mode else None),
+                }
         except Exception as exc:
             return _remote_error_payload("remote_proxy_error", str(exc), request_id=request_id, details=client_debug)
 
@@ -1196,7 +1220,15 @@ def _build_remote_prompt_messages(remote_request: RemoteInferenceRequest) -> tup
     return prompt_messages, debug_payload
 
 
-def _collect_local_remote_payload(*, messages: list, request_id: str, max_tokens: int, debug_mode: bool) -> tuple[dict | None, dict | None]:
+def _collect_local_remote_payload(
+    *,
+    messages: list,
+    request_id: str,
+    max_tokens: int,
+    debug_mode: bool,
+    stream: bool,
+) -> tuple[dict | None, dict | None]:
+    # TODO(phase6): remote payload generation currently uses direct local retrieval only; align with planned-context/local orchestration retrieval for parity
     query = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "").strip()
     if not query:
         return None, _remote_error_payload("validation_error", "query is required", request_id=request_id)
@@ -1295,7 +1327,7 @@ def _collect_local_remote_payload(*, messages: list, request_id: str, max_tokens
             for c in normalized.chunks
         ],
         "options": {
-            "stream": True,
+            "stream": stream,
             "debug": debug_mode,
             "max_answer_tokens": max_tokens,
         },

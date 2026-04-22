@@ -198,6 +198,8 @@ class TestRemoteInferenceServerPath(unittest.TestCase):
         ]
         self.server.subprocess.check_output = lambda *args, **kwargs: "stub"
 
+        captured = {"payload": None}
+
         class _Resp:
             def __init__(self, body: dict):
                 self._body = json.dumps(body).encode("utf-8")
@@ -211,7 +213,18 @@ class TestRemoteInferenceServerPath(unittest.TestCase):
             def __exit__(self, *_args):
                 return False
 
-        self.server.url_request.urlopen = lambda *_args, **_kwargs: _Resp({"ok": True, "event": "final_answer"})
+        class _ReqObj:
+            def __init__(self, data):
+                self.data = data
+
+        def _request_stub(_url, data=None, headers=None, method=None):
+            captured["payload"] = json.loads(data.decode("utf-8"))
+            return _ReqObj(data)
+
+        self.server.url_request.Request = _request_stub
+        self.server.url_request.urlopen = lambda *_args, **_kwargs: _Resp(
+            {"ok": True, "event": "final_answer", "answer": "remote answer"}
+        )
 
         class _Req:
             async def json(self):
@@ -222,8 +235,9 @@ class TestRemoteInferenceServerPath(unittest.TestCase):
                 }
 
         result = asyncio.run(self.server.chat(_Req()))
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["event"], "final_answer")
+        self.assertEqual(result["object"], "chat.completion")
+        self.assertEqual(result["choices"][0]["message"]["content"], "remote answer")
+        self.assertEqual(captured["payload"]["options"]["stream"], False)
 
 
 if __name__ == "__main__":
