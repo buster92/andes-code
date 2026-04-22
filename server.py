@@ -51,6 +51,7 @@ from ask_orchestrator import (
     LocalAskOrchestrator,
 )
 from execution_mode import ExecutionMode, execution_mode_env_key, get_execution_mode
+from local_retrieval import normalize_local_retrieval
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_DIR       = Path(__file__).parent
@@ -890,6 +891,7 @@ def _build_context(
         return (messages, None) if return_debug else messages
 
     try:
+        index_state = _indexer_module._load_index_state() if _indexer_module and hasattr(_indexer_module, "_load_index_state") else {}
         # ── Project map ───────────────────────────────────────────────────────
         pmap        = _indexer_module._load_project_map() if _indexer_module else {}
         ws          = _indexer_module._load_workspace_index() if _indexer_module else {}
@@ -913,7 +915,19 @@ def _build_context(
         else:
             chunks = search_codebase(query, n_results=CONTEXT_CHUNKS, debug_mode=debug_mode)
 
-        if not chunks:
+        normalized = normalize_local_retrieval(
+            query=query,
+            chunks=chunks,
+            strategy="direct_retrieval",
+            top_k=CONTEXT_CHUNKS,
+            retrieval_mode=get_execution_mode().value,
+            index_state=index_state if isinstance(index_state, dict) else {},
+        )
+        normalized_chunks = normalized.to_prompt_chunks()
+        if retrieval_debug is not None:
+            retrieval_debug["normalized_retrieval"] = normalized.to_debug_dict()
+
+        if not normalized_chunks:
             sections = build_prompt_sections(
                 system_prefix=_BASE_SYSTEM,
                 reasoning_policy=reasoning_policy,
@@ -943,7 +957,7 @@ def _build_context(
         code_section, packing_info = _pack_context_section(
             query=query,
             map_section=map_section,
-            chunks=chunks,
+            chunks=normalized_chunks,
             anchor_files=anchor_files,
             conversation_messages=[m for m in messages if m.get("role") != "system"],
             authoritative_files=authoritative_files,
@@ -967,7 +981,7 @@ def _build_context(
             system = serialize_prompt_sections(sections)
 
         audit.info(
-            f"CONTEXT {request_id} | chunks={len(chunks)} | "
+            f"CONTEXT {request_id} | chunks={len(normalized_chunks)} | "
             f"packed={packing_info['packed_chunks']} | files={packing_info['kept_files']}"
         )
 
@@ -1562,6 +1576,7 @@ def _build_context_from_plan(
         map_section = format_project_map_for_prompt(pmap)
     repo_fp = _indexer_module.get_repo_fingerprint() if _indexer_module else ""
     mode = (diagnosis or {}).get("mode", "bugfix")
+    index_state = _indexer_module._load_index_state() if _indexer_module and hasattr(_indexer_module, "_load_index_state") else {}
 
     all_chunks  = []
     files_loaded = []
@@ -1722,11 +1737,23 @@ def _build_context_from_plan(
             audit.warning("authoritative retrieval failure (not packing failure)")
         return (messages, [], debug_payload) if return_debug else (messages, [])
 
+    normalized = normalize_local_retrieval(
+        query=query,
+        chunks=all_chunks,
+        strategy="planned_context",
+        top_k=CONTEXT_CHUNKS,
+        retrieval_mode=get_execution_mode().value,
+        index_state=index_state if isinstance(index_state, dict) else {},
+    )
+    normalized_chunks = normalized.to_prompt_chunks()
+    if debug_payload is not None:
+        debug_payload["normalized_retrieval"] = normalized.to_debug_dict()
+
     anchor_files = _extract_anchor_files(query)
     code_section, packing_info = _pack_context_section(
         query=query,
         map_section=map_section,
-        chunks=all_chunks,
+        chunks=normalized_chunks,
         anchor_files=anchor_files,
         planned_files=planned_files,
         neighbor_files=neighbor_files,
@@ -1746,7 +1773,7 @@ def _build_context_from_plan(
 
     audit.info(
         f"CONTEXT {request_id} | planned={planned_files} | "
-        f"loaded={files_loaded} | chunks={len(all_chunks)} | "
+        f"loaded={files_loaded} | chunks={len(normalized_chunks)} | "
         f"packed={packing_info['packed_chunks']} | kept={packing_info['kept_files']}"
     )
 
