@@ -177,4 +177,9 @@ def orchestration_plan(intent: str) -> dict:
 
 
 def _score(q: str, words: set[str], terms: set[str]) -> int:
-    return sum(1 for t in terms if t in words or t in q)
+    # Use only the pre-tokenised word set, never bare substring matching.
+    # `t in q` was a substring fallback that caused false positives: e.g.
+    # "go" matched inside "good", "env" matched inside "environment" even
+    # though "environment" is already an explicit term.  The `words` set
+    # (built with re.findall(r"\w+", q)) gives exact word boundaries for free.
+    return sum(1 for t in terms if t in words)

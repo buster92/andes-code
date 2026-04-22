@@ -38,6 +38,14 @@ from andes_cache.source_of_truth import (
     wants_runtime_usage,
     is_declaration_query,
     has_declaration_keywords,
+    # Dependency-authority helpers
+    DEPENDENCY_BUILD_AUTHORITY_TYPES,
+    context_has_dependency_authority,
+    workspace_has_dependency_files,
+    recover_dependency_build_files,
+    no_dependency_files_in_workspace_limitation,
+    dependency_files_not_indexed_limitation,
+    dependency_authority_incomplete_limitation,
 )
 from andes_cache.integrity import (
     INTEGRITY_HEALTHY,
@@ -121,12 +129,17 @@ SUPPORTED_EXTENSIONS = {
     ".go", ".rs", ".java", ".cpp", ".c", ".h",
     ".rb", ".php", ".cs", ".swift", ".kt",
     ".gradle", ".xml",
+    ".toml",        # Rust Cargo.toml, Python pyproject.toml, Gradle version catalogs, etc.
+    ".properties",  # Java/Gradle/Spring project properties files
 }
 
 MANIFEST_FILES = {
     "requirements.txt", "pyproject.toml", "poetry.lock", "Pipfile",
     "package.json", "pnpm-workspace.yaml", "yarn.lock",
     "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
+    # Gradle version catalog — must be present so libs.versions.toml is discovered,
+    # indexed, and available for dependency_or_build_inventory recovery.
+    "libs.versions.toml",
     "Cargo.toml", "go.mod", "pom.xml", "build.sbt",
     "Podfile", "Package.swift", "AndroidManifest.xml", "Dockerfile", "docker-compose.yml",
 }
@@ -567,6 +580,14 @@ def search(
         payload["retrieval"]["route_taken"] = retrieval_route
         _update_authoritative_debug([], mode="semantic_fallback_blocked")
     repo_fp = get_repo_fingerprint()
+    # For declaration queries, check whether the startup integrity probe flagged
+    # the index as unhealthy. If so, skip the retrieval cache entirely so the
+    # live path can attempt repair/best-effort rather than serving a stale result.
+    _startup_probe_unhealthy = False
+    if decl_query:
+        _probe = get_startup_integrity_probe()
+        _startup_probe_unhealthy = bool(_probe.get("warning_active", False))
+
     if repo_fp:
         cached = CACHE.retrieval_get(
             repo_fp=repo_fp,
@@ -575,45 +596,73 @@ def search(
             intent=intent,
             retrieval_route=retrieval_route,
         )
+        if cached and _startup_probe_unhealthy:
+            cached = None  # index health signal overrides stale cache
         if cached:
             cached_final = list(cached)
-            authoritative_source_types = {"manifest", "build_file", "dependency_file", "config_file"}
-            authoritative_cached = [
-                c
-                for c in cached_final
-                if c.get("source_type") in authoritative_source_types
-                or _matches_authoritative(c.get("file", ""))
-            ]
-            preserve_authoritative_overflow = (
+            _failure_file_markers = {
+                "__source_of_truth_missing__",
+                "__source_of_truth_integrity__",
+                "__no_dependency_files_in_workspace__",
+                "__dependency_files_not_indexed__",
+                "__dependency_authority_incomplete__",
+            }
+            # Bypass stale failure caches: if this is a declaration query and every cached
+            # chunk is a failure/limitation marker, skip the cache and retry live retrieval.
+            _cached_all_failures = (
                 decl_query
-                and len(cached_final) > n_results
-                and len(authoritative_cached) > n_results
+                and cached_final
+                and all(c.get("file") in _failure_file_markers for c in cached_final)
             )
-            cached_visible = cached_final if preserve_authoritative_overflow else cached_final[:n_results]
-            cache_mode = "runtime_fallback_used"
-            if any(c.get("file") in {"__source_of_truth_missing__", "__source_of_truth_integrity__"} for c in cached_visible):
-                cache_mode = "workspace_only_detected_not_indexed"
-            elif authoritative_cached:
-                cache_mode = "direct_chunk_load"
-            if payload is not None:
-                payload = populate_retrieval_snapshot(
-                    payload,
-                    chunks=cached_visible,
-                    raw_candidates=[c.get("file", "") for c in cached_visible],
-                    cache_hit=True,
+            # Bypass manifest-only dep query cache: for dependency_or_build_inventory, a
+            # cached result that contains only manifest/config files (no build_file /
+            # dependency_file) was produced before intent-specific authority checks existed.
+            # Force live retrieval so the dependency recovery pass can run.
+            _cached_dep_authority_missing = (
+                intent == "dependency_or_build_inventory"
+                and cached_final
+                and not context_has_dependency_authority(cached_final)
+            )
+            if _cached_all_failures or _cached_dep_authority_missing:
+                cached = None  # fall through to live retrieval below
+            else:
+                authoritative_source_types = {"manifest", "build_file", "dependency_file", "config_file"}
+                authoritative_cached = [
+                    c
+                    for c in cached_final
+                    if c.get("source_type") in authoritative_source_types
+                    or _matches_authoritative(c.get("file", ""))
+                ]
+                preserve_authoritative_overflow = (
+                    decl_query
+                    and len(cached_final) > n_results
+                    and len(authoritative_cached) > n_results
                 )
-                _update_authoritative_debug(cached_visible, mode=cache_mode, reason="cache hit")
-                payload_out = finalize_payload(payload, cached_visible)
-                payload_out = apply_failure_signals(
-                    payload_out,
-                    query=query,
-                    intent=intent,
-                    retrieval_route=retrieval_route,
-                    top_score=None,
-                    final_chunks=cached_visible,
-                )
-                return _ret(cached_visible, payload_out)
-            return _ret(cached_visible)
+                cached_visible = cached_final if preserve_authoritative_overflow else cached_final[:n_results]
+                cache_mode = "runtime_fallback_used"
+                if any(c.get("file") in _failure_file_markers for c in cached_visible):
+                    cache_mode = "workspace_only_detected_not_indexed"
+                elif authoritative_cached:
+                    cache_mode = "direct_chunk_load"
+                if payload is not None:
+                    payload = populate_retrieval_snapshot(
+                        payload,
+                        chunks=cached_visible,
+                        raw_candidates=[c.get("file", "") for c in cached_visible],
+                        cache_hit=True,
+                    )
+                    _update_authoritative_debug(cached_visible, mode=cache_mode, reason="cache hit")
+                    payload_out = finalize_payload(payload, cached_visible)
+                    payload_out = apply_failure_signals(
+                        payload_out,
+                        query=query,
+                        intent=intent,
+                        retrieval_route=retrieval_route,
+                        top_score=None,
+                        final_chunks=cached_visible,
+                    )
+                    return _ret(cached_visible, payload_out)
+                return _ret(cached_visible)
 
     if retrieval_route == "source_of_truth":
         final = _retrieve_config_first(
@@ -625,7 +674,16 @@ def search(
             strict_authority_mode=decision.get("strict_authority_mode", True),
             debug_payload=payload,
         )
-        if repo_fp and final:
+        _failure_markers = {
+            "__source_of_truth_missing__",
+            "__source_of_truth_integrity__",
+            # Dependency-specific limitation markers (should not be cached as "good" results)
+            "__no_dependency_files_in_workspace__",
+            "__dependency_files_not_indexed__",
+            "__dependency_authority_incomplete__",
+        }
+        _result_is_failure = final and all(c.get("file") in _failure_markers for c in final)
+        if repo_fp and final and not _result_is_failure:
             CACHE.retrieval_set(
                 repo_fp=repo_fp,
                 query=query,
@@ -822,12 +880,12 @@ def search(
                 "_rank": 1.0,
                 "full_file": True,
                 "coverage": {"returned": 1, "total": 1, "partial": False},
-                "source_type": "inferred",
-                "authority_level": "inferred",
+                "source_type": "meta",
+                "authority_level": "notice",
             }
             final = [limitation]
             final = _add_coverage(final)
-            final = annotate_sources(final, source_type="inferred", authority_level="inferred")
+            final = annotate_sources(final, source_type="meta", authority_level="notice")
             if payload is not None:
                 payload = populate_retrieval_snapshot(
                     payload,
@@ -865,6 +923,41 @@ def search(
                 continue
             merged.append(c)
         final_ranked = merged
+
+    # Inject an explicit "no declaration files" notice when the workspace has no
+    # authoritative files at all and the query is asking for declared dependencies.
+    # Without this, the model receives only semantic/inferred results and no signal
+    # that declaration files are absent — a silent fallback that erodes trust.
+    if decl_query and not authoritative_files_required:
+        _no_auth_notice = {
+            "content": (
+                "# No Declaration Files\n"
+                "- No dependency declaration files (build.gradle, package.json, "
+                "requirements.txt, pyproject.toml, Cargo.toml, go.mod, pom.xml, etc.) "
+                "were discovered in the indexed workspace metadata.\n"
+                "- Declared dependencies CANNOT be confirmed from any authoritative "
+                "source-of-truth file.\n"
+                "- The results below are inferred from code usage only — they are NOT "
+                "the same as declared dependencies.\n"
+            ),
+            "file": "__source_of_truth_missing__",
+            "language": "meta",
+            "symbols": "",
+            "score": 0.0,
+            "_rank": 1.0,
+            "full_file": True,
+            "coverage": {"returned": 1, "total": 1, "partial": False},
+            "source_type": "meta",
+            "authority_level": "notice",
+        }
+        final_ranked = [_no_auth_notice] + final_ranked
+        if payload is not None:
+            payload["failure_signals"]["expected_but_missing_authority"] = True
+            _update_authoritative_debug(
+                final_ranked,
+                mode="no_authority_files_in_workspace",
+                reason="declaration query but workspace metadata contains no manifest files",
+            )
 
     # Add coverage metadata — lets server tell model how much of each file it has
     final = _add_coverage(final_ranked)
@@ -1214,8 +1307,12 @@ def _structured_query_results(query: str) -> list[dict]:
             "coverage": {"returned": 1, "total": 1, "partial": False},
         }
 
-    dep_intent = re.search(r"\b(dependenc|library|libraries|package|uses?|framework)\b", q)
-    cfg_intent = re.search(r"\b(config|manifest|permission|capabilit|build|gradle|docker|env)\b", q)
+    # Use prefix patterns (no trailing \b after a fragment) so that
+    # "dependenc\w+" matches "dependency"/"dependencies", and "capabilit\w+"
+    # matches "capability"/"capabilities".  A bare \bdependenc\b would never
+    # match because word-boundary after "dependenc" fails when "ies" follows.
+    dep_intent = re.search(r"\b(dependenc\w+|librar\w*|package\w*|uses?|framework\w*)", q)
+    cfg_intent = re.search(r"\b(config\w*|manifest|permission\w*|capabilit\w+|build|gradle|docker|env)\b", q)
     mod_intent = re.search(r"\b(module|monorepo|workspace|service|package|architecture|entry)\b", q)
 
     chunks = []
@@ -1599,9 +1696,53 @@ def _retrieve_config_first(
             "attempts": integrity_attempts,
         }
     if not selected_healthy_path:
+        # Integrity validation failed (DEGRADED or STALE) for every candidate, but the
+        # chunks may still be present in the index — a degraded index is far better than
+        # returning a hard "no data found" limitation chunk.  Attempt a best-effort direct
+        # fetch across all priority_files before giving up.
+        best_effort_collected: list[dict] = []
+        for fname in priority_files:
+            file_chunks = _fetch_all_from_file(fname, query=query, intent=intent, max_results=40)
+            if not file_chunks:
+                continue
+            source_type = classify_source_type(fname)
+            authority = authority_level_for_source(intent, source_type)
+            annotate_sources(file_chunks, source_type=source_type, authority_level=authority)
+            best_effort_collected.extend(file_chunks[:6])
+            if len(best_effort_collected) >= n_results:
+                break
+
+        if best_effort_collected:
+            # Prepend a stale-index caveat so the model (and user) knows the index may
+            # be slightly out of sync, but the declared data is real.
+            stale_caveat = {
+                "content": (
+                    "# Source-of-Truth Limitation\n"
+                    "- Dependency declaration files were retrieved from a potentially stale index.\n"
+                    "- The content below is from authoritative build/manifest files and represents "
+                    "declared dependencies, but the index should be refreshed for full accuracy.\n"
+                ),
+                "file": "__source_of_truth_stale__",
+                "language": "meta",
+                "symbols": "",
+                "score": 0.0,
+                "_rank": 1.0,
+                "full_file": True,
+                "coverage": {"returned": 1, "total": 1, "partial": False},
+                "source_type": "meta",
+                "authority_level": "notice",
+            }
+            if debug_payload is not None:
+                debug_payload["source_of_truth"]["integrity"]["best_effort_fallback"] = True
+                debug_payload["source_of_truth"]["selected_files"] = [
+                    c.get("file", "") for c in best_effort_collected
+                ]
+            return [stale_caveat] + best_effort_collected[:n_results]
+
+        # Genuine failure: discovered in workspace but not retrievable even with best-effort.
         limitation = {
             "content": (
-                "# Source-of-Truth Index Integrity Limitation\n"
+                "# Source-of-Truth Limitation\n"
                 "- The file was discovered in workspace metadata, but the current index could not retrieve it.\n"
                 "- The index appears stale or incomplete for authoritative file retrieval.\n"
                 "- AndesCode attempted targeted repair for authoritative files before returning this limitation.\n"
@@ -1613,8 +1754,8 @@ def _retrieve_config_first(
             "_rank": 1.0,
             "full_file": True,
             "coverage": {"returned": 1, "total": 1, "partial": False},
-            "source_type": "inferred",
-            "authority_level": "inferred",
+            "source_type": "meta",
+            "authority_level": "notice",
         }
         if debug_payload is not None:
             debug_payload["failure_signals"]["expected_but_missing_authority"] = True
@@ -1675,8 +1816,69 @@ def _retrieve_config_first(
     if debug_payload is not None:
         debug_payload["source_of_truth"]["selected_files"] = [c.get("file", "") for c in collected]
 
+    # ── Dependency intent: enforce dependency/build authority ─────────────────
+    # For dependency_or_build_inventory queries, manifest files are NOT sufficient
+    # authority.  If the collection phase only found manifest/config files (e.g.
+    # AndroidManifest.xml), force a targeted dependency-file recovery pass before
+    # proceeding.  This prevents the system from returning manifest-only context
+    # and leaving the LLM to falsely report "No dependency declaration files found."
+    if intent == "dependency_or_build_inventory" and collected and not context_has_dependency_authority(collected):
+        dep_candidates = recover_dependency_build_files(
+            intent,
+            query,
+            workspace.get("manifests", []),
+            workspace.get("config_graph", {}).get("config_files", []),
+        )
+        if debug_payload is not None:
+            debug_payload["retrieval"]["dependency_recovery_attempted"] = True
+            debug_payload["retrieval"]["dependency_recovery_candidates"] = dep_candidates
+
+        dep_chunks = _recover_authoritative_files(dep_candidates, intent=intent, n_results=n_results)
+
+        if dep_chunks:
+            # Recovery succeeded — put dep/build chunks FIRST so they are not truncated
+            # by the final collected[:n_results] slice.  Manifest context is kept as
+            # secondary support (for the "Inferred" section) up to the remaining budget.
+            manifest_budget = max(0, n_results - len(dep_chunks))
+            non_dep_collected = [
+                c for c in collected
+                if classify_source_type(c.get("file", "")) not in DEPENDENCY_BUILD_AUTHORITY_TYPES
+            ]
+            collected = dep_chunks + non_dep_collected[:manifest_budget]
+            if debug_payload is not None:
+                debug_payload["retrieval"]["dependency_recovery_selected_files"] = [
+                    c.get("file", "") for c in dep_chunks
+                ]
+                debug_payload["retrieval"]["dependency_recovery_succeeded"] = True
+                debug_payload["source_of_truth"]["selected_files"] = [c.get("file", "") for c in collected]
+        else:
+            # Recovery attempted but no dependency/build files could be fetched.
+            # Choose the right failure mode based on workspace metadata presence.
+            has_dep_in_workspace = workspace_has_dependency_files(
+                workspace.get("manifests", []),
+                workspace.get("config_graph", {}).get("config_files", []),
+            )
+            if debug_payload is not None:
+                debug_payload["retrieval"]["dependency_recovery_succeeded"] = False
+                debug_payload["failure_signals"]["expected_but_missing_authority"] = True
+                debug_payload["source_of_truth"]["selected_files"] = [c.get("file", "") for c in collected]
+
+            if dep_candidates and has_dep_in_workspace:
+                # Case B: files exist in workspace metadata but the index cannot retrieve them.
+                _lim = dependency_files_not_indexed_limitation()
+            else:
+                # Case C: no dependency/build files known to the workspace at all.
+                _lim = dependency_authority_incomplete_limitation()
+            _lim.update({
+                "symbols": "", "score": 0.0, "_rank": 1.0,
+                "full_file": True, "coverage": {"returned": 1, "total": 1, "partial": False},
+            })
+            # Return the limitation notice together with whatever (non-dep) files were found
+            # so the model can still use manifest/config context for non-dep sections.
+            return [_lim] + collected[:n_results]
+
     q = query.lower()
-    asks_permissions = any(k in q for k in ("permission", "permissions", "declared", "manifest"))
+    asks_permissions = any(k in q for k in ("permission", "permissions", "manifest"))
     if asks_permissions:
         permissions = summarize_declared_permissions(collected)
         if permissions:
@@ -1719,6 +1921,34 @@ def _retrieve_config_first(
     if collected:
         return collected[:n_results]
 
+    # ── Intent-specific failure messaging ─────────────────────────────────────
+    # For dependency queries, distinguish clearly between the three failure modes
+    # so the user/model knows whether the problem is "no files exist" vs "files
+    # exist but are not indexed/retrievable".
+    if intent == "dependency_or_build_inventory":
+        has_dep_in_workspace = workspace_has_dependency_files(
+            workspace.get("manifests", []),
+            workspace.get("config_graph", {}).get("config_files", []),
+        )
+        if debug_payload is not None:
+            debug_payload["retrieval"]["dependency_recovery_attempted"] = True
+            debug_payload["retrieval"]["dependency_recovery_succeeded"] = False
+        if not has_dep_in_workspace:
+            # Case A: No dependency declaration files exist anywhere in this workspace.
+            limitation = no_dependency_files_in_workspace_limitation()
+        else:
+            # Case B: Dependency declaration files exist in workspace metadata but the
+            # index could not retrieve them (stale/incomplete index).
+            limitation = dependency_files_not_indexed_limitation()
+        limitation.update({
+            "symbols": "", "score": 0.0, "_rank": 1.0,
+            "full_file": True, "coverage": {"returned": 1, "total": 1, "partial": False},
+        })
+        if debug_payload is not None:
+            debug_payload["failure_signals"]["expected_but_missing_authority"] = True
+        return [limitation]
+
+    # Generic limitation for non-dependency queries.
     limitation = {
         "content": (
             "# Source-of-Truth Limitation\n"
@@ -1734,8 +1964,8 @@ def _retrieve_config_first(
         "_rank": 1.0,
         "full_file": True,
         "coverage": {"returned": 1, "total": 1, "partial": False},
-        "source_type": "inferred",
-        "authority_level": "inferred",
+        "source_type": "meta",
+        "authority_level": "notice",
     }
     if (
         not strict_authority_mode
@@ -2185,11 +2415,24 @@ def evaluate_index_state(current_state: dict, stored_state: dict | None, repo_ch
 
 
 def _collect_files(root: Path) -> list:
+    """
+    Collect all indexable files: source files with supported extensions AND
+    authoritative manifest/build/dependency files by canonical basename.
+
+    Manifest files (requirements.txt, pyproject.toml, package.json, Cargo.toml,
+    go.mod, etc.) have non-standard extensions not in SUPPORTED_EXTENSIONS, but
+    MUST be indexed so that source-of-truth retrieval can fetch their content from
+    ChromaDB rather than returning an integrity-failure limitation chunk.
+    """
+    _manifest_basenames_lower = {m.lower() for m in MANIFEST_FILES}
     files = []
     for fp in root.rglob("*"):
-        if fp.is_file() and fp.suffix in SUPPORTED_EXTENSIONS:
-            if not any(s in fp.parts for s in SKIP_DIRS):
-                files.append(fp)
+        if not fp.is_file():
+            continue
+        if any(s in fp.parts for s in SKIP_DIRS):
+            continue
+        if fp.suffix in SUPPORTED_EXTENSIONS or fp.name.lower() in _manifest_basenames_lower:
+            files.append(fp)
     return sorted(files)
 
 

@@ -48,6 +48,45 @@ def resolve_debug_mode(
     return env_debug_mode()
 
 
+def compute_intent_authority_satisfaction(intent: str, chunks: list[dict]) -> dict:
+    """Compute intent-specific authority class satisfaction from a list of retrieved chunks.
+
+    For ``dependency_or_build_inventory`` queries the *required* classes are
+    ``{"build_file", "dependency_file"}`` — manifest-only context does NOT satisfy this.
+    For ``declaration_or_configuration`` queries the required classes are
+    ``{"config_file", "manifest"}``.
+    For all other intents no specific class is required (empty sets are returned).
+
+    Returns a dict with three sorted lists:
+      - ``required_authority_classes``  — what this intent needs
+      - ``satisfied_authority_classes`` — what was found in ``chunks``
+      - ``missing_authority_classes``   — what is still absent
+    """
+    from andes_cache.source_of_truth import DEPENDENCY_BUILD_AUTHORITY_TYPES  # local to avoid circular import
+
+    AUTHORITATIVE_SOURCE_TYPES = {"manifest", "build_file", "dependency_file", "config_file"}
+
+    if intent == "dependency_or_build_inventory":
+        required: set[str] = DEPENDENCY_BUILD_AUTHORITY_TYPES.copy()
+    elif intent == "declaration_or_configuration":
+        required = {"config_file", "manifest"}
+    else:
+        required = set()
+
+    found_types = {
+        c.get("source_type")
+        for c in chunks
+        if c.get("source_type") in AUTHORITATIVE_SOURCE_TYPES
+    }
+    satisfied = required & found_types
+    missing = required - found_types
+    return {
+        "required_authority_classes": sorted(required),
+        "satisfied_authority_classes": sorted(satisfied),
+        "missing_authority_classes": sorted(missing),
+    }
+
+
 def infer_expected_authority(intent: str, query: str) -> dict:
     q = (query or "").lower()
     expected_classes: list[str] = []
@@ -136,6 +175,15 @@ def initialize_payload(query: str, decision: dict, workspace: dict | None) -> di
             "authority_retrieval_mode": "",
             "declaration_answer_mode": "",
             "declaration_query_trigger_reason": "",
+            # Intent-specific authority class tracking (dependency/declaration queries)
+            "required_authority_classes": [],
+            "satisfied_authority_classes": [],
+            "missing_authority_classes": [],
+            # Dependency-specific recovery tracking
+            "dependency_recovery_attempted": False,
+            "dependency_recovery_candidates": [],
+            "dependency_recovery_selected_files": [],
+            "dependency_recovery_succeeded": False,
             "chunks_per_file": {},
             "coverage": {},
             "cache_hit": False,
@@ -144,6 +192,9 @@ def initialize_payload(query: str, decision: dict, workspace: dict | None) -> di
         "final_context": {
             "files_used": [],
             "authoritative_files_present": False,
+            # Intent-specific: True only when the required authority classes for THIS intent
+            # are satisfied (e.g. for dep queries, manifest-only context returns False here).
+            "authoritative_files_present_for_intent": False,
             "context_size": 0,
         },
         "summaries": {
@@ -181,9 +232,16 @@ def apply_failure_signals(
     p["failure_signals"]["empty_retrieval"] = len(chunks) == 0
 
     if retrieval_route == "source_of_truth":
-        has_authoritative = any(
-            c.get("source_type") in {"manifest", "build_file", "dependency_file", "config_file"} for c in chunks
-        )
+        # For dependency queries, manifest-only context is not sufficient authority.
+        if intent == "dependency_or_build_inventory":
+            from andes_cache.source_of_truth import DEPENDENCY_BUILD_AUTHORITY_TYPES
+            has_authoritative = any(
+                c.get("source_type") in DEPENDENCY_BUILD_AUTHORITY_TYPES for c in chunks
+            )
+        else:
+            has_authoritative = any(
+                c.get("source_type") in {"manifest", "build_file", "dependency_file", "config_file"} for c in chunks
+            )
         p["failure_signals"]["low_confidence_retrieval"] = (len(chunks) == 0) or (not has_authoritative)
     else:
         p["failure_signals"]["low_confidence_retrieval"] = (top_score is None) or (top_score < 0.25)
@@ -204,9 +262,24 @@ def apply_failure_signals(
     }
     missing_classes = sorted(expected_classes - found_classes)
     p["source_of_truth"]["missing_expected"] = sorted(set(p["source_of_truth"].get("missing_expected", []) + missing_classes))
-    p["failure_signals"]["expected_but_missing_authority"] = (
-        retrieval_route == "source_of_truth" and len(expected_classes) > 0 and len(found_classes) == 0
-    )
+
+    # Intent-specific authority gap detection.
+    # For dependency queries: expected_but_missing_authority fires when no dependency/build
+    # authority files are found — manifest-only context does NOT satisfy this.
+    if retrieval_route == "source_of_truth" and len(expected_classes) > 0:
+        if intent == "dependency_or_build_inventory":
+            from andes_cache.source_of_truth import DEPENDENCY_BUILD_AUTHORITY_TYPES
+            dep_expected = expected_classes & DEPENDENCY_BUILD_AUTHORITY_TYPES
+            dep_found = found_classes & DEPENDENCY_BUILD_AUTHORITY_TYPES
+            p["failure_signals"]["expected_but_missing_authority"] = (
+                len(dep_expected) > 0 and len(dep_found) == 0
+            )
+        else:
+            p["failure_signals"]["expected_but_missing_authority"] = len(found_classes) == 0
+    else:
+        p["failure_signals"]["expected_but_missing_authority"] = (
+            retrieval_route == "source_of_truth" and len(expected_classes) > 0 and len(found_classes) == 0
+        )
 
     p["summaries"]["missing_authority"] = (
         "Missing authoritative classes: " + ", ".join(p["source_of_truth"]["missing_expected"])
@@ -241,12 +314,34 @@ def format_debug_sse_event(payload: dict) -> str:
 
 def finalize_payload(payload: dict, final_chunks: list[dict]) -> dict:
     p = deepcopy(payload)
+    intent = p.get("intent", "")
     files = [c.get("file", "") for c in final_chunks if c.get("file")]
     p["final_context"]["files_used"] = files
     p["final_context"]["context_size"] = sum(len(c.get("content", "")) for c in final_chunks)
     p["final_context"]["authoritative_files_present"] = any(
         c.get("source_type") in {"manifest", "build_file", "config_file", "dependency_file"} for c in final_chunks
     )
+
+    # Intent-specific authority satisfaction — manifest-only context does NOT satisfy
+    # dependency_or_build_inventory queries.
+    auth = compute_intent_authority_satisfaction(intent, final_chunks)
+    p["retrieval"]["required_authority_classes"] = auth["required_authority_classes"]
+    p["retrieval"]["satisfied_authority_classes"] = auth["satisfied_authority_classes"]
+    p["retrieval"]["missing_authority_classes"] = auth["missing_authority_classes"]
+    if auth["required_authority_classes"]:
+        # OR semantics: having *any one* of the required classes is sufficient
+        # (e.g. build.gradle alone satisfies a dep query even if requirements.txt is absent).
+        # missing_authority_classes is informational (shows what else could be present)
+        # but does NOT by itself mean the intent is unsatisfied.
+        p["final_context"]["authoritative_files_present_for_intent"] = (
+            len(auth["satisfied_authority_classes"]) > 0
+        )
+    else:
+        # No specific class requirement for this intent — fall back to the generic flag.
+        p["final_context"]["authoritative_files_present_for_intent"] = (
+            p["final_context"]["authoritative_files_present"]
+        )
+
     p["failure_signals"]["empty_retrieval"] = len(final_chunks) == 0
     p["failure_signals"]["fragmented_context"] = _is_fragmented(final_chunks)
 

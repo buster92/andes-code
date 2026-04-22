@@ -22,7 +22,16 @@ from andes_cache.source_of_truth import (
     is_declaration_query,
     has_declaration_keywords,
     source_of_truth_guidance,
+    # Dependency authority helpers
+    context_has_dependency_authority,
+    workspace_has_dependency_files,
+    recover_dependency_build_files,
+    no_dependency_files_in_workspace_limitation,
+    dependency_files_not_indexed_limitation,
+    dependency_authority_incomplete_limitation,
+    DEPENDENCY_BUILD_AUTHORITY_TYPES,
 )
+from andes_cache.debug import compute_intent_authority_satisfaction
 from andes_cache.manager import AndesCacheManager
 from andes_cache.integrity import (
     INTEGRITY_HEALTHY,
@@ -125,9 +134,9 @@ class TestSourceOfTruthBehavior(unittest.TestCase):
 
     def test_guidance_requires_declared_and_inferred_sections(self):
         guidance = source_of_truth_guidance("what dependencies are declared in package.json")
-        self.assertIn("`Declared`", guidance)
-        self.assertIn("`Inferred from usage`", guidance)
-        self.assertIn("declaration files are missing", guidance)
+        self.assertIn("Declared Dependencies", guidance)
+        self.assertIn("Inferred from Code Usage", guidance)
+        self.assertIn("dependency declaration files", guidance)
 
     def test_runtime_fallback_requires_explicit_runtime_wording(self):
         self.assertFalse(wants_runtime_usage("what config does this service use"))
@@ -516,6 +525,314 @@ class TestRouteIsolationAndFastPath(unittest.TestCase):
         self.assertIn(
             "AndesCode could not find the required authoritative file in indexed source-of-truth candidates.",
             src,
+        )
+
+
+class TestDependencyAuthoritySourceGuardrails(unittest.TestCase):
+    """Source-code guardrail tests — verify the key structural invariants in indexer.py."""
+
+    def test_cache_bypass_triggers_for_manifest_only_dep_results(self):
+        """indexer.py must bypass cache when a dep query has a manifest-only cached result."""
+        src = Path("indexer.py").read_text()
+        self.assertIn("_cached_dep_authority_missing", src)
+        self.assertIn("context_has_dependency_authority(cached_final)", src)
+        self.assertIn("intent == \"dependency_or_build_inventory\"", src)
+
+    def test_dep_chunks_placed_before_manifest_chunks_in_return(self):
+        """After dep recovery, dep chunks must be placed at the front of collected[]."""
+        src = Path("indexer.py").read_text()
+        # The fix puts dep_chunks first; verify the reorder pattern is present.
+        self.assertIn("collected = dep_chunks + non_dep_collected[:manifest_budget]", src)
+
+    def test_libs_versions_toml_in_manifest_files_for_discovery(self):
+        """libs.versions.toml must be in MANIFEST_FILES so it gets indexed and discovered."""
+        src = Path("indexer.py").read_text()
+        self.assertIn("libs.versions.toml", src)
+        # Also verify it's within the MANIFEST_FILES block
+        mf_start = src.find("MANIFEST_FILES = {")
+        mf_end = src.find("}", mf_start)
+        self.assertIn("libs.versions.toml", src[mf_start:mf_end])
+
+    def test_dep_specific_failure_markers_in_both_cache_bypass_sets(self):
+        """New __dep*__ markers must appear in both _failure_markers and _failure_file_markers."""
+        src = Path("indexer.py").read_text()
+        # Both sets must list the new markers
+        self.assertGreaterEqual(
+            src.count("__no_dependency_files_in_workspace__"), 2
+        )
+        self.assertGreaterEqual(
+            src.count("__dependency_files_not_indexed__"), 2
+        )
+        self.assertGreaterEqual(
+            src.count("__dependency_authority_incomplete__"), 2
+        )
+
+
+class TestDependencyAuthorityIntentSpecific(unittest.TestCase):
+    """
+    Targeted tests for intent-specific dependency authority checks.
+    Tests cover scenarios A-E as specified in the implementation requirements.
+    """
+
+    # ── Helpers (shared chunk factories) ────────────────────────────────────
+
+    def _manifest_chunk(self, path: str = "app/src/main/AndroidManifest.xml") -> dict:
+        return {
+            "file": path,
+            "content": '<uses-permission android:name="android.permission.INTERNET"/>',
+            "source_type": "manifest",
+            "authority_level": "configured",
+        }
+
+    def _build_chunk(self, path: str = "app/build.gradle.kts") -> dict:
+        return {
+            "file": path,
+            "content": 'implementation("com.example:library:1.0.0")',
+            "source_type": "build_file",
+            "authority_level": "declared",
+        }
+
+    def _dep_chunk(self, path: str = "gradle/libs.versions.toml") -> dict:
+        return {
+            "file": path,
+            "content": "[libraries]\nretrofit = { group = \"com.squareup.retrofit2\", name = \"retrofit\", version = \"2.9.0\" }",
+            "source_type": "dependency_file",
+            "authority_level": "declared",
+        }
+
+    # ── Test A: Android repo with manifest-only, no build.gradle retrieved ───
+
+    def test_A_manifest_does_not_satisfy_dependency_authority(self):
+        """Manifest chunk alone must NOT count as dependency authority."""
+        chunks = [self._manifest_chunk()]
+        self.assertFalse(context_has_dependency_authority(chunks))
+
+    def test_A_workspace_manifest_only_has_no_dependency_files(self):
+        """Workspace with only manifest in metadata has no dependency files."""
+        manifests = ["app/src/main/AndroidManifest.xml"]
+        self.assertFalse(workspace_has_dependency_files(manifests, []))
+
+    def test_A_dependency_recovery_returns_empty_for_manifest_only_workspace(self):
+        """Recovery helper returns empty list when workspace has no dep/build files."""
+        manifests = ["app/src/main/AndroidManifest.xml"]
+        candidates = recover_dependency_build_files(
+            intent="dependency_or_build_inventory",
+            query="what dependencies are declared",
+            manifests=manifests,
+            config_files=[],
+        )
+        self.assertEqual(candidates, [])
+
+    def test_A_no_dep_files_limitation_chunk_has_correct_marker(self):
+        """Case A limitation uses the dedicated no-dep-files marker."""
+        chunk = no_dependency_files_in_workspace_limitation()
+        self.assertEqual(chunk["file"], "__no_dependency_files_in_workspace__")
+        self.assertIn("No Declaration Files", chunk["content"])
+        self.assertNotIn("Source-of-Truth Limitation", chunk["content"].split("\n")[0])
+
+    def test_A_debug_compute_shows_dependency_authority_missing_for_manifest_only(self):
+        """Intent authority satisfaction: manifest-only → missing dep authority."""
+        chunks = [self._manifest_chunk()]
+        result = compute_intent_authority_satisfaction(
+            "dependency_or_build_inventory", chunks
+        )
+        self.assertIn("build_file", result["required_authority_classes"])
+        self.assertIn("dependency_file", result["required_authority_classes"])
+        self.assertEqual(result["satisfied_authority_classes"], [])
+        self.assertIn("build_file", result["missing_authority_classes"])
+        self.assertIn("dependency_file", result["missing_authority_classes"])
+
+    # ── Test B: Android repo with build.gradle.kts and/or libs.versions.toml ─
+
+    def test_B_build_gradle_kts_satisfies_dependency_authority(self):
+        """build.gradle.kts chunk counts as dependency authority."""
+        chunks = [self._build_chunk()]
+        self.assertTrue(context_has_dependency_authority(chunks))
+
+    def test_B_libs_versions_toml_classified_as_dependency_file(self):
+        """libs.versions.toml must be classified as dependency_file, not build_file."""
+        self.assertEqual(classify_source_type("gradle/libs.versions.toml"), "dependency_file")
+
+    def test_B_libs_versions_toml_satisfies_dependency_authority(self):
+        """libs.versions.toml chunk counts as dependency authority."""
+        chunks = [self._dep_chunk("gradle/libs.versions.toml")]
+        self.assertTrue(context_has_dependency_authority(chunks))
+
+    def test_B_workspace_with_build_gradle_kts_has_dependency_files(self):
+        """Workspace containing build.gradle.kts reports dependency files present."""
+        manifests = [
+            "app/src/main/AndroidManifest.xml",
+            "app/build.gradle.kts",
+        ]
+        self.assertTrue(workspace_has_dependency_files(manifests, []))
+
+    def test_B_recovery_returns_build_gradle_kts_when_present_in_workspace(self):
+        """Recovery helper returns build.gradle.kts when workspace has it."""
+        manifests = [
+            "app/src/main/AndroidManifest.xml",
+            "app/build.gradle.kts",
+        ]
+        candidates = recover_dependency_build_files(
+            intent="dependency_or_build_inventory",
+            query="what dependencies are declared",
+            manifests=manifests,
+            config_files=[],
+        )
+        self.assertIn("app/build.gradle.kts", candidates)
+        self.assertNotIn("app/src/main/AndroidManifest.xml", candidates)
+
+    def test_B_debug_compute_satisfied_when_build_file_in_context(self):
+        """Intent authority satisfaction: build_file in context → satisfied (OR logic).
+
+        missing_authority_classes may still list dependency_file as absent but that
+        does NOT mean the intent is unsatisfied — having any one required type is enough.
+        """
+        chunks = [self._manifest_chunk(), self._build_chunk()]
+        result = compute_intent_authority_satisfaction(
+            "dependency_or_build_inventory", chunks
+        )
+        self.assertIn("build_file", result["satisfied_authority_classes"])
+        # dependency_file is absent (only build_file is present) — debug shows this
+        # but does not block authority satisfaction (OR semantics).
+        self.assertIn("dependency_file", result["missing_authority_classes"])
+        self.assertNotIn("build_file", result["missing_authority_classes"])
+
+    # ── Test C: Workspace with truly no dependency declaration files ──────────
+
+    def test_C_no_dep_files_anywhere_returns_correct_limitation_file(self):
+        """When workspace has no dep files, the 'no dep files' limitation is used."""
+        chunk = no_dependency_files_in_workspace_limitation()
+        self.assertEqual(chunk["file"], "__no_dependency_files_in_workspace__")
+        # Content must NOT claim files were retrieved/attempted
+        self.assertNotIn("retrieved", chunk["content"].lower())
+
+    def test_C_config_only_workspace_not_treated_as_dependency_authority(self):
+        """A workspace with only config/.env files has no dep authority."""
+        config_files = [".env.production", "config/settings.yml"]
+        self.assertFalse(workspace_has_dependency_files([], config_files))
+
+    def test_C_no_dep_file_limitation_differs_from_generic_source_of_truth_limitation(self):
+        """Case A must use the specific no-dep-files marker, not the generic one."""
+        chunk = no_dependency_files_in_workspace_limitation()
+        self.assertNotEqual(chunk["file"], "__source_of_truth_missing__")
+        self.assertNotEqual(chunk["file"], "__source_of_truth_integrity__")
+
+    # ── Test D: Dep files exist in workspace metadata but not retrievable ─────
+
+    def test_D_dep_files_not_indexed_limitation_has_correct_marker(self):
+        """Case B limitation uses the 'not indexed' marker."""
+        chunk = dependency_files_not_indexed_limitation()
+        self.assertEqual(chunk["file"], "__dependency_files_not_indexed__")
+        self.assertIn("Source-of-Truth Limitation", chunk["content"])
+        self.assertIn("could not retrieve", chunk["content"])
+
+    def test_D_dep_files_not_indexed_distinct_from_no_dep_files(self):
+        """Case B marker must be distinct from Case A marker."""
+        a = no_dependency_files_in_workspace_limitation()
+        b = dependency_files_not_indexed_limitation()
+        self.assertNotEqual(a["file"], b["file"])
+        self.assertNotEqual(a["content"], b["content"])
+
+    def test_D_workspace_with_build_gradle_but_not_fetched_reports_dep_present(self):
+        """workspace_has_dependency_files is True even if the index cannot fetch them."""
+        # Workspace metadata says build.gradle is present.
+        manifests = ["app/build.gradle", "app/src/main/AndroidManifest.xml"]
+        self.assertTrue(workspace_has_dependency_files(manifests, []))
+
+    def test_D_recovery_candidates_include_gradle_when_workspace_has_it(self):
+        """If workspace has build.gradle, recovery_candidates should include it."""
+        manifests = ["app/build.gradle", "app/src/main/AndroidManifest.xml"]
+        candidates = recover_dependency_build_files(
+            intent="dependency_or_build_inventory",
+            query="what dependencies are declared",
+            manifests=manifests,
+            config_files=[],
+        )
+        self.assertIn("app/build.gradle", candidates)
+
+    # ── Test E: Manifest-specific query still works normally ─────────────────
+
+    def test_E_manifest_query_intent_is_not_dependency_inventory(self):
+        """Permissions/manifest queries are classified as declaration_or_configuration."""
+        d = classify_query_intent_details("what permissions does the app declare")
+        self.assertEqual(d["intent"], "declaration_or_configuration")
+        self.assertNotEqual(d["intent"], "dependency_or_build_inventory")
+
+    def test_E_manifest_satisfies_declaration_intent_authority(self):
+        """For declaration_or_configuration, manifest IS valid authority (OR logic).
+
+        config_file may show up in missing_authority_classes (informational) but the
+        intent is satisfied as long as at least one required type is present.
+        """
+        chunks = [self._manifest_chunk()]
+        result = compute_intent_authority_satisfaction(
+            "declaration_or_configuration", chunks
+        )
+        self.assertIn("manifest", result["satisfied_authority_classes"])
+        # config_file is listed as absent (informational) but manifest is sufficient.
+        self.assertNotIn("manifest", result["missing_authority_classes"])
+
+    def test_E_context_has_dependency_authority_false_for_manifest_only(self):
+        """context_has_dependency_authority is False for manifest, not a dep-query problem."""
+        # This is fine: the caller checks intent BEFORE calling this helper.
+        chunks = [self._manifest_chunk()]
+        self.assertFalse(context_has_dependency_authority(chunks))
+
+    def test_E_manifest_chunk_authority_level_for_declaration_intent(self):
+        """Manifest authority level for declaration_or_configuration is 'configured'."""
+        self.assertEqual(
+            authority_level_for_source("declaration_or_configuration", "manifest"),
+            "configured",
+        )
+
+    def test_E_manifest_not_in_dependency_build_authority_types(self):
+        """manifest source type must NOT be in DEPENDENCY_BUILD_AUTHORITY_TYPES."""
+        self.assertNotIn("manifest", DEPENDENCY_BUILD_AUTHORITY_TYPES)
+        self.assertNotIn("config_file", DEPENDENCY_BUILD_AUTHORITY_TYPES)
+        self.assertIn("build_file", DEPENDENCY_BUILD_AUTHORITY_TYPES)
+        self.assertIn("dependency_file", DEPENDENCY_BUILD_AUTHORITY_TYPES)
+
+    # ── Additional classify_source_type coverage ─────────────────────────────
+
+    def test_classify_source_type_libs_versions_toml(self):
+        """gradle/libs.versions.toml is a dependency_file (Gradle version catalog)."""
+        self.assertEqual(classify_source_type("gradle/libs.versions.toml"), "dependency_file")
+
+    def test_classify_source_type_gradle_properties(self):
+        """gradle.properties is a build_file (contains build/project config)."""
+        self.assertEqual(classify_source_type("gradle.properties"), "build_file")
+
+    def test_classify_source_type_gemfile(self):
+        """Gemfile is a dependency_file (Ruby)."""
+        self.assertEqual(classify_source_type("Gemfile"), "dependency_file")
+
+    def test_classify_source_type_composer_json(self):
+        """composer.json is a dependency_file (PHP)."""
+        self.assertEqual(classify_source_type("composer.json"), "dependency_file")
+
+    def test_classify_source_type_build_gradle_kts_is_build_file(self):
+        """build.gradle.kts is a build_file, not a dependency_file."""
+        self.assertEqual(classify_source_type("app/build.gradle.kts"), "build_file")
+
+    # ── Declare/infer separation ─────────────────────────────────────────────
+
+    def test_declared_section_must_only_use_dep_or_build_source_types(self):
+        """
+        Verifies that manifest source_type is classified as 'configured', not 'declared',
+        under the dependency_or_build_inventory intent — preventing manifest entries from
+        appearing in a declared dependency section.
+        """
+        self.assertEqual(
+            authority_level_for_source("dependency_or_build_inventory", "manifest"),
+            "configured",
+        )
+        self.assertEqual(
+            authority_level_for_source("dependency_or_build_inventory", "build_file"),
+            "declared",
+        )
+        self.assertEqual(
+            authority_level_for_source("dependency_or_build_inventory", "dependency_file"),
+            "declared",
         )
 
 

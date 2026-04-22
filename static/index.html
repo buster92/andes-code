@@ -922,6 +922,26 @@
     color: var(--text);
     font-weight: 600;
   }
+  .debug-summary b.warn { color: #fbbf24; }
+  .debug-summary b.ok   { color: #34d399; }
+  .debug-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .debug-action-btn {
+    background: transparent;
+    border: 1px solid #7c3aed;
+    border-radius: 5px;
+    color: #c4b5fd;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    padding: 3px 10px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .debug-action-btn:hover { background: rgba(167,139,250,0.18); color: #ede9fe; }
+  .debug-action-btn.done  { color: #34d399; border-color: #34d399; }
 
   .char-count {
     font-size: 11px;
@@ -1890,16 +1910,58 @@ function renderDebugPanel(msgEl, payload) {
   const bodyEl = msgEl.content.parentElement;
   const existing = bodyEl ? bodyEl.querySelector('.debug-panel') : null;
   if (existing) existing.remove();
-  const filesUsed = Array.isArray(payload?.final_context?.files_used) ? payload.final_context.files_used : [];
-  const path = payload?.stream_path || payload?.orchestration_path || payload?.retrieval?.route_taken || 'unknown';
-  const cacheHit = payload?.cache_hit ?? payload?.retrieval?.cache_hit;
+
+  const filesUsed   = Array.isArray(payload?.final_context?.files_used) ? payload.final_context.files_used : [];
+  const path        = payload?.stream_path || payload?.orchestration_path || payload?.retrieval?.route_taken || 'unknown';
+  const cacheHit    = payload?.cache_hit ?? payload?.retrieval?.cache_hit;
   const payloadKind = payload?.payload_kind || 'full';
-  const intent = payload?.intent || payload?.routing?.intent || 'unknown';
-  const route = payload?.retrieval_route || payload?.retrieval?.route_taken || payload?.routing?.retrieval_route || 'unknown';
-  const details = document.createElement('details');
+  const intent      = payload?.intent || payload?.routing?.intent || 'unknown';
+  const route       = payload?.retrieval_route || payload?.retrieval?.route_taken || payload?.routing?.retrieval_route || 'unknown';
+
+  // Intent-specific authority fields (new)
+  const authForIntent  = payload?.final_context?.authoritative_files_present_for_intent;
+  const missingAuth    = payload?.summaries?.missing_authority || '';
+  const depRecAttempt  = payload?.retrieval?.dependency_recovery_attempted;
+  const depRecSuccess  = payload?.retrieval?.dependency_recovery_succeeded;
+  const missingClasses = Array.isArray(payload?.retrieval?.missing_authority_classes) ? payload.retrieval.missing_authority_classes : [];
+  const satisfiedCls   = Array.isArray(payload?.retrieval?.satisfied_authority_classes) ? payload.retrieval.satisfied_authority_classes : [];
+  const expButMissing  = payload?.failure_signals?.expected_but_missing_authority;
+
+  const jsonText = JSON.stringify(payload, null, 2);
+  const details  = document.createElement('details');
   details.className = 'debug-panel';
+
+  // Build authority rows only when relevant
+  let authorityRows = '';
+  if (authForIntent !== undefined) {
+    const cls = authForIntent ? 'ok' : 'warn';
+    authorityRows += `<div>auth for intent: <b class="${cls}">${authForIntent ? 'YES' : 'NO'}</b></div>`;
+  }
+  if (satisfiedCls.length)  authorityRows += `<div>satisfied classes: <b class="ok">${escapeHtml(satisfiedCls.join(', '))}</b></div>`;
+  if (missingClasses.length) authorityRows += `<div>missing classes: <b class="warn">${escapeHtml(missingClasses.join(', '))}</b></div>`;
+  if (depRecAttempt !== undefined) {
+    const cls = depRecSuccess ? 'ok' : 'warn';
+    authorityRows += `<div>dep recovery: <b class="${cls}">${depRecAttempt ? (depRecSuccess ? 'succeeded' : 'attempted/failed') : 'not needed'}</b></div>`;
+  }
+  if (expButMissing) authorityRows += `<div>missing authority: <b class="warn">⚠ ${escapeHtml(missingAuth || 'yes')}</b></div>`;
+
   details.innerHTML = `
     <summary>DEBUG PIPELINE</summary>
+    <div class="debug-actions">
+      <button class="debug-action-btn" id="dbg-copy-${Date.now()}" onclick="(function(btn){
+        navigator.clipboard.writeText(${JSON.stringify(jsonText)}).then(()=>{
+          btn.textContent='✓ copied'; btn.classList.add('done');
+          setTimeout(()=>{ btn.textContent='copy JSON'; btn.classList.remove('done'); }, 1800);
+        });
+      })(this)">copy JSON</button>
+      <button class="debug-action-btn" onclick="(function(){
+        const blob = new Blob([${JSON.stringify(jsonText)}], {type:'application/json'});
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'andescode-debug-${Date.now()}.json';
+        a.click(); URL.revokeObjectURL(a.href);
+      })()">download JSON</button>
+    </div>
     <div class="debug-summary">
       <div>path: <b>${escapeHtml(String(path))}</b></div>
       <div>cache: <b>${cacheHit ? 'hit' : 'miss'}</b></div>
@@ -1907,8 +1969,9 @@ function renderDebugPanel(msgEl, payload) {
       <div>intent: <b>${escapeHtml(String(intent))}</b></div>
       <div>route: <b>${escapeHtml(String(route))}</b></div>
       <div>files: <b>${filesUsed.length}</b></div>
+      ${authorityRows}
     </div>
-    <div class="debug-json">${escapeHtml(JSON.stringify(payload, null, 2))}</div>
+    <div class="debug-json">${escapeHtml(jsonText)}</div>
   `;
   target.insertAdjacentElement('afterend', details);
 }

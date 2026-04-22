@@ -12,6 +12,8 @@ AUTHORITATIVE_NAME_HINTS = [
     "build.gradle.kts",
     "settings.gradle",
     "settings.gradle.kts",
+    "libs.versions.toml",
+    "gradle.properties",
     "package.json",
     "pyproject.toml",
     "requirements.txt",
@@ -23,6 +25,8 @@ AUTHORITATIVE_NAME_HINTS = [
     "package.swift",
     "pipfile",
     "poetry.lock",
+    "gemfile",
+    "composer.json",
     ".env",
     "config",
     "settings",
@@ -68,8 +72,10 @@ def expected_authority_candidates(intent: str, query: str, manifests: list[str],
     if intent == "dependency_or_build_inventory":
         intent_hints.extend([
             "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
+            "libs.versions.toml", "gradle.properties",
             "package.json", "pyproject.toml", "requirements.txt", "cargo.toml", "go.mod",
             "pom.xml", "dockerfile", "docker-compose.yml", "package.swift", "pipfile", "poetry.lock",
+            "gemfile", "composer.json",
         ])
     else:
         intent_hints.extend([
@@ -78,7 +84,7 @@ def expected_authority_candidates(intent: str, query: str, manifests: list[str],
         ])
 
     # Query-focused expansions.
-    if any(k in q for k in ("permission", "permissions", "declared", "manifest")):
+    if any(k in q for k in ("permission", "permissions", "manifest")):
         intent_hints.extend(["androidmanifest.xml", "manifest"])
     if any(k in q for k in ("dependenc", "library", "package", "build", "module")):
         intent_hints.extend([
@@ -221,10 +227,17 @@ def classify_source_type(path: str) -> str:
     p = (path or "").lower()
     if "manifest" in p:
         return "manifest"
-    if any(x in p for x in ("gradle", "pom.xml", "dockerfile", "compose", "package.swift")):
-        return "build_file"
-    if any(x in p for x in ("requirements", "pyproject", "cargo.toml", "go.mod", "package.json", "pipfile", "poetry.lock")):
+    # Dependency-file patterns are checked before build-file patterns so more-specific
+    # names (e.g. libs.versions.toml, which lives under a gradle/ directory) win.
+    if any(x in p for x in (
+        "requirements", "pyproject", "cargo.toml", "go.mod", "package.json",
+        "pipfile", "poetry.lock", "libs.versions.toml", "gemfile", "composer.json",
+    )):
         return "dependency_file"
+    if any(x in p for x in (
+        "gradle", "pom.xml", "dockerfile", "compose", "package.swift",
+    )):
+        return "build_file"
     if any(x in p for x in ("config", ".env", "entitlements", ".plist", "settings")):
         return "config_file"
     return "source_code"
@@ -253,33 +266,182 @@ def wants_runtime_usage(query: str) -> bool:
 def missing_manifest_notice() -> dict:
     return {
         "content": (
-            "# Manifest Availability\n"
+            "# Source-of-Truth Limitation\n"
             "- No AndroidManifest.xml was found in indexed source-of-truth files.\n"
             "- Declared permissions cannot be confirmed.\n"
             "- Any fallback findings below are references/inferences, not declarations."
         ),
         "file": "__manifest_status__",
         "language": "meta",
-        "source_type": "inferred",
-        "authority_level": "inferred",
+        "source_type": "meta",
+        "authority_level": "notice",
     }
 
 
-DECLARATION_QUERY_KEYWORDS = (
-    "dependenc",
-    "declared",
-    "librar",
-    "version",
-    "manifest",
-    "permission",
-    "config",
-    "build",
-    "settings",
-    "requirements",
-    "package.json",
-    "pyproject",
-    "gradle",
-    "pom.xml",
+
+# ---------------------------------------------------------------------------
+# Dependency / build-declaration authority helpers
+# ---------------------------------------------------------------------------
+
+#: Source types that constitute genuine dependency/build declaration authority.
+#: A manifest-only context does NOT satisfy this requirement.
+DEPENDENCY_BUILD_AUTHORITY_TYPES: frozenset[str] = frozenset({"dependency_file", "build_file"})
+
+
+def context_has_dependency_authority(chunks: list[dict]) -> bool:
+    """Return True if at least one chunk comes from a dependency/build declaration file.
+
+    Manifest files (AndroidManifest.xml, etc.) and generic config files are
+    explicitly excluded — they do not constitute dependency declaration authority.
+    """
+    return any(c.get("source_type") in DEPENDENCY_BUILD_AUTHORITY_TYPES for c in chunks)
+
+
+def workspace_has_dependency_files(manifests: list[str], config_files: list[str]) -> bool:
+    """Return True if the workspace metadata contains at least one dependency/build file.
+
+    Used to distinguish between:
+      - No dependency files exist at all in the workspace (Case A)
+      - Files exist but are not indexed/retrievable (Case B)
+    """
+    all_paths = (manifests or []) + (config_files or [])
+    return any(
+        classify_source_type(p) in DEPENDENCY_BUILD_AUTHORITY_TYPES
+        for p in all_paths
+        if p
+    )
+
+
+def recover_dependency_build_files(
+    intent: str,
+    query: str,
+    manifests: list[str],
+    config_files: list[str],
+) -> list[str]:
+    """Dedicated recovery helper that returns only dependency/build declaration file
+    candidates filtered from workspace metadata.
+
+    Called when a dependency query has collected manifest-only context and needs a
+    force-recovery pass for the required dependency/build authority.  Uses
+    filename/path-driven ranking (via rank_authoritative_paths) — no semantic fallback.
+    """
+    all_paths = [p for p in (manifests or []) + (config_files or []) if p]
+    dep_paths = [
+        p for p in all_paths
+        if classify_source_type(p) in DEPENDENCY_BUILD_AUTHORITY_TYPES
+        and _is_authoritative_candidate(p)
+    ]
+    return rank_authoritative_paths(dep_paths, query, intent)
+
+
+def no_dependency_files_in_workspace_limitation() -> dict:
+    """Limitation chunk for Case A: no dependency declaration files exist in workspace.
+
+    Distinct from the generic source-of-truth limitation so callers and the LLM
+    can clearly distinguish 'nothing to find' from 'something exists but is stale'.
+    """
+    return {
+        "content": (
+            "# No Declaration Files\n"
+            "- No dependency declaration files (build.gradle, build.gradle.kts, package.json, "
+            "requirements.txt, pyproject.toml, Cargo.toml, go.mod, pom.xml, etc.) were found "
+            "in this workspace.\n"
+            "- Declared dependencies cannot be sourced from a build or dependency declaration file.\n"
+            "- AndroidManifest.xml and other config files are present but do not declare "
+            "build dependencies."
+        ),
+        "file": "__no_dependency_files_in_workspace__",
+        "language": "meta",
+        "source_type": "meta",
+        "authority_level": "notice",
+    }
+
+
+def dependency_files_not_indexed_limitation() -> dict:
+    """Limitation chunk for Case B: dependency files exist in workspace but are not
+    indexed/retrievable.
+
+    Distinct from Case A so the user knows re-indexing should fix this.
+    """
+    return {
+        "content": (
+            "# Source-of-Truth Limitation\n"
+            "- Dependency declaration files were found in workspace metadata, but the current "
+            "index could not retrieve them.\n"
+            "- The index may be stale or the files may not have been indexed yet.\n"
+            "- AndesCode attempted deterministic dependency/build file recovery before returning "
+            "this limitation.\n"
+            "- Re-indexing the workspace should resolve this."
+        ),
+        "file": "__dependency_files_not_indexed__",
+        "language": "meta",
+        "source_type": "meta",
+        "authority_level": "notice",
+    }
+
+
+def dependency_authority_incomplete_limitation() -> dict:
+    """Limitation chunk for Case C: partial recovery succeeded but required dependency
+    authority is still incomplete (e.g. only manifest/config files in context).
+    """
+    return {
+        "content": (
+            "# Source-of-Truth Limitation\n"
+            "- Dependency declaration file recovery was attempted but could not satisfy the "
+            "required dependency authority for this query.\n"
+            "- Some authoritative files were found, but none are recognized dependency/build "
+            "declaration files (build.gradle, package.json, requirements.txt, etc.).\n"
+            "- Declared dependencies cannot be confirmed from the retrieved context."
+        ),
+        "file": "__dependency_authority_incomplete__",
+        "language": "meta",
+        "source_type": "meta",
+        "authority_level": "notice",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Declaration-domain keyword detection
+# ---------------------------------------------------------------------------
+# Rules for this regex:
+#
+#  1. Always use \b word-boundary anchors so that domain terms are never
+#     matched as sub-strings of unrelated words:
+#       "independence" must NOT trigger dependency routing.
+#       "misconfigured" must NOT trigger config routing.
+#
+#  2. Use prefix patterns (dependenc\w+, librar\w*, config\w*) to catch
+#     all inflected forms (dependency/dependencies, library/libraries,
+#     configured/configuration) with a single branch.
+#
+#  3. "declared" is intentionally EXCLUDED.  It is a common English
+#     adjective ("What variables are declared?", "What is declared vs
+#     defined?") and its presence alone is not evidence of a build-file /
+#     manifest query.  Dependency queries that happen to contain "declared"
+#     are correctly classified by the dependency-domain terms themselves
+#     ("dependenc\w+", "librar\w*", etc.).
+#
+# If you need to add a new ecosystem keyword, add it here (not in ad-hoc
+# `any(k in q for k in ...)` checks scattered in the codebase).
+# ---------------------------------------------------------------------------
+_DECL_KW_RE = re.compile(
+    r"\b(?:"
+    r"dependenc\w+"      # dependency, dependencies, dependent, …
+    r"|librar\w*"        # library, libraries
+    r"|version\w*"       # version, versions, versioned
+    r"|manifest"
+    r"|permission\w*"    # permission, permissions
+    r"|config\w*"        # config, configuration, configured, configs
+    r"|build\w*"         # build, builds, building, build.gradle
+    r"|setting\w*"       # setting, settings
+    r"|requirements"
+    r"|gradle\w*"
+    r"|pom"              # pom, pom.xml
+    r"|pyproject"
+    r"|package\.json"
+    r"|pom\.xml"
+    r")",
+    re.IGNORECASE,
 )
 
 
@@ -296,8 +458,7 @@ def is_declaration_query(query: str, intent: str = "") -> bool:
 
 
 def has_declaration_keywords(query: str) -> bool:
-    q = (query or "").lower()
-    return any(k in q for k in DECLARATION_QUERY_KEYWORDS)
+    return bool(_DECL_KW_RE.search(query or ""))
 
 
 def source_of_truth_guidance(query: str, intent: str = "") -> str:
@@ -305,12 +466,36 @@ def source_of_truth_guidance(query: str, intent: str = "") -> str:
     if not is_declaration_query(query, intent):
         return ""
     return (
-        "## Source-of-Truth Guidance\n"
-        "- Prioritize authoritative declaration/config/build files first.\n"
-        "- Prefer explicit declarations over inference from runtime code usage.\n"
-        "- Downgrade inferred statements unless declaration files are missing.\n"
-        "- Format the final answer in two sections: `Declared` and `Inferred from usage`.\n"
-        "- If declaration files are missing, state that explicitly before any inferred findings.\n\n"
+        "## Source-of-Truth Guidance — STRICT RULES FOR THIS QUERY\n\n"
+        "This is a dependency/declaration query. You MUST follow every rule below exactly.\n\n"
+        "**Definitions:**\n"
+        "- DECLARED = a dependency or setting that appears explicitly in a build or dependency "
+        "declaration file (build.gradle, build.gradle.kts, package.json, requirements.txt, "
+        "pyproject.toml, Cargo.toml, go.mod, pom.xml, Podfile, Package.swift, Dockerfile, etc.).\n"
+        "- INFERRED = a dependency or library observed only from import statements, `require()` "
+        "calls, or other code usage — NOT from a declaration file.\n\n"
+        "**Mandatory Output Structure:**\n"
+        "Your answer MUST be split into exactly these two sections. Never merge them.\n\n"
+        "### Declared Dependencies\n"
+        "List only what you can directly cite from a declaration file present in the retrieved "
+        "context. For each entry include the source file name. If no declaration files are in "
+        "the retrieved context, write: *No dependency declaration files were found.*\n\n"
+        "### Inferred from Code Usage\n"
+        "List only what you observed from imports, `require()` calls, or usage patterns in source "
+        "files — NOT from declaration files. If none found, write: *None identified.*\n\n"
+        "**Critical prohibitions:**\n"
+        "- NEVER present inferred findings as declared dependencies.\n"
+        "- NEVER merge the two sections into a single list.\n"
+        "- NEVER omit the 'Declared Dependencies' section even when it is empty.\n"
+        "- NEVER omit the 'Inferred from Code Usage' section even when it is empty.\n"
+        "- If a retrieved chunk is labelled `source_type: source_code` or "
+        "`authority_level: inferred`, it belongs in 'Inferred from Code Usage' only.\n"
+        "- If a retrieved chunk is labelled `source_type: meta` or `authority_level: notice`, "
+        "it is a system notice — NOT a dependency entry. Quote it verbatim at the very top "
+        "of your response, before either section header.\n"
+        "- The only recognized system notice markers are '# Source-of-Truth Limitation' and "
+        "'# No Declaration Files'. If either appears in the context, quote it verbatim at the "
+        "top of the response.\n\n"
     )
 
 def _is_authoritative_candidate(path: str) -> bool:
@@ -383,7 +568,13 @@ def _rank_by_query_hints(paths: list[str], hints: list[str]) -> list[str]:
 
 
 def _intent_source_priority(intent: str, query: str, source_type: str, basename: str) -> int:
-    asks_dependency = any(k in query for k in ("dependenc", "library", "package", "build", "module"))
+    # Use word-tokenised set so that short terms never match mid-word
+    # (e.g. "config" must not fire inside "misconfigured").
+    _qw = set(re.findall(r"\w+", (query or "").lower()))
+    asks_dependency = bool(
+        _qw & {"library", "libraries", "package", "packages", "module", "modules"}
+        or re.search(r"\bdependenc\w+|\bbuild\w*", query, re.IGNORECASE)
+    )
     if intent == "dependency_or_build_inventory":
         if source_type == "dependency_file":
             return 70
@@ -393,8 +584,8 @@ def _intent_source_priority(intent: str, query: str, source_type: str, basename:
             return 20
         return 0
 
-    asks_manifest = any(k in query for k in ("permission", "permissions", "manifest"))
-    asks_config = any(k in query for k in ("config", "configured", "settings", "env", "environment"))
+    asks_manifest = bool(_qw & {"permission", "permissions", "manifest"})
+    asks_config = bool(_qw & {"config", "configured", "settings", "env", "environment"})
     if asks_manifest:
         if source_type == "manifest":
             return 80
@@ -419,9 +610,13 @@ def _intent_source_priority(intent: str, query: str, source_type: str, basename:
 
 
 def _candidate_match_factor(intent: str, query: str, source_type: str) -> float:
-    asks_manifest = any(k in query for k in ("permission", "permissions", "manifest"))
-    asks_config = any(k in query for k in ("config", "configured", "settings", "env", "environment"))
-    asks_dependency = any(k in query for k in ("dependenc", "library", "package", "build", "module"))
+    _qw = set(re.findall(r"\w+", (query or "").lower()))
+    asks_manifest = bool(_qw & {"permission", "permissions", "manifest"})
+    asks_config = bool(_qw & {"config", "configured", "settings", "env", "environment"})
+    asks_dependency = bool(
+        _qw & {"library", "libraries", "package", "packages", "module", "modules"}
+        or re.search(r"\bdependenc\w+|\bbuild\w*", query, re.IGNORECASE)
+    )
 
     if intent == "dependency_or_build_inventory":
         return 1.0 if source_type in {"dependency_file", "build_file"} else 0.25

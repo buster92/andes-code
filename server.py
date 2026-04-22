@@ -152,8 +152,17 @@ def _is_performance_query(query: str) -> bool:
 
 
 def _reasoning_policy_for_query(query: str) -> tuple[str, str]:
-    query_type = "performance" if _is_performance_query(query) else "general"
-    return (_HIGH_SIGNAL_PERFORMANCE_POLICY if query_type == "performance" else "", query_type)
+    # Performance queries take the highest priority — they need execution-path analysis.
+    if _is_performance_query(query):
+        return (_HIGH_SIGNAL_PERFORMANCE_POLICY, "performance")
+    # Declaration/dependency queries get structured source-of-truth guidance so the
+    # model always separates declared findings from inferred ones and never silently
+    # falls back to code-usage inference without acknowledging missing authority files.
+    intent = classify_query_intent(query)
+    sot_guidance = source_of_truth_guidance(query, intent)
+    if sot_guidance:
+        return (sot_guidance, "declaration")
+    return ("", "general")
 
 
 def _validate_high_signal_output(text: str, enabled: bool) -> tuple[str, int]:
