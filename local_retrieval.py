@@ -37,6 +37,7 @@ class LocalRetrievedChunk:
 @dataclass
 class LocalRetrievalSummary:
     strategy: str
+    top_k: int
     retrieved_chunk_count: int
     total_candidate_files: int
     index_state: str
@@ -134,15 +135,17 @@ def normalize_local_retrieval(
     if not indexed_at:
         indexed_at = datetime.now(timezone.utc).isoformat()
 
+    # approximate: derived from unique files in retrieved chunks
+    total_candidate_files = len(unique_files)
+
     summary = LocalRetrievalSummary(
         strategy=strategy,
+        top_k=top_k,
         retrieved_chunk_count=len(normalized_chunks),
-        total_candidate_files=max(len(unique_files), len(normalized_chunks), top_k),
+        total_candidate_files=total_candidate_files,
         index_state=(index_state or {}).get("status", "ready"),
         retrieval_mode=retrieval_mode,
         indexed_at=indexed_at,
     )
-    metadata = {
-        "top_k": top_k,
-    }
+    metadata = {}
     return LocalRetrievalResult(query=query, chunks=normalized_chunks, summary=summary, metadata=metadata)
