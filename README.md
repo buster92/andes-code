@@ -289,7 +289,7 @@ For large projects or architectural questions, increase `CONTEXT_CHUNKS` to 7–
 ### Execution modes
 
 - `LOCAL` (default): existing end-to-end behavior (local indexing, retrieval, and inference).
-- `REMOTE_INFERENCE`: reserved for distributed inference rollout. In this phase, schema contracts are implemented and mode wiring is scaffolded, while local behavior remains unchanged by default.
+- `REMOTE_INFERENCE`: distributed rollout path. Retrieval output is now normalized in local mode as well (`query + retrieval summary + chunks with path/line/source authority metadata`) so both modes share the same retrieval result structure before server-side inference is enabled.
 - Remote payload contract reference: `docs/remote-inference-contract.md`.
 
 ---
