@@ -281,9 +281,16 @@ TRANSFORMERS_OFFLINE=1
 HF_DATASETS_OFFLINE=1
 HF_HUB_OFFLINE=1
 TOKENIZERS_PARALLELISM=false
+ANDESCODE_EXECUTION_MODE=LOCAL  # LOCAL (default) or REMOTE_INFERENCE
 ```
 
 For large projects or architectural questions, increase `CONTEXT_CHUNKS` to 7–10. The retrieval pipeline automatically widens its candidate pool for broad queries — this setting controls how many final chunks land in the prompt.
+
+### Execution modes
+
+- `LOCAL` (default): existing end-to-end behavior (local indexing, retrieval, and inference).
+- `REMOTE_INFERENCE`: reserved for distributed inference rollout. In this phase, schema contracts are implemented and mode wiring is scaffolded, while local behavior remains unchanged by default.
+- Remote payload contract reference: `docs/remote-inference-contract.md`.
 
 ---
 
