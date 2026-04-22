@@ -732,6 +732,7 @@ async def chat(request: Request):
         }
 
     if stream:
+        # TODO(phase3): streaming path not yet wrapped by LocalAskOrchestrator — bypasses orchestration boundary
         return StreamingResponse(
             _stream(messages, max_tokens, request_id, t_start, debug_mode=debug_mode),
             media_type="text/event-stream",

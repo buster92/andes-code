@@ -75,6 +75,12 @@ class TestRemoteInferenceSchema(unittest.TestCase):
         with self.assertRaises(SchemaValidationError):
             RemoteInferenceRequest.from_dict(payload)
 
+    def test_rejects_invalid_protocol_version(self):
+        payload = _valid_request_payload()
+        payload["client"]["protocol_version"] = "andes.remote.v2"
+        with self.assertRaises(SchemaValidationError):
+            RemoteInferenceRequest.from_dict(payload)
+
     def test_rejects_invalid_chunk_line_range(self):
         payload = _valid_request_payload()
         payload["chunks"][0]["start_line"] = 50
