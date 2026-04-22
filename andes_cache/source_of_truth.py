@@ -12,6 +12,8 @@ AUTHORITATIVE_NAME_HINTS = [
     "build.gradle.kts",
     "settings.gradle",
     "settings.gradle.kts",
+    "libs.versions.toml",
+    "gradle.properties",
     "package.json",
     "pyproject.toml",
     "requirements.txt",
@@ -23,6 +25,8 @@ AUTHORITATIVE_NAME_HINTS = [
     "package.swift",
     "pipfile",
     "poetry.lock",
+    "gemfile",
+    "composer.json",
     ".env",
     "config",
     "settings",
@@ -68,8 +72,10 @@ def expected_authority_candidates(intent: str, query: str, manifests: list[str],
     if intent == "dependency_or_build_inventory":
         intent_hints.extend([
             "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
+            "libs.versions.toml", "gradle.properties",
             "package.json", "pyproject.toml", "requirements.txt", "cargo.toml", "go.mod",
             "pom.xml", "dockerfile", "docker-compose.yml", "package.swift", "pipfile", "poetry.lock",
+            "gemfile", "composer.json",
         ])
     else:
         intent_hints.extend([
@@ -221,10 +227,17 @@ def classify_source_type(path: str) -> str:
     p = (path or "").lower()
     if "manifest" in p:
         return "manifest"
-    if any(x in p for x in ("gradle", "pom.xml", "dockerfile", "compose", "package.swift")):
-        return "build_file"
-    if any(x in p for x in ("requirements", "pyproject", "cargo.toml", "go.mod", "package.json", "pipfile", "poetry.lock")):
+    # Dependency-file patterns are checked before build-file patterns so more-specific
+    # names (e.g. libs.versions.toml, which lives under a gradle/ directory) win.
+    if any(x in p for x in (
+        "requirements", "pyproject", "cargo.toml", "go.mod", "package.json",
+        "pipfile", "poetry.lock", "libs.versions.toml", "gemfile", "composer.json",
+    )):
         return "dependency_file"
+    if any(x in p for x in (
+        "gradle", "pom.xml", "dockerfile", "compose", "package.swift",
+    )):
+        return "build_file"
     if any(x in p for x in ("config", ".env", "entitlements", ".plist", "settings")):
         return "config_file"
     return "source_code"
@@ -259,6 +272,128 @@ def missing_manifest_notice() -> dict:
             "- Any fallback findings below are references/inferences, not declarations."
         ),
         "file": "__manifest_status__",
+        "language": "meta",
+        "source_type": "meta",
+        "authority_level": "notice",
+    }
+
+
+
+# ---------------------------------------------------------------------------
+# Dependency / build-declaration authority helpers
+# ---------------------------------------------------------------------------
+
+#: Source types that constitute genuine dependency/build declaration authority.
+#: A manifest-only context does NOT satisfy this requirement.
+DEPENDENCY_BUILD_AUTHORITY_TYPES: frozenset[str] = frozenset({"dependency_file", "build_file"})
+
+
+def context_has_dependency_authority(chunks: list[dict]) -> bool:
+    """Return True if at least one chunk comes from a dependency/build declaration file.
+
+    Manifest files (AndroidManifest.xml, etc.) and generic config files are
+    explicitly excluded — they do not constitute dependency declaration authority.
+    """
+    return any(c.get("source_type") in DEPENDENCY_BUILD_AUTHORITY_TYPES for c in chunks)
+
+
+def workspace_has_dependency_files(manifests: list[str], config_files: list[str]) -> bool:
+    """Return True if the workspace metadata contains at least one dependency/build file.
+
+    Used to distinguish between:
+      - No dependency files exist at all in the workspace (Case A)
+      - Files exist but are not indexed/retrievable (Case B)
+    """
+    all_paths = (manifests or []) + (config_files or [])
+    return any(
+        classify_source_type(p) in DEPENDENCY_BUILD_AUTHORITY_TYPES
+        for p in all_paths
+        if p
+    )
+
+
+def recover_dependency_build_files(
+    intent: str,
+    query: str,
+    manifests: list[str],
+    config_files: list[str],
+) -> list[str]:
+    """Dedicated recovery helper that returns only dependency/build declaration file
+    candidates filtered from workspace metadata.
+
+    Called when a dependency query has collected manifest-only context and needs a
+    force-recovery pass for the required dependency/build authority.  Uses
+    filename/path-driven ranking (via rank_authoritative_paths) — no semantic fallback.
+    """
+    all_paths = [p for p in (manifests or []) + (config_files or []) if p]
+    dep_paths = [
+        p for p in all_paths
+        if classify_source_type(p) in DEPENDENCY_BUILD_AUTHORITY_TYPES
+        and _is_authoritative_candidate(p)
+    ]
+    return rank_authoritative_paths(dep_paths, query, intent)
+
+
+def no_dependency_files_in_workspace_limitation() -> dict:
+    """Limitation chunk for Case A: no dependency declaration files exist in workspace.
+
+    Distinct from the generic source-of-truth limitation so callers and the LLM
+    can clearly distinguish 'nothing to find' from 'something exists but is stale'.
+    """
+    return {
+        "content": (
+            "# No Declaration Files\n"
+            "- No dependency declaration files (build.gradle, build.gradle.kts, package.json, "
+            "requirements.txt, pyproject.toml, Cargo.toml, go.mod, pom.xml, etc.) were found "
+            "in this workspace.\n"
+            "- Declared dependencies cannot be sourced from a build or dependency declaration file.\n"
+            "- AndroidManifest.xml and other config files are present but do not declare "
+            "build dependencies."
+        ),
+        "file": "__no_dependency_files_in_workspace__",
+        "language": "meta",
+        "source_type": "meta",
+        "authority_level": "notice",
+    }
+
+
+def dependency_files_not_indexed_limitation() -> dict:
+    """Limitation chunk for Case B: dependency files exist in workspace but are not
+    indexed/retrievable.
+
+    Distinct from Case A so the user knows re-indexing should fix this.
+    """
+    return {
+        "content": (
+            "# Source-of-Truth Limitation\n"
+            "- Dependency declaration files were found in workspace metadata, but the current "
+            "index could not retrieve them.\n"
+            "- The index may be stale or the files may not have been indexed yet.\n"
+            "- AndesCode attempted deterministic dependency/build file recovery before returning "
+            "this limitation.\n"
+            "- Re-indexing the workspace should resolve this."
+        ),
+        "file": "__dependency_files_not_indexed__",
+        "language": "meta",
+        "source_type": "meta",
+        "authority_level": "notice",
+    }
+
+
+def dependency_authority_incomplete_limitation() -> dict:
+    """Limitation chunk for Case C: partial recovery succeeded but required dependency
+    authority is still incomplete (e.g. only manifest/config files in context).
+    """
+    return {
+        "content": (
+            "# Source-of-Truth Limitation\n"
+            "- Dependency declaration file recovery was attempted but could not satisfy the "
+            "required dependency authority for this query.\n"
+            "- Some authoritative files were found, but none are recognized dependency/build "
+            "declaration files (build.gradle, package.json, requirements.txt, etc.).\n"
+            "- Declared dependencies cannot be confirmed from the retrieved context."
+        ),
+        "file": "__dependency_authority_incomplete__",
         "language": "meta",
         "source_type": "meta",
         "authority_level": "notice",
