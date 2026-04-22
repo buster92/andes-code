@@ -84,24 +84,59 @@ class TestRemoteInferenceSchema(unittest.TestCase):
 
     def test_response_event_schemas(self):
         now = datetime.now(timezone.utc)
-        final_event = RemoteFinalAnswerEvent(
-            request_id="req-1",
-            answer="Done.",
-            finished_at=now,
+        final_event = RemoteFinalAnswerEvent.from_dict(
+            {
+                "request_id": "req-1",
+                "answer": "Done.",
+                "finished_at": now.isoformat(),
+            }
         )
-        debug_event = RemoteDebugEvent(
-            request_id="req-1",
-            payload={"files": ["server.py"]},
+        debug_event = RemoteDebugEvent.from_dict(
+            {
+                "request_id": "req-1",
+                "payload": {"files": ["server.py"]},
+            }
         )
-        error_event = RemoteErrorEvent(
-            request_id="req-1",
-            code="bad_request",
-            message="payload invalid",
+        error_event = RemoteErrorEvent.from_dict(
+            {
+                "request_id": "req-1",
+                "code": "bad_request",
+                "message": "payload invalid",
+            }
         )
 
         self.assertEqual(final_event.event, "final_answer")
         self.assertEqual(debug_event.event, "debug")
         self.assertEqual(error_event.event, "error")
+        self.assertEqual(
+            set(final_event.to_dict().keys()),
+            {"event", "request_id", "answer", "finished_at"},
+        )
+        self.assertEqual(
+            set(debug_event.to_dict().keys()),
+            {"event", "request_id", "payload"},
+        )
+        self.assertEqual(
+            set(error_event.to_dict().keys()),
+            {"event", "request_id", "code", "message"},
+        )
+        self.assertEqual(final_event.to_dict()["finished_at"], now.isoformat())
+
+    def test_response_event_schema_rejects_invalid_payloads(self):
+        with self.assertRaises(SchemaValidationError):
+            RemoteFinalAnswerEvent.from_dict(
+                {"request_id": "", "answer": "ok", "finished_at": datetime.now(timezone.utc).isoformat()}
+            )
+        with self.assertRaises(SchemaValidationError):
+            RemoteFinalAnswerEvent.from_dict(
+                {"request_id": "req-1", "answer": "ok", "finished_at": "not-a-date"}
+            )
+        with self.assertRaises(SchemaValidationError):
+            RemoteDebugEvent.from_dict({"request_id": "req-1", "payload": "not-a-dict"})
+        with self.assertRaises(SchemaValidationError):
+            RemoteErrorEvent.from_dict({"request_id": "req-1", "code": "", "message": "m"})
+        with self.assertRaises(SchemaValidationError):
+            RemoteErrorEvent.from_dict({"request_id": "req-1", "code": "bad_request", "message": ""})
 
 
 if __name__ == "__main__":

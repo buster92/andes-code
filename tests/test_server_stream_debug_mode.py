@@ -103,6 +103,14 @@ def _collect_stream(server_module, *, debug_mode=True):
     return asyncio.run(_collect())
 
 
+def _call_chat(server_module, body):
+    class _Req:
+        async def json(self):
+            return body
+
+    return asyncio.run(server_module.chat(_Req()))
+
+
 class TestServerStreamingDebugMode(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -659,6 +667,85 @@ class TestServerStreamingDebugMode(unittest.TestCase):
         self.assertLess(raw_2_idx, refined_header_idx)
         self.assertLess(refined_header_idx, shaped_idx)
         self.assertLess(shaped_idx, done_idx)
+
+    def test_chat_non_stream_local_mode_regression_contract(self):
+        server = self.server
+        prev_mode = os.environ.get("ANDESCODE_EXECUTION_MODE")
+        os.environ["ANDESCODE_EXECUTION_MODE"] = "LOCAL"
+        calls = {"run_non_stream": 0}
+        original_orchestrator = server.LocalAskOrchestrator
+        try:
+            class _StubOrchestrator:
+                def __init__(self, **_kwargs):
+                    pass
+
+                def run_non_stream(self, *, messages, request_id, max_tokens, debug_mode):
+                    calls["run_non_stream"] += 1
+                    return "local path answer", ({"query": "q"} if debug_mode else None)
+
+            server.LocalAskOrchestrator = _StubOrchestrator
+
+            response_debug_off = _call_chat(
+                server,
+                {
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": False,
+                    "max_tokens": 16,
+                    "debug_mode": False,
+                },
+            )
+            self.assertEqual(response_debug_off["object"], "chat.completion")
+            self.assertEqual(response_debug_off["choices"][0]["message"]["content"], "local path answer")
+            self.assertIsNone(response_debug_off["debug"])
+
+            response_debug_on = _call_chat(
+                server,
+                {
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": False,
+                    "max_tokens": 16,
+                    "debug_mode": True,
+                },
+            )
+            self.assertEqual(response_debug_on["object"], "chat.completion")
+            self.assertEqual(response_debug_on["choices"][0]["message"]["content"], "local path answer")
+            self.assertEqual(response_debug_on["debug"], {"query": "q"})
+            self.assertEqual(calls["run_non_stream"], 2)
+        finally:
+            server.LocalAskOrchestrator = original_orchestrator
+            if prev_mode is None:
+                os.environ.pop("ANDESCODE_EXECUTION_MODE", None)
+            else:
+                os.environ["ANDESCODE_EXECUTION_MODE"] = prev_mode
+
+    def test_chat_non_stream_remote_inference_placeholder_contract(self):
+        server = self.server
+        prev_mode = os.environ.get("ANDESCODE_EXECUTION_MODE")
+        os.environ["ANDESCODE_EXECUTION_MODE"] = "REMOTE_INFERENCE"
+        original_orchestrator = server.LocalAskOrchestrator
+        try:
+            class _FailIfUsed:
+                def __init__(self, **_kwargs):
+                    raise AssertionError("local orchestrator should not run in REMOTE_INFERENCE mode")
+
+            server.LocalAskOrchestrator = _FailIfUsed
+            response = _call_chat(
+                server,
+                {
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": False,
+                    "max_tokens": 16,
+                },
+            )
+            self.assertEqual(response["object"], "chat.completion")
+            self.assertEqual(response["error"]["code"], "remote_inference_not_wired")
+            self.assertTrue(response["error"]["message"])
+        finally:
+            server.LocalAskOrchestrator = original_orchestrator
+            if prev_mode is None:
+                os.environ.pop("ANDESCODE_EXECUTION_MODE", None)
+            else:
+                os.environ["ANDESCODE_EXECUTION_MODE"] = prev_mode
 
 
 if __name__ == "__main__":

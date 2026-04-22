@@ -235,12 +235,60 @@ class RemoteFinalAnswerEvent:
     finished_at: datetime
     event: str = "final_answer"
 
+    def __post_init__(self):
+        self.request_id = _require_str({"request_id": self.request_id}, "request_id")
+        if not isinstance(self.answer, str):
+            raise SchemaValidationError("answer is required and must be a string")
+        if not isinstance(self.finished_at, datetime):
+            raise SchemaValidationError("finished_at is required and must be a datetime")
+        if self.event != "final_answer":
+            raise SchemaValidationError("event must be final_answer")
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "RemoteFinalAnswerEvent":
+        return cls(
+            request_id=_require_str(payload, "request_id"),
+            answer=payload.get("answer"),
+            finished_at=_parse_datetime(payload.get("finished_at"), "finished_at"),
+            event=payload.get("event", "final_answer"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event": self.event,
+            "request_id": self.request_id,
+            "answer": self.answer,
+            "finished_at": self.finished_at.isoformat(),
+        }
+
 
 @dataclass
 class RemoteDebugEvent:
     request_id: str
     payload: dict[str, Any]
     event: str = "debug"
+
+    def __post_init__(self):
+        self.request_id = _require_str({"request_id": self.request_id}, "request_id")
+        if not isinstance(self.payload, dict):
+            raise SchemaValidationError("payload is required and must be an object")
+        if self.event != "debug":
+            raise SchemaValidationError("event must be debug")
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "RemoteDebugEvent":
+        return cls(
+            request_id=_require_str(payload, "request_id"),
+            payload=payload.get("payload"),
+            event=payload.get("event", "debug"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event": self.event,
+            "request_id": self.request_id,
+            "payload": self.payload,
+        }
 
 
 @dataclass
@@ -249,3 +297,27 @@ class RemoteErrorEvent:
     code: str
     message: str
     event: str = "error"
+
+    def __post_init__(self):
+        self.request_id = _require_str({"request_id": self.request_id}, "request_id")
+        self.code = _require_str({"code": self.code}, "code")
+        self.message = _require_str({"message": self.message}, "message")
+        if self.event != "error":
+            raise SchemaValidationError("event must be error")
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "RemoteErrorEvent":
+        return cls(
+            request_id=_require_str(payload, "request_id"),
+            code=_require_str(payload, "code"),
+            message=_require_str(payload, "message"),
+            event=payload.get("event", "error"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event": self.event,
+            "request_id": self.request_id,
+            "code": self.code,
+            "message": self.message,
+        }
