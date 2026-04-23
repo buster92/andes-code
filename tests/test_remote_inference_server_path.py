@@ -264,6 +264,59 @@ class TestRemoteInferenceServerPath(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"]["code"], "remote_unreachable")
 
+    def test_chat_remote_stream_done_marker_split_across_reads(self):
+        self.server.get_execution_mode = lambda: self.server.ExecutionMode.REMOTE_INFERENCE
+        self.server.INDEXER_READY = True
+        self.server._indexer_module = types.SimpleNamespace(_load_index_state=lambda: {}, ROOT=".")
+        self.server.search_codebase = lambda *_args, **_kwargs: [
+            {"file": "server.py", "content": "def a():\n  pass", "line": 1, "score": 0.7}
+        ]
+        self.server.subprocess.check_output = lambda *args, **kwargs: "stub"
+        self.server.StreamingResponse = lambda gen, **_kwargs: gen
+
+        class _Resp:
+            def __init__(self):
+                self._parts = [
+                    b"data: token1\n\n",
+                    b"data: [DO",
+                    b"NE]\n\n",
+                    b"",
+                ]
+                self._idx = 0
+
+            def read(self, _size: int | None = None):
+                part = self._parts[self._idx]
+                self._idx += 1
+                return part
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        self.server.url_request.urlopen = lambda *_args, **_kwargs: _Resp()
+
+        class _Req:
+            async def json(self):
+                return {
+                    "messages": [{"role": "user", "content": "what is a?"}],
+                    "stream": True,
+                    "max_tokens": 16,
+                }
+
+        stream_gen = asyncio.run(self.server.chat(_Req()))
+
+        async def _collect():
+            out = []
+            async for part in stream_gen:
+                out.append(part)
+            return "".join(out)
+
+        stream_payload = asyncio.run(_collect())
+        self.assertIn("data: [DONE]", stream_payload)
+        self.assertNotIn("remote_stream_interrupted", stream_payload)
+
 
 if __name__ == "__main__":
     unittest.main()

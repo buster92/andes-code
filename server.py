@@ -763,6 +763,7 @@ async def chat(request: Request):
         if stream:
             async def _proxy_stream():
                 saw_done = False
+                done_scan_buffer = ""
                 try:
                     req = url_request.Request(
                         endpoint,
@@ -777,7 +778,8 @@ async def chat(request: Request):
                             if not part:
                                 break
                             decoded = part.decode("utf-8", errors="ignore")
-                            if "[DONE]" in decoded:
+                            done_scan_buffer = f"{done_scan_buffer}{decoded}"[-32:]
+                            if "[DONE]" in done_scan_buffer:
                                 saw_done = True
                             yield decoded
                     _phase_log(request_id, "remote_payload_send_succeeded", stream=True)
