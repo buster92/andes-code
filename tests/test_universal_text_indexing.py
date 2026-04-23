@@ -7,22 +7,61 @@ Tests for universal text indexing:
 """
 
 import json
+import importlib
 import shutil
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
 # Make sure the project root is on the path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from indexer import (
-    MAX_FILE_BYTES,
-    SUPPORTED_EXTENSIONS,
-    _chunk_notebook,
-    _collect_files,
-    _is_binary,
-)
+
+class _FakeSentenceTransformer:
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def encode(self, _query):  # pragma: no cover - not used in these tests
+        return [0.1, 0.2, 0.3]
+
+
+class _FakeCollection:
+    def count(self):  # pragma: no cover - not used in these tests
+        return 0
+
+    def get(self, **_kwargs):  # pragma: no cover - not used in these tests
+        return {"documents": [], "metadatas": []}
+
+
+class _FakeChromaClient:
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def get_or_create_collection(self, *_args, **_kwargs):
+        return _FakeCollection()
+
+
+def _import_indexer_with_stubs():
+    fake_sentence_transformers = types.ModuleType("sentence_transformers")
+    fake_sentence_transformers.SentenceTransformer = _FakeSentenceTransformer
+    sys.modules["sentence_transformers"] = fake_sentence_transformers
+
+    fake_chromadb = types.ModuleType("chromadb")
+    fake_chromadb.PersistentClient = _FakeChromaClient
+    sys.modules["chromadb"] = fake_chromadb
+
+    import indexer
+    return importlib.reload(indexer)
+
+
+_indexer = _import_indexer_with_stubs()
+MAX_FILE_BYTES = _indexer.MAX_FILE_BYTES
+SUPPORTED_EXTENSIONS = _indexer.SUPPORTED_EXTENSIONS
+_chunk_notebook = _indexer._chunk_notebook
+_collect_files = _indexer._collect_files
+_is_binary = _indexer._is_binary
 
 
 class TestSupportedExtensions(unittest.TestCase):
@@ -30,7 +69,6 @@ class TestSupportedExtensions(unittest.TestCase):
 
     def test_r_scripts_supported(self):
         self.assertIn(".r", SUPPORTED_EXTENSIONS)
-        self.assertIn(".R", SUPPORTED_EXTENSIONS)
 
     def test_sql_supported(self):
         self.assertIn(".sql", SUPPORTED_EXTENSIONS)
@@ -123,6 +161,18 @@ class TestCollectFiles(unittest.TestCase):
         self.assertEqual(len(files), 1)
         self.assertEqual(files[0].suffix, ".R")
 
+    def test_collects_uppercase_supported_extensions(self):
+        self._write("QUERY.SQL", "SELECT 1;\n")
+        self._write("README.MD", "# Docs\n")
+        self._write("SCRIPT.SH", "echo hello\n")
+        self._write("MODEL.R", "x <- 1\n")
+        files = _collect_files(self.tmp)
+        names = {f.name for f in files}
+        self.assertIn("QUERY.SQL", names)
+        self.assertIn("README.MD", names)
+        self.assertIn("SCRIPT.SH", names)
+        self.assertIn("MODEL.R", names)
+
     def test_collects_sql_files(self):
         self._write("query.sql", "SELECT 1;\n")
         files = _collect_files(self.tmp)
@@ -132,6 +182,11 @@ class TestCollectFiles(unittest.TestCase):
         self._write("huge.md", "x\n" * (MAX_FILE_BYTES + 1))
         files = _collect_files(self.tmp)
         self.assertEqual(len(files), 0)
+
+    def test_collects_oversized_manifest_file(self):
+        self._write("poetry.lock", "pkg = 'x'\n" * (MAX_FILE_BYTES + 1))
+        files = _collect_files(self.tmp)
+        self.assertEqual([f.name for f in files], ["poetry.lock"])
 
     def test_skips_binary_files(self):
         # A .md file that is actually binary

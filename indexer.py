@@ -139,7 +139,7 @@ SUPPORTED_EXTENSIONS = {
     ".toml",        # Rust Cargo.toml, Python pyproject.toml, Gradle version catalogs, etc.
     ".properties",  # Java/Gradle/Spring project properties files
     # ── Data science & statistics ─────────────────────────────────────────────
-    ".r", ".R",     # R scripts — critical for stats/research teams
+    ".r",           # R scripts — critical for stats/research teams
     ".sql",         # SQL queries and migrations
     ".ipynb",       # Jupyter notebooks (cell sources extracted, not raw JSON)
     # ── Docs & config ─────────────────────────────────────────────────────────
@@ -1256,7 +1256,7 @@ def build_workspace_index(
     CACHE.workspace_set(repo_fp, "module_graph", modules)
 
     has_manifest_change = any(Path(p).name in MANIFEST_FILES for p in changed_paths)
-    has_code_change = any(Path(p).suffix in SUPPORTED_EXTENSIONS for p in changed_paths)
+    has_code_change = any(Path(p).suffix.lower() in SUPPORTED_EXTENSIONS for p in changed_paths)
 
     dependencies = None if force_refresh else CACHE.workspace_get(repo_fp, "dependency_inventory")
     if dependencies is None or has_manifest_change:
@@ -2470,27 +2470,35 @@ def _collect_files(root: Path) -> list:
     MUST be indexed so that source-of-truth retrieval can fetch their content from
     ChromaDB rather than returning an integrity-failure limitation chunk.
 
-    Files larger than MAX_FILE_BYTES or detected as binary are silently skipped
-    to protect against huge CSVs, minified bundles, PDFs, images, etc.
+    Generic text files larger than MAX_FILE_BYTES or detected as binary are
+    silently skipped to protect against huge CSVs, minified bundles, PDFs,
+    images, etc.
+
+    Manifest/source-of-truth files intentionally use a more permissive policy:
+    they are not rejected by the generic size/binary heuristics so we preserve
+    authoritative retrieval guarantees for lock/config files.
     """
     _manifest_basenames_lower = {m.lower() for m in MANIFEST_FILES}
     files = []
     for fp in root.rglob("*"):
         if not fp.is_file():
             continue
-        if any(s in fp.parts for s in SKIP_DIRS):
+        rel_parts = fp.relative_to(root).parts
+        if any(s in rel_parts for s in SKIP_DIRS):
             continue
-        if fp.suffix not in SUPPORTED_EXTENSIONS and fp.name.lower() not in _manifest_basenames_lower:
+        is_manifest = fp.name.lower() in _manifest_basenames_lower
+        if fp.suffix.lower() not in SUPPORTED_EXTENSIONS and not is_manifest:
             continue
-        # Skip files that are too large (e.g. huge CSVs, minified bundles)
-        try:
-            if fp.stat().st_size > MAX_FILE_BYTES:
+        if not is_manifest:
+            # Skip generic files that are too large (e.g. huge CSVs, minified bundles)
+            try:
+                if fp.stat().st_size > MAX_FILE_BYTES:
+                    continue
+            except OSError:
                 continue
-        except OSError:
-            continue
-        # Skip binary files that happen to have a text extension
-        if _is_binary(fp):
-            continue
+            # Skip binary files that happen to have a text extension
+            if _is_binary(fp):
+                continue
         files.append(fp)
     return sorted(files)
 
