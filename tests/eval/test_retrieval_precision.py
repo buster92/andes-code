@@ -37,9 +37,13 @@ from pathlib import Path
 from typing import Optional
 
 # ── Path setup ────────────────────────────────────────────────────────────────
-REPO_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(REPO_ROOT))
-sys.path.insert(0, str(Path(__file__).parent))
+# File lives at tests/eval/test_retrieval_precision.py
+# .parent              → tests/eval/
+# .parent.parent       → tests/
+# .parent.parent.parent → repo root  (where indexer.py lives)
+REPO_ROOT = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(REPO_ROOT))            # finds indexer.py
+sys.path.insert(0, str(Path(__file__).parent)) # finds fixtures/
 
 from fixtures.golden_android import write_golden_codebase
 
