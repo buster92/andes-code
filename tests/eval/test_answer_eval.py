@@ -58,9 +58,10 @@ BASE_URL   = os.getenv("ANDESCODE_URL", "http://localhost:8080")
 TIMEOUT    = 180   # seconds — model can be slow on first query
 AUTO_INDEX = os.getenv("AUTO_INDEX", "0") == "1"
 
-REPO_ROOT = Path(__file__).parent.parent.parent  # tests/eval/ → tests/ → repo root
-sys.path.insert(0, str(REPO_ROOT))            # finds indexer.py, server.py
-sys.path.insert(0, str(Path(__file__).parent)) # finds fixtures/
+REPO_ROOT = Path(__file__).resolve().parents[2]  # tests/eval/ → tests/ → repo root
+EVAL_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO_ROOT))  # finds indexer.py, server.py
+sys.path.insert(0, str(EVAL_DIR))   # finds fixtures/
 
 from fixtures.golden_android import write_golden_codebase
 

@@ -38,12 +38,13 @@ from typing import Optional
 
 # ── Path setup ────────────────────────────────────────────────────────────────
 # File lives at tests/eval/test_retrieval_precision.py
-# .parent              → tests/eval/
-# .parent.parent       → tests/
-# .parent.parent.parent → repo root  (where indexer.py lives)
-REPO_ROOT = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(REPO_ROOT))            # finds indexer.py
-sys.path.insert(0, str(Path(__file__).parent)) # finds fixtures/
+# parents[0] → tests/eval/
+# parents[1] → tests/
+# parents[2] → repo root  (where indexer.py lives)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+EVAL_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO_ROOT))  # finds indexer.py
+sys.path.insert(0, str(EVAL_DIR))   # finds fixtures/
 
 from fixtures.golden_android import write_golden_codebase
 
