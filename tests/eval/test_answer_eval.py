@@ -58,23 +58,18 @@ BASE_URL   = os.getenv("ANDESCODE_URL", "http://localhost:8080")
 TIMEOUT    = 180   # seconds — model can be slow on first query
 AUTO_INDEX = os.getenv("AUTO_INDEX", "0") == "1"
 
-<<<<<<< ours
-REPO_ROOT = Path(__file__).resolve().parents[2]  # tests/eval/ → tests/ → repo root
-EVAL_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(REPO_ROOT))  # finds indexer.py, server.py
-sys.path.insert(0, str(EVAL_DIR))   # finds fixtures/
-=======
 EVAL_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(EVAL_DIR))   # finds path_setup + fixtures/
 
 from path_setup import find_repo_root, prepend_sys_path
+from fixture_registry import DEFAULT_FIXTURE, load_fixture
 
 REPO_ROOT = find_repo_root(__file__)
 prepend_sys_path(REPO_ROOT)  # finds indexer.py, server.py
 prepend_sys_path(EVAL_DIR)   # finds fixtures/
->>>>>>> theirs
 
-from fixtures.golden_android import write_golden_codebase
+FIXTURE = os.getenv("FIXTURE", DEFAULT_FIXTURE)
+_fixture_module, _fixture_description = load_fixture(FIXTURE)
 
 # ── API helpers ───────────────────────────────────────────────────────────────
 
@@ -534,14 +529,24 @@ class TestAnswerQuality(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        if FIXTURE != "android":
+            raise RuntimeError(
+                f"Answer eval is currently Android-only. Got fixture='{FIXTURE}'. "
+                "Use --fixture android for --suite eval/full."
+            )
+
         if not _server_up():
             raise unittest.SkipTest(
                 "AndesCode server not running — start with: python3 server.py"
             )
 
         if AUTO_INDEX:
-            cls.tmpdir = tempfile.mkdtemp(prefix="andescode_eval_")
-            write_golden_codebase(cls.tmpdir)
+            preset_tmpdir = os.getenv("GOLDEN_FIXTURE_DIR")
+            if preset_tmpdir:
+                cls.tmpdir = preset_tmpdir
+            else:
+                cls.tmpdir = tempfile.mkdtemp(prefix="andescode_eval_")
+                _fixture_module.write_golden_codebase(cls.tmpdir)
             sys.path.insert(0, str(REPO_ROOT))
             from indexer import index_codebase
             result = index_codebase(cls.tmpdir)
@@ -551,7 +556,7 @@ class TestAnswerQuality(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        if cls.tmpdir:
+        if cls.tmpdir and not os.getenv("GOLDEN_FIXTURE_DIR"):
             shutil.rmtree(cls.tmpdir, ignore_errors=True)
         _print_eval_report(cls.results)
 

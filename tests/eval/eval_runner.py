@@ -66,30 +66,11 @@ EVAL_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(EVAL_DIR))
 
 from path_setup import find_repo_root, prepend_sys_path
+from fixture_registry import DEFAULT_FIXTURE, FIXTURES, load_fixture
 
 REPO_ROOT = find_repo_root(__file__)
 prepend_sys_path(REPO_ROOT)
 prepend_sys_path(EVAL_DIR)
-
-# ── Fixture registry ──────────────────────────────────────────────────────────
-# Each entry: name → (module_path, human description)
-FIXTURES: dict[str, tuple[str, str]] = {
-    "android": (
-        "fixtures.golden_android",
-        "SecureCam Android — Kotlin / RxJava 3 / Hilt / Room / CameraX / BLE",
-    ),
-    "python_api": (
-        "fixtures.golden_python_api",
-        "TaskFlow API — FastAPI / SQLAlchemy async / Celery / Redis / Pytest",
-    ),
-    "rust_cli": (
-        "fixtures.golden_rust_cli",
-        "Ferox CLI — Tokio / Serde / Clap / async traits / Cargo workspace",
-    ),
-}
-
-DEFAULT_FIXTURE = "android"
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -102,48 +83,33 @@ def _server_up(url: str) -> bool:
         return False
 
 
-def _load_fixture(name: str):
-    import importlib
-    if name not in FIXTURES:
-        print(f"❌ Unknown fixture '{name}'. Available: {list(FIXTURES)}")
-        sys.exit(1)
-    module_path, description = FIXTURES[name]
-    module = importlib.import_module(module_path)
-    return module, description
-
-
-def _auto_index(fixture_module, tmpdir: str):
-    from indexer import index_codebase
-    fixture_module.write_golden_codebase(tmpdir)
-    result = index_codebase(tmpdir)
-    print(f"  Indexed {result['indexed']} files from golden codebase.\n")
-    return result
-
-
 # ── Suite runners ─────────────────────────────────────────────────────────────
 
 def run_fast(fixture_name: str, auto_index: bool):
     """Retrieval precision only — no model needed."""
-    import tempfile, shutil
+    import tempfile, shutil, os
     from test_retrieval_precision import (
+        RetrievalFixtureSmoke,
         RetrievalBaseline, RetrievalCodeUnderstanding, RetrievalArchitecture,
         RetrievalNestedDeps, RetrievalHardware, RetrievalFramework, RetrievalReactiveX,
         GoldenBaseTest,
     )
 
-    fixture_module, description = _load_fixture(fixture_name)
+    fixture_module, description = load_fixture(fixture_name)
     print(f"  Fixture:  {description}")
     print(f"  Suite:    fast (retrieval precision, no model)\n")
 
     tmpdir = tempfile.mkdtemp(prefix="andescode_eval_")
     try:
         fixture_module.write_golden_codebase(tmpdir)
-        # Patch the base class so all test classes use this tmpdir
-        GoldenBaseTest._override_tmpdir = tmpdir
+        os.environ["FIXTURE"] = fixture_name
+        os.environ["GOLDEN_FIXTURE_DIR"] = tmpdir
+        GoldenBaseTest._reset_shared_state()
 
         loader = unittest.TestLoader()
         suite = unittest.TestSuite([
             loader.loadTestsFromTestCase(cls) for cls in [
+                RetrievalFixtureSmoke,
                 RetrievalBaseline, RetrievalCodeUnderstanding, RetrievalArchitecture,
                 RetrievalNestedDeps, RetrievalHardware, RetrievalFramework, RetrievalReactiveX,
             ]
@@ -151,6 +117,7 @@ def run_fast(fixture_name: str, auto_index: bool):
         result = unittest.TextTestRunner(verbosity=2).run(suite)
         return result.wasSuccessful()
     finally:
+        os.environ.pop("GOLDEN_FIXTURE_DIR", None)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
@@ -158,7 +125,7 @@ def run_eval(url: str, fixture_name: str, auto_index: bool):
     """Answer quality eval only — model required."""
     import tempfile, shutil
 
-    fixture_module, description = _load_fixture(fixture_name)
+    fixture_module, description = load_fixture(fixture_name)
     print(f"  Fixture:  {description}")
     print(f"  Suite:    eval (answer quality, model required)")
     print(f"  Server:   {url}\n")
@@ -171,12 +138,15 @@ def run_eval(url: str, fixture_name: str, auto_index: bool):
     os.environ["ANDESCODE_URL"] = url
 
     tmpdir = None
+    os.environ["FIXTURE"] = fixture_name
     if auto_index:
         tmpdir = tempfile.mkdtemp(prefix="andescode_eval_")
         fixture_module.write_golden_codebase(tmpdir)
         os.environ["AUTO_INDEX"] = "1"
-        # Patch indexer path so test_answer_eval picks it up
         os.environ["GOLDEN_FIXTURE_DIR"] = tmpdir
+    else:
+        os.environ.pop("AUTO_INDEX", None)
+        os.environ.pop("GOLDEN_FIXTURE_DIR", None)
 
     from test_answer_eval import TestAnswerQuality
     loader = unittest.TestLoader()
@@ -184,6 +154,7 @@ def run_eval(url: str, fixture_name: str, auto_index: bool):
     result = unittest.TextTestRunner(verbosity=1).run(suite)
 
     if tmpdir:
+        os.environ.pop("GOLDEN_FIXTURE_DIR", None)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
     return result.wasSuccessful()
@@ -235,6 +206,10 @@ examples:
         help="List available fixtures and exit"
     )
     args = parser.parse_args()
+
+    if args.fixture not in FIXTURES:
+        print(f"❌ Unknown fixture '{args.fixture}'. Available: {list(FIXTURES)}")
+        sys.exit(1)
 
     if args.list_fixtures:
         print("\nRegistered fixtures:\n")

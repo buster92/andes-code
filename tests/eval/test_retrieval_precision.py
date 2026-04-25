@@ -33,35 +33,38 @@ import sys
 import shutil
 import tempfile
 import unittest
+import atexit
 from pathlib import Path
 from typing import Optional
 
 # ── Path setup ────────────────────────────────────────────────────────────────
-<<<<<<< ours
-# File lives at tests/eval/test_retrieval_precision.py
-# parents[0] → tests/eval/
-# parents[1] → tests/
-# parents[2] → repo root  (where indexer.py lives)
-REPO_ROOT = Path(__file__).resolve().parents[2]
-EVAL_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(REPO_ROOT))  # finds indexer.py
-sys.path.insert(0, str(EVAL_DIR))   # finds fixtures/
-=======
 EVAL_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(EVAL_DIR))  # finds path_setup + fixtures/
 
 from path_setup import find_repo_root, prepend_sys_path
+from fixture_registry import DEFAULT_FIXTURE, load_fixture
 
 REPO_ROOT = find_repo_root(__file__)
 prepend_sys_path(REPO_ROOT)        # finds indexer.py
 prepend_sys_path(EVAL_DIR)         # finds fixtures/
->>>>>>> theirs
-
-from fixtures.golden_android import write_golden_codebase
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 _indexed_dir: Optional[str] = None
+_shared_tmpdir: Optional[str] = None
+_owns_shared_tmpdir = False
+_fixture_name = os.getenv("FIXTURE", DEFAULT_FIXTURE)
+_fixture_module, _fixture_description = load_fixture(_fixture_name)
+
+
+def _cleanup_shared_tmpdir():
+    global _shared_tmpdir
+    if _owns_shared_tmpdir and _shared_tmpdir:
+        shutil.rmtree(_shared_tmpdir, ignore_errors=True)
+        _shared_tmpdir = None
+
+
+atexit.register(_cleanup_shared_tmpdir)
 
 def _ensure_index(tmpdir: str):
     """Index the golden codebase once per test session."""
@@ -120,11 +123,35 @@ def _assert_retrieval(
 
 class GoldenBaseTest(unittest.TestCase):
     tmpdir: str = ""
+    _android_only = False
+
+    @classmethod
+    def _reset_shared_state(cls):
+        global _indexed_dir, _shared_tmpdir, _owns_shared_tmpdir, _fixture_name, _fixture_module, _fixture_description
+        _indexed_dir = None
+        _cleanup_shared_tmpdir()
+        _shared_tmpdir = None
+        _owns_shared_tmpdir = False
+        _fixture_name = os.getenv("FIXTURE", DEFAULT_FIXTURE)
+        _fixture_module, _fixture_description = load_fixture(_fixture_name)
 
     @classmethod
     def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp(prefix="andescode_golden_")
-        write_golden_codebase(cls.tmpdir)
+        global _shared_tmpdir, _owns_shared_tmpdir
+        if cls._android_only and _fixture_name != "android":
+            raise unittest.SkipTest(
+                f"{cls.__name__} is Android-specific and not applicable to fixture '{_fixture_name}'."
+            )
+
+        if _shared_tmpdir is None:
+            preset_tmpdir = os.getenv("GOLDEN_FIXTURE_DIR")
+            if preset_tmpdir:
+                _shared_tmpdir = preset_tmpdir
+            else:
+                _shared_tmpdir = tempfile.mkdtemp(prefix="andescode_golden_")
+                _fixture_module.write_golden_codebase(_shared_tmpdir)
+                _owns_shared_tmpdir = True
+        cls.tmpdir = _shared_tmpdir
         try:
             _ensure_index(cls.tmpdir)
         except ModuleNotFoundError as exc:
@@ -134,15 +161,25 @@ class GoldenBaseTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+        # Shared tempdir is cleaned once (via eval runner or atexit).
+        return
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BASELINE — sanity checks
 # ─────────────────────────────────────────────────────────────────────────────
 
+class RetrievalFixtureSmoke(GoldenBaseTest):
+    """Fixture-agnostic smoke checks to ensure fixture is written and indexed."""
+
+    def test_fixture_indexed_has_results(self):
+        retrieved = _search("repository architecture", n=3)
+        self.assertGreater(len(retrieved), 0, "Expected non-empty retrieval results")
+
+
 class RetrievalBaseline(GoldenBaseTest):
     """Basic sanity: obviously relevant files must rank in top results."""
+    _android_only = True
 
     def test_camera_viewmodel_by_name(self):
         """Direct filename mention retrieves the file."""
@@ -180,6 +217,7 @@ class RetrievalBaseline(GoldenBaseTest):
 
 class RetrievalCodeUnderstanding(GoldenBaseTest):
     """Queries about specific functions, classes, and their purpose."""
+    _android_only = True
 
     def test_upload_video_function(self):
         """Query about upload logic should retrieve the function's owner file."""
@@ -230,6 +268,7 @@ class RetrievalCodeUnderstanding(GoldenBaseTest):
 
 class RetrievalArchitecture(GoldenBaseTest):
     """Queries about layers, data flow, and architectural decisions."""
+    _android_only = True
 
     def test_clean_architecture_layers(self):
         """Query about app layers must retrieve files from multiple layers."""
@@ -294,6 +333,7 @@ class RetrievalNestedDeps(GoldenBaseTest):
     Queries that require understanding multi-level dependency chains.
     These are the hardest for retrieval — the answer is spread across files.
     """
+    _android_only = True
 
     def test_upload_use_case_full_chain(self):
         """
@@ -384,6 +424,7 @@ class RetrievalNestedDeps(GoldenBaseTest):
 
 class RetrievalHardware(GoldenBaseTest):
     """Queries about hardware components, permissions, and constraints."""
+    _android_only = True
 
     def test_camerax_hardware(self):
         """CameraX recording logic should retrieve CameraManager."""
@@ -453,6 +494,7 @@ class RetrievalHardware(GoldenBaseTest):
 
 class RetrievalFramework(GoldenBaseTest):
     """Queries about Android framework patterns: Hilt, Room, Retrofit, LiveData."""
+    _android_only = True
 
     def test_hilt_viewmodel_injection(self):
         """@HiltViewModel annotation is on both ViewModels."""
@@ -509,6 +551,7 @@ class RetrievalFramework(GoldenBaseTest):
 
 class RetrievalReactiveX(GoldenBaseTest):
     """RxJava-specific queries — the hardest category."""
+    _android_only = True
 
     def test_retrywhen_operator(self):
         """retryWhen is the RxJava hook used in VideoRepository."""
