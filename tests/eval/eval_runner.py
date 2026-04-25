@@ -62,9 +62,14 @@ import sys
 import unittest
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(REPO_ROOT))
-sys.path.insert(0, str(Path(__file__).parent))
+EVAL_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(EVAL_DIR))
+
+from path_setup import find_repo_root, prepend_sys_path
+
+REPO_ROOT = find_repo_root(__file__)
+prepend_sys_path(REPO_ROOT)
+prepend_sys_path(EVAL_DIR)
 
 # ── Fixture registry ──────────────────────────────────────────────────────────
 # Each entry: name → (module_path, human description)

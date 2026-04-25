@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Optional
 
 # ── Path setup ────────────────────────────────────────────────────────────────
+<<<<<<< ours
 # File lives at tests/eval/test_retrieval_precision.py
 # parents[0] → tests/eval/
 # parents[1] → tests/
@@ -45,6 +46,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 EVAL_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))  # finds indexer.py
 sys.path.insert(0, str(EVAL_DIR))   # finds fixtures/
+=======
+EVAL_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(EVAL_DIR))  # finds path_setup + fixtures/
+
+from path_setup import find_repo_root, prepend_sys_path
+
+REPO_ROOT = find_repo_root(__file__)
+prepend_sys_path(REPO_ROOT)        # finds indexer.py
+prepend_sys_path(EVAL_DIR)         # finds fixtures/
+>>>>>>> theirs
 
 from fixtures.golden_android import write_golden_codebase
 
@@ -116,8 +127,10 @@ class GoldenBaseTest(unittest.TestCase):
         write_golden_codebase(cls.tmpdir)
         try:
             _ensure_index(cls.tmpdir)
-        except ImportError:
-            raise unittest.SkipTest("indexer.py not found — run from repo root")
+        except ModuleNotFoundError as exc:
+            if exc.name == "indexer":
+                raise unittest.SkipTest("indexer.py not found — run from repo root")
+            raise
 
     @classmethod
     def tearDownClass(cls):
