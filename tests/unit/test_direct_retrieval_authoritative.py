@@ -4,6 +4,8 @@ import types
 import unittest
 from types import SimpleNamespace
 
+import pytest
+
 
 class _FakeEmbedding:
     def __init__(self, values):
@@ -311,6 +313,7 @@ class TestDirectRetrievalAuthoritative(unittest.TestCase):
         self.assertEqual(len(second_payload["retrieval"]["selected_candidates"]), 3)
         self.assertEqual(second_payload["retrieval"]["authority_retrieval_mode"], "direct_chunk_load")
 
+    @pytest.mark.integration
     def test_cache_hit_non_authoritative_respects_smaller_n_results(self):
         indexer = _import_indexer_with_stubs()
         indexer._load_workspace_index = lambda: {"manifests": [], "config_graph": {"config_files": []}}

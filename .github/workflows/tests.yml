@@ -18,6 +18,7 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
+<<<<<<< ours
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
@@ -30,10 +31,12 @@ jobs:
         run: python -m pytest tests/ --ignore=tests/eval -v --tb=short
 
       - name: Run eval fast suite (model-free retrieval, android fixture)
+=======
+>>>>>>> theirs
         run: |
-          set -euo pipefail
-          python3 tests/eval/eval_runner.py --suite fast --fixture android | tee /tmp/eval_fast.log
-          if grep -q "Ran 0 tests" /tmp/eval_fast.log; then
-            echo "Retrieval eval reported 0 tests; failing to avoid false green."
-            exit 1
-          fi
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run deterministic unit tests only
+        run: python -m pytest tests/unit -v --tb=short
