@@ -122,16 +122,45 @@ _BOUNDARY = {
     "swift":re.compile(r"^\s*(func |class |struct |protocol |extension )", re.MULTILINE),
     "go":   re.compile(r"^(func |type )", re.MULTILINE),
     "rs":   re.compile(r"^(fn |pub fn |impl |struct |enum |trait )", re.MULTILINE),
+    # Text / data science formats
+    "r":    re.compile(r"^(\w+\s*(<-|=)\s*function|#'|# ----)", re.MULTILINE),
+    "sql":  re.compile(r"^(SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|WITH|--)", re.MULTILINE | re.IGNORECASE),
+    "md":   re.compile(r"^#{1,3} ", re.MULTILINE),
+    "sh":   re.compile(r"^(function |\w+\(\)\s*\{|# ----)", re.MULTILINE),
+    "bash": re.compile(r"^(function |\w+\(\)\s*\{|# ----)", re.MULTILINE),
 }
 
 SUPPORTED_EXTENSIONS = {
+    # ── Languages (original) ──────────────────────────────────────────────────
     ".py", ".js", ".ts", ".jsx", ".tsx",
     ".go", ".rs", ".java", ".cpp", ".c", ".h",
     ".rb", ".php", ".cs", ".swift", ".kt",
     ".gradle", ".xml",
     ".toml",        # Rust Cargo.toml, Python pyproject.toml, Gradle version catalogs, etc.
     ".properties",  # Java/Gradle/Spring project properties files
+    # ── Data science & statistics ─────────────────────────────────────────────
+    ".r",           # R scripts — critical for stats/research teams
+    ".sql",         # SQL queries and migrations
+    ".ipynb",       # Jupyter notebooks (cell sources extracted, not raw JSON)
+    # ── Docs & config ─────────────────────────────────────────────────────────
+    ".md", ".mdx",  # Markdown documentation
+    ".txt",         # Plain text notes, changelogs, etc.
+    ".yaml", ".yml",# Config files
+    ".sh", ".bash", # Shell scripts
+    ".env",         # Environment config
+    ".html", ".css",# Web templates and styles
 }
+SUPPORTED_BASENAMES = {
+    ".env",  # Canonical dotenv file has no suffix in pathlib
+}
+
+# Files larger than this are skipped — protects against huge CSVs, logs, etc.
+MAX_FILE_BYTES = 500_000  # 500 KB
+
+# Binary detection: if >2% of sampled bytes are non-text, skip the file.
+# Catches .pdf, .xlsx, .png, .db, .zip etc. without needing an extension list.
+_BINARY_SAMPLE_BYTES = 8_000
+_BINARY_THRESHOLD    = 0.02
 
 MANIFEST_FILES = {
     "requirements.txt", "pyproject.toml", "poetry.lock", "Pipfile",
@@ -1230,7 +1259,7 @@ def build_workspace_index(
     CACHE.workspace_set(repo_fp, "module_graph", modules)
 
     has_manifest_change = any(Path(p).name in MANIFEST_FILES for p in changed_paths)
-    has_code_change = any(Path(p).suffix in SUPPORTED_EXTENSIONS for p in changed_paths)
+    has_code_change = any(Path(p).suffix.lower() in SUPPORTED_EXTENSIONS for p in changed_paths)
 
     dependencies = None if force_refresh else CACHE.workspace_get(repo_fp, "dependency_inventory")
     if dependencies is None or has_manifest_change:
@@ -2414,6 +2443,26 @@ def evaluate_index_state(current_state: dict, stored_state: dict | None, repo_ch
     }
 
 
+def _is_binary(fp: Path) -> bool:
+    """Return True if the file looks like binary (non-text).
+
+    Reads up to _BINARY_SAMPLE_BYTES and checks what fraction of bytes are
+    outside the printable ASCII + common UTF-8 continuation range. A null
+    byte (0x00) is an instant binary signal — it never appears in plain text.
+    """
+    try:
+        sample = fp.read_bytes()[:_BINARY_SAMPLE_BYTES]
+    except OSError:
+        return True
+    if b"\x00" in sample:
+        return True
+    non_text = sum(
+        1 for b in sample
+        if b < 0x09 or (0x0E <= b <= 0x1F and b not in (0x1B,))
+    )
+    return (non_text / max(len(sample), 1)) > _BINARY_THRESHOLD
+
+
 def _collect_files(root: Path) -> list:
     """
     Collect all indexable files: source files with supported extensions AND
@@ -2423,26 +2472,52 @@ def _collect_files(root: Path) -> list:
     go.mod, etc.) have non-standard extensions not in SUPPORTED_EXTENSIONS, but
     MUST be indexed so that source-of-truth retrieval can fetch their content from
     ChromaDB rather than returning an integrity-failure limitation chunk.
+
+    Generic text files larger than MAX_FILE_BYTES or detected as binary are
+    silently skipped to protect against huge CSVs, minified bundles, PDFs,
+    images, etc.
+
+    Manifest/source-of-truth files intentionally use a more permissive policy:
+    they are not rejected by the generic size/binary heuristics so we preserve
+    authoritative retrieval guarantees for lock/config files.
     """
     _manifest_basenames_lower = {m.lower() for m in MANIFEST_FILES}
     files = []
     for fp in root.rglob("*"):
         if not fp.is_file():
             continue
-        if any(s in fp.parts for s in SKIP_DIRS):
+        rel_parts = fp.relative_to(root).parts
+        if any(s in rel_parts for s in SKIP_DIRS):
             continue
-        if fp.suffix in SUPPORTED_EXTENSIONS or fp.name.lower() in _manifest_basenames_lower:
-            files.append(fp)
+        is_manifest = fp.name.lower() in _manifest_basenames_lower
+        is_supported_basename = fp.name.lower() in SUPPORTED_BASENAMES
+        if fp.suffix.lower() not in SUPPORTED_EXTENSIONS and not is_supported_basename and not is_manifest:
+            continue
+        if not is_manifest:
+            # Skip generic files that are too large (e.g. huge CSVs, minified bundles)
+            try:
+                if fp.stat().st_size > MAX_FILE_BYTES:
+                    continue
+            except OSError:
+                continue
+            # Skip binary files that happen to have a text extension
+            if _is_binary(fp):
+                continue
+        files.append(fp)
     return sorted(files)
 
 
 def _chunk_file(fp: Path, root: Path) -> list:
+    # Jupyter notebooks: extract cell sources instead of indexing raw JSON
+    if fp.suffix.lower() == ".ipynb":
+        return _chunk_notebook(fp, root)
+
     text = fp.read_text(encoding="utf-8", errors="ignore")
     if not text.strip():
         return []
 
     rel_path = str(fp.relative_to(root))
-    language = fp.suffix.lstrip(".")
+    language = fp.suffix.lstrip(".").lower()  # lowercase for consistent _BOUNDARY lookup
     lines    = text.splitlines()
     symbols  = _extract_symbols(text, language)
     pattern  = _BOUNDARY.get(language)
@@ -2452,6 +2527,36 @@ def _chunk_file(fp: Path, root: Path) -> list:
         if chunks:
             return chunks
     return _line_chunks(lines, rel_path, language, symbols)
+
+
+def _chunk_notebook(fp: Path, root: Path) -> list:
+    """Extract source lines from each Jupyter notebook cell and chunk them."""
+    import json as _json
+    rel_path = str(fp.relative_to(root))
+    try:
+        nb = _json.loads(fp.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return []
+
+    cells = nb.get("cells", [])
+    all_lines: list[str] = []
+    for cell in cells:
+        cell_type = cell.get("cell_type", "")
+        source    = cell.get("source", [])
+        if isinstance(source, list):
+            source = "".join(source)
+        if not source.strip():
+            continue
+        prefix = "# [markdown]" if cell_type == "markdown" else "# [code]"
+        all_lines.append(prefix)
+        all_lines.extend(source.splitlines())
+        all_lines.append("")  # blank line between cells
+
+    if not all_lines:
+        return []
+
+    symbols = _extract_symbols("\n".join(all_lines), "py")
+    return _line_chunks(all_lines, rel_path, "ipynb", symbols)
 
 
 def _boundary_chunks(text, rel_path, language, symbols, pattern) -> list:
