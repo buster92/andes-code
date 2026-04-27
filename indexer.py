@@ -147,11 +147,26 @@ SUPPORTED_EXTENSIONS = {
     ".txt",         # Plain text notes, changelogs, etc.
     ".yaml", ".yml",# Config files
     ".sh", ".bash", # Shell scripts
-    ".env",         # Environment config
     ".html", ".css",# Web templates and styles
 }
-SUPPORTED_BASENAMES = {
-    ".env",  # Canonical dotenv file has no suffix in pathlib
+SUPPORTED_BASENAMES = set()
+
+SKIPPED_REAL_ENV_BASENAMES = {
+    ".env",
+    ".env.local",
+    ".env.development",
+    ".env.production",
+    ".env.test",
+    ".env.staging",
+}
+
+ALLOWED_ENV_TEMPLATE_BASENAMES = {
+    ".env.example",
+    ".env.sample",
+    ".env.template",
+    "example.env",
+    "sample.env",
+    "template.env",
 }
 
 # Files larger than this are skipped — protects against huge CSVs, logs, etc.
@@ -2489,9 +2504,23 @@ def _collect_files(root: Path) -> list:
         rel_parts = fp.relative_to(root).parts
         if any(s in rel_parts for s in SKIP_DIRS):
             continue
-        is_manifest = fp.name.lower() in _manifest_basenames_lower
-        is_supported_basename = fp.name.lower() in SUPPORTED_BASENAMES
-        if fp.suffix.lower() not in SUPPORTED_EXTENSIONS and not is_supported_basename and not is_manifest:
+        lower_name = fp.name.lower()
+        is_manifest = lower_name in _manifest_basenames_lower
+        is_supported_basename = lower_name in SUPPORTED_BASENAMES
+        is_real_env_file = lower_name in SKIPPED_REAL_ENV_BASENAMES
+        is_allowed_env_template = lower_name in ALLOWED_ENV_TEMPLATE_BASENAMES
+        is_non_canonical_env_filename = lower_name.endswith(".env") and not lower_name.startswith(".env")
+
+        if is_real_env_file:
+            continue
+
+        if (
+            fp.suffix.lower() not in SUPPORTED_EXTENSIONS
+            and not is_supported_basename
+            and not is_manifest
+            and not is_allowed_env_template
+            and not is_non_canonical_env_filename
+        ):
             continue
         if not is_manifest:
             # Skip generic files that are too large (e.g. huge CSVs, minified bundles)
