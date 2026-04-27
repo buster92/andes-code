@@ -1,6 +1,8 @@
 import unittest
 from pathlib import Path
 
+import pytest
+
 from andes_cache.integrity import (
     INTEGRITY_DEGRADED,
     INTEGRITY_HEALTHY,
@@ -330,6 +332,7 @@ class TestIntegrationGuardrails(unittest.TestCase):
         self.assertEqual(calls, ["app/build.gradle"])
         self.assertEqual(attempts[0]["overall_status"], INTEGRITY_HEALTHY)
 
+    @pytest.mark.integration
     def test_strict_source_truth_gated_by_integrity(self):
         src = Path("indexer.py").read_text(encoding="utf-8")
         self.assertIn("selected_healthy_path, integrity_attempts = select_healthy_authoritative_path(", src)
