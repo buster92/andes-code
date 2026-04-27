@@ -183,6 +183,7 @@ class RetrievalFixtureSmoke(GoldenBaseTest):
             self,
             "FastAPI task routes create list endpoint",
             ["app/api/routes/tasks.py"],
+            n_results=8,
             label="smoke/python_api/routes",
         )
 
@@ -191,8 +192,9 @@ class RetrievalFixtureSmoke(GoldenBaseTest):
             raise unittest.SkipTest("python_api fixture smoke test")
         _assert_retrieval(
             self,
-            "JWT token verify password authentication service",
+            "AuthService create_access_token decode_token verify_password bcrypt jose jwt",
             ["app/services/auth_service.py"],
+            n_results=8,
             label="smoke/python_api/auth",
         )
 
@@ -203,6 +205,7 @@ class RetrievalFixtureSmoke(GoldenBaseTest):
             self,
             "Celery background jobs worker queue retries",
             ["app/workers/tasks.py"],
+            n_results=8,
             label="smoke/python_api/celery",
         )
 
@@ -213,6 +216,7 @@ class RetrievalFixtureSmoke(GoldenBaseTest):
             self,
             "Tokio async processing pipeline stage execution",
             ["ferox-core/src/pipeline.rs"],
+            n_results=8,
             label="smoke/rust_cli/pipeline",
         )
 
@@ -223,6 +227,7 @@ class RetrievalFixtureSmoke(GoldenBaseTest):
             self,
             "worker pool scheduler channel dispatch backpressure",
             ["ferox-worker/src/scheduler.rs", "ferox-worker/src/channel.rs"],
+            n_results=8,
             label="smoke/rust_cli/scheduler",
         )
 
@@ -233,6 +238,7 @@ class RetrievalFixtureSmoke(GoldenBaseTest):
             self,
             "clap command line args parse subcommands",
             ["ferox-cli/src/main.rs"],
+            n_results=8,
             label="smoke/rust_cli/cli",
         )
 
