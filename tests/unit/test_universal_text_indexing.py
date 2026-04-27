@@ -179,18 +179,68 @@ class TestCollectFiles(unittest.TestCase):
         files = _collect_files(self.tmp)
         self.assertEqual(len(files), 1)
 
-    def test_collects_canonical_dotenv_basename(self):
+    def test_skips_dotenv(self):
         self._write(".env", "API_TOKEN=abc123\n")
         files = _collect_files(self.tmp)
-        self.assertEqual([f.name for f in files], [".env"])
+        self.assertEqual(files, [])
 
-    def test_collects_dotenv_with_extension(self):
+    def test_skips_dotenv_local(self):
+        self._write(".env.local", "API_TOKEN=abc123\n")
+        files = _collect_files(self.tmp)
+        self.assertEqual(files, [])
+
+    def test_skips_dotenv_production(self):
+        self._write(".env.production", "API_TOKEN=abc123\n")
+        files = _collect_files(self.tmp)
+        self.assertEqual(files, [])
+
+    def test_collects_dotenv_example(self):
+        self._write(".env.example", "API_TOKEN=\n")
+        files = _collect_files(self.tmp)
+        self.assertEqual([f.name for f in files], [".env.example"])
+
+    def test_collects_dotenv_sample(self):
+        self._write(".env.sample", "API_TOKEN=\n")
+        files = _collect_files(self.tmp)
+        self.assertEqual([f.name for f in files], [".env.sample"])
+
+    def test_collects_dotenv_template(self):
+        self._write(".env.template", "API_TOKEN=\n")
+        files = _collect_files(self.tmp)
+        self.assertEqual([f.name for f in files], [".env.template"])
+
+    def test_skips_config_dotenv_by_default(self):
         self._write("config.env", "LOG_LEVEL=debug\n")
         files = _collect_files(self.tmp)
-        self.assertEqual([f.name for f in files], ["config.env"])
+        self.assertEqual(files, [])
 
-    def test_skips_binary_canonical_dotenv(self):
-        self._write(".env", b"\x00\x01\x02\x03" + b"\x80" * 64)
+    def test_skips_secrets_dotenv_by_default(self):
+        self._write("secrets.env", "API_TOKEN=real-secret\n")
+        files = _collect_files(self.tmp)
+        self.assertEqual(files, [])
+
+    def test_collects_example_dotenv(self):
+        self._write("example.env", "API_TOKEN=\n")
+        files = _collect_files(self.tmp)
+        self.assertEqual([f.name for f in files], ["example.env"])
+
+    def test_collects_sample_dotenv(self):
+        self._write("sample.env", "API_TOKEN=\n")
+        files = _collect_files(self.tmp)
+        self.assertEqual([f.name for f in files], ["sample.env"])
+
+    def test_collects_template_dotenv(self):
+        self._write("template.env", "API_TOKEN=\n")
+        files = _collect_files(self.tmp)
+        self.assertEqual([f.name for f in files], ["template.env"])
+
+    def test_skips_binary_dotenv_example(self):
+        self._write(".env.example", b"\x00\x01\x02\x03" + b"\x80" * 64)
+        files = _collect_files(self.tmp)
+        self.assertEqual(files, [])
+
+    def test_skips_oversized_dotenv_example(self):
+        self._write(".env.example", "x\n" * (MAX_FILE_BYTES + 1))
         files = _collect_files(self.tmp)
         self.assertEqual(files, [])
 
