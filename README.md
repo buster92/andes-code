@@ -421,7 +421,7 @@ AndesCode tests are split by execution tier:
 - `tests/integration/` — indexer/embedding/server/model tests (opt-in).
 - `tests/eval/` — quality evaluation suites (opt-in).
 
-Default CI runs only unit tests so it does **not** require:
+Default CI runs **only** `tests/unit/` so it does **not** require:
 
 - a running AndesCode server
 - Hugging Face/network downloads
@@ -436,7 +436,15 @@ ANDESCODE_RUN_INTEGRATION_TESTS=1 ANDESCODE_RUN_MODEL_TESTS=1 python -m pytest t
 ANDESCODE_RUN_EVAL_TESTS=1 python3 tests/eval/eval_runner.py --suite fast --fixture android
 ```
 
-> Note: eval `fast` is model-free, but it is **not** embedding-free. It still depends on retrieval/index embedding availability.
+> Note 1: eval `fast` is model-free, but it is **not** embedding-free. It still depends on retrieval/index embedding availability.
+>
+> Note 2: answer eval (`--suite eval` or `--suite full` phase 2) is currently **Android-only** (`--fixture android`).
+>
+> Note 3: integration/model/server/eval tiers are all opt-in and intentionally excluded from default CI.
+
+Optional future CI split:
+- Keep default PR CI on `tests/unit/` for speed and determinism.
+- Add a separate model-enabled workflow/job (manual, nightly, or protected-branch) for integration + answer eval.
 
 ---
 
