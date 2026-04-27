@@ -35,7 +35,7 @@ To reduce accidental indexing of secrets, AndesCode skips these by default:
 
 ### Dotenv examples/templates are allowed
 
-AndesCode still indexes non-secret dotenv templates/examples so it can reason about config shape:
+AndesCode only indexes explicit non-secret dotenv templates/examples so it can reason about config shape:
 
 - `.env.example`
 - `.env.sample`
@@ -44,4 +44,4 @@ AndesCode still indexes non-secret dotenv templates/examples so it can reason ab
 - `sample.env`
 - `template.env`
 
-Non-canonical `*.env` filenames (for example, `config.env`) are also indexable by current policy.
+All other dotenv/env files are skipped by default.

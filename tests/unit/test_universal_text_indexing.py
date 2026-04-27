@@ -209,10 +209,30 @@ class TestCollectFiles(unittest.TestCase):
         files = _collect_files(self.tmp)
         self.assertEqual([f.name for f in files], [".env.template"])
 
-    def test_collects_config_dotenv_by_policy_for_named_env_extension(self):
+    def test_skips_config_dotenv_by_default(self):
         self._write("config.env", "LOG_LEVEL=debug\n")
         files = _collect_files(self.tmp)
-        self.assertEqual([f.name for f in files], ["config.env"])
+        self.assertEqual(files, [])
+
+    def test_skips_secrets_dotenv_by_default(self):
+        self._write("secrets.env", "API_TOKEN=real-secret\n")
+        files = _collect_files(self.tmp)
+        self.assertEqual(files, [])
+
+    def test_collects_example_dotenv(self):
+        self._write("example.env", "API_TOKEN=\n")
+        files = _collect_files(self.tmp)
+        self.assertEqual([f.name for f in files], ["example.env"])
+
+    def test_collects_sample_dotenv(self):
+        self._write("sample.env", "API_TOKEN=\n")
+        files = _collect_files(self.tmp)
+        self.assertEqual([f.name for f in files], ["sample.env"])
+
+    def test_collects_template_dotenv(self):
+        self._write("template.env", "API_TOKEN=\n")
+        files = _collect_files(self.tmp)
+        self.assertEqual([f.name for f in files], ["template.env"])
 
     def test_skips_binary_dotenv_example(self):
         self._write(".env.example", b"\x00\x01\x02\x03" + b"\x80" * 64)

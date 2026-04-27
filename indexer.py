@@ -2509,9 +2509,9 @@ def _collect_files(root: Path) -> list:
         is_supported_basename = lower_name in SUPPORTED_BASENAMES
         is_real_env_file = lower_name in SKIPPED_REAL_ENV_BASENAMES
         is_allowed_env_template = lower_name in ALLOWED_ENV_TEMPLATE_BASENAMES
-        is_non_canonical_env_filename = lower_name.endswith(".env") and not lower_name.startswith(".env")
+        is_other_env_filename = lower_name.endswith(".env") and not is_allowed_env_template
 
-        if is_real_env_file:
+        if is_real_env_file or is_other_env_filename:
             continue
 
         if (
@@ -2519,7 +2519,6 @@ def _collect_files(root: Path) -> list:
             and not is_supported_basename
             and not is_manifest
             and not is_allowed_env_template
-            and not is_non_canonical_env_filename
         ):
             continue
         if not is_manifest:

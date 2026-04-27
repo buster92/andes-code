@@ -255,6 +255,7 @@ Relevant environment knobs:
 
 - Real dotenv files are skipped by default during indexing to reduce accidental secret ingestion (`.env`, `.env.local`, `.env.development`, `.env.production`, `.env.test`, `.env.staging`).
 - Dotenv examples/templates are indexed (`.env.example`, `.env.sample`, `.env.template`, `example.env`, `sample.env`, `template.env`) so AndesCode can understand configuration shape without storing real secret values.
+- Other env-like files (for example `config.env` or `secrets.env`) are skipped by default unless they match the explicit template/example allowlist.
 
 ---
 
