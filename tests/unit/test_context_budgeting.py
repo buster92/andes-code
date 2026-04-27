@@ -2,7 +2,9 @@ import asyncio
 import types
 import unittest
 
-from tests.test_server_stream_debug_mode import _import_server_with_stubs
+import pytest
+
+from tests.unit.test_server_stream_debug_mode import _import_server_with_stubs
 
 
 async def _collect_events(server_module, query):
@@ -176,6 +178,7 @@ class TestContextBudgeting(unittest.TestCase):
         self.assertEqual(candidates[0]["authority_rank"], 0)
         self.assertEqual(candidates[1]["authority_rank"], 1)
 
+    @pytest.mark.integration
     def test_declaration_guidance_is_injected_when_authoritative_chunks_are_missing(self):
         server = self.server
         context, _info = server._pack_context_section(

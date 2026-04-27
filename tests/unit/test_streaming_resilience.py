@@ -4,7 +4,7 @@ import types
 import unittest
 from pathlib import Path
 
-from tests.test_server_stream_debug_mode import _import_server_with_stubs
+from tests.unit.test_server_stream_debug_mode import _import_server_with_stubs
 
 
 async def _collect_events(server_module):

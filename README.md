@@ -413,6 +413,31 @@ Highest-value contributions right now:
 - AST-aware chunking (deeper than current regex-based boundary detection)
 - File watcher for automatic incremental re-indexing
 
+## Test tiers and CI defaults
+
+AndesCode tests are split by execution tier:
+
+- `tests/unit/` — deterministic pure-logic tests (default CI suite).
+- `tests/integration/` — indexer/embedding/server/model tests (opt-in).
+- `tests/eval/` — quality evaluation suites (opt-in).
+
+Default CI runs only unit tests so it does **not** require:
+
+- a running AndesCode server
+- Hugging Face/network downloads
+- cached embedding models
+- a loaded LLM model
+- local `audit.log`
+
+Run full validation locally when you have model + server dependencies available:
+
+```bash
+ANDESCODE_RUN_INTEGRATION_TESTS=1 ANDESCODE_RUN_MODEL_TESTS=1 python -m pytest tests/integration -v
+ANDESCODE_RUN_EVAL_TESTS=1 python3 tests/eval/eval_runner.py --suite fast --fixture android
+```
+
+> Note: eval `fast` is model-free, but it is **not** embedding-free. It still depends on retrieval/index embedding availability.
+
 ---
 
 ## Built in the Andes. Runs everywhere.
