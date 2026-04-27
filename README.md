@@ -1,13 +1,19 @@
 # 🏔️ AndesCode
 
-**Local AI coding assistant. No cloud. No leaks. No trust required.**
+**Private local AI for codebases. Local by default. Remote inference only when explicitly configured.**
 
 [![License](https://img.shields.io/badge/license-Source--Available-lightgrey.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
 [![Model](https://img.shields.io/badge/model-Gemma%204%2026B-orange)](https://huggingface.co/lmstudio-community/gemma-4-26B-A4B-it-GGUF)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey)](#hardware-guide)
 
-AndesCode runs Gemma 4 26B entirely on your hardware. It indexes your codebase, understands your project structure, and answers questions about it — all locally, through its own native desktop interface. Your code is never uploaded anywhere.
+AndesCode runs Gemma 4 26B on your hardware in `LOCAL` mode. It indexes your codebase, understands your project structure, and answers questions through its own native desktop interface. It can also run in `REMOTE_INFERENCE` mode when explicitly configured for private/self-hosted infrastructure.
+
+## Execution Modes (at a glance)
+
+- **`LOCAL` mode (default):** repository, index, retrieval, prompts, and inference stay on the same machine.
+- **`REMOTE_INFERENCE` mode:** repository and index stay local, but selected retrieved chunks plus metadata are sent to your configured private remote server for inference.
+- AndesCode does **not** provide a hosted SaaS.
 
 ---
 
@@ -49,7 +55,7 @@ AndesCode is built for developers who work with client code under NDA, operate i
 - 📌 **Deterministic routing for repo questions** — config/dependency/manifest questions use a source-of-truth config-first path before inferred code usage
 - 🛠️ **Safe edit/apply primitive (v1)** — deterministic single-file exact-match edits with hash stale-context protection and unified diff preview
 - ⚠️ **Coverage warnings** — the model is told when it has a partial view of a file, so it never pretends to have context it doesn't
-- 🔒 **Local inference** — offline flags enforced at OS level before any library loads; your code never leaves the machine
+- 🔒 **Execution-mode privacy controls** — `LOCAL` keeps inference on-device with offline flags; `REMOTE_INFERENCE` sends only selected retrieved chunks + metadata to your configured private server
 - ⚡ **Fast** — KV cache warm-up on startup, 30–40 tokens/second on Apple Silicon, streaming responses
 - 🖥️ **Native desktop app** — runs as a native window on macOS and Windows via the built-in web UI
 - 📋 **Audit log** — every request logged locally with metadata only; proof of isolation for compliance
@@ -73,8 +79,8 @@ AndesCode is built for developers who work with client code under NDA, operate i
 **1. Clone**
 
 ```bash
-git clone https://github.com/yourusername/andescode
-cd andescode
+git clone https://github.com/buster92/andes-code
+cd andes-code
 ```
 
 **2. Run the launcher**
@@ -325,7 +331,17 @@ Common remote error codes surfaced to clients:
 
 ## Supported Languages
 
-Python, JavaScript, TypeScript, JSX/TSX, Go, Rust, Java, Kotlin, Swift, C, C++, Ruby, PHP, C# — with language-aware chunking that respects function and class boundaries for each.
+AndesCode indexes a broad set of text-based project files:
+
+- **Code:** Python, JavaScript/TypeScript, Java, Kotlin, Swift, Go, Rust, C/C++, C#, Ruby, PHP
+- **Data/statistics:** R, SQL, Jupyter notebooks
+- **Docs:** Markdown, MDX, TXT
+- **Config/build:** TOML, YAML/YML, XML, `.properties`, Gradle files, package manifests
+- **Scripts/web:** SH, Bash, HTML, CSS
+
+Binary, oversized, and generated files are skipped.
+
+See `docs/indexing-policy.md` for the exact indexing and skip policy.
 
 ---
 
@@ -392,7 +408,7 @@ For declaration/config/dependency questions, debug payloads now include authorit
 If AndesCode detects authoritative files in workspace metadata but cannot retrieve chunks from the index, it now emits an explicit limitation (`workspace_only_detected_not_indexed`) instead of silently degrading to inferred/runtime-only answers.
 
 **Is there a hosted version?**  
-No. That would defeat the purpose.
+No official AndesCode-hosted SaaS is available. Remote inference is supported only for self-hosted/private-network deployments that you configure and operate.
 
 ---
 
@@ -401,7 +417,7 @@ No. That would defeat the purpose.
 AndesCode is source-available.
 
 - Free for personal use and internal company use
-- Commercial redistribution, resale, or offering AndesCode as a service requires a commercial license
+- Commercial redistribution, resale, managed hosting, or offering AndesCode as a service requires a commercial license
 
 See [LICENSE](LICENSE) for full terms.
 
@@ -458,8 +474,8 @@ Optional future CI split:
 
 AndesCode is built by an independent developer from Latin America. It exists because some teams require full control over their code, infrastructure, and data flow.
 
-Source-available. Free to use internally. Commercial use requires a license.
+Source-available. Free for personal use and internal company use. Commercial redistribution, resale, managed hosting, or offering AndesCode as a service requires a commercial license.
 
 ---
 
-*Your AI runs at home. Your code never leaves.*
+*Private AI for your codebase — local by default, with optional private remote inference when explicitly configured.*
