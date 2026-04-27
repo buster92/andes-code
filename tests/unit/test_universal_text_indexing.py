@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 
 # Make sure the project root is on the path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 
 class _FakeSentenceTransformer:
@@ -62,6 +62,7 @@ SUPPORTED_EXTENSIONS = _indexer.SUPPORTED_EXTENSIONS
 _chunk_notebook = _indexer._chunk_notebook
 _collect_files = _indexer._collect_files
 _is_binary = _indexer._is_binary
+_chunk_file = _indexer._chunk_file
 
 
 class TestSupportedExtensions(unittest.TestCase):
@@ -178,6 +179,21 @@ class TestCollectFiles(unittest.TestCase):
         files = _collect_files(self.tmp)
         self.assertEqual(len(files), 1)
 
+    def test_collects_canonical_dotenv_basename(self):
+        self._write(".env", "API_TOKEN=abc123\n")
+        files = _collect_files(self.tmp)
+        self.assertEqual([f.name for f in files], [".env"])
+
+    def test_collects_dotenv_with_extension(self):
+        self._write("config.env", "LOG_LEVEL=debug\n")
+        files = _collect_files(self.tmp)
+        self.assertEqual([f.name for f in files], ["config.env"])
+
+    def test_skips_binary_canonical_dotenv(self):
+        self._write(".env", b"\x00\x01\x02\x03" + b"\x80" * 64)
+        files = _collect_files(self.tmp)
+        self.assertEqual(files, [])
+
     def test_skips_oversized_files(self):
         self._write("huge.md", "x\n" * (MAX_FILE_BYTES + 1))
         files = _collect_files(self.tmp)
@@ -284,6 +300,29 @@ class TestNotebookChunking(unittest.TestCase):
         chunks = _chunk_notebook(p, self.tmp)
         combined = " ".join(c["content"] for c in chunks)
         self.assertIn("import os", combined)
+
+    def test_uppercase_ipynb_chunked_as_notebook_cells(self):
+        nb = {
+            "nbformat": 4,
+            "nbformat_minor": 5,
+            "metadata": {},
+            "cells": [
+                {"cell_type": "markdown", "source": ["# Header\n"], "metadata": {}},
+                {"cell_type": "code", "source": ["print('hello')\n"], "metadata": {}, "outputs": []},
+            ],
+        }
+        p = self.tmp / "NOTEBOOK.IPYNB"
+        p.write_text(json.dumps(nb), encoding="utf-8")
+
+        chunks = _chunk_file(p, self.tmp)
+        self.assertGreater(len(chunks), 0)
+        combined = " ".join(c["content"] for c in chunks)
+
+        self.assertIn("[markdown]", combined)
+        self.assertIn("[code]", combined)
+        self.assertIn("Header", combined)
+        self.assertIn("print('hello')", combined)
+        self.assertNotIn('"cells"', combined)
 
 
 if __name__ == "__main__":

@@ -150,6 +150,9 @@ SUPPORTED_EXTENSIONS = {
     ".env",         # Environment config
     ".html", ".css",# Web templates and styles
 }
+SUPPORTED_BASENAMES = {
+    ".env",  # Canonical dotenv file has no suffix in pathlib
+}
 
 # Files larger than this are skipped — protects against huge CSVs, logs, etc.
 MAX_FILE_BYTES = 500_000  # 500 KB
@@ -2487,7 +2490,8 @@ def _collect_files(root: Path) -> list:
         if any(s in rel_parts for s in SKIP_DIRS):
             continue
         is_manifest = fp.name.lower() in _manifest_basenames_lower
-        if fp.suffix.lower() not in SUPPORTED_EXTENSIONS and not is_manifest:
+        is_supported_basename = fp.name.lower() in SUPPORTED_BASENAMES
+        if fp.suffix.lower() not in SUPPORTED_EXTENSIONS and not is_supported_basename and not is_manifest:
             continue
         if not is_manifest:
             # Skip generic files that are too large (e.g. huge CSVs, minified bundles)
@@ -2505,7 +2509,7 @@ def _collect_files(root: Path) -> list:
 
 def _chunk_file(fp: Path, root: Path) -> list:
     # Jupyter notebooks: extract cell sources instead of indexing raw JSON
-    if fp.suffix == ".ipynb":
+    if fp.suffix.lower() == ".ipynb":
         return _chunk_notebook(fp, root)
 
     text = fp.read_text(encoding="utf-8", errors="ignore")
