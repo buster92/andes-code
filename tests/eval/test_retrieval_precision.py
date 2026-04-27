@@ -176,6 +176,72 @@ class RetrievalFixtureSmoke(GoldenBaseTest):
         retrieved = _search("repository architecture", n=3)
         self.assertGreater(len(retrieved), 0, "Expected non-empty retrieval results")
 
+    def test_python_api_task_routes_smoke(self):
+        if _fixture_name != "python_api":
+            raise unittest.SkipTest("python_api fixture smoke test")
+        _assert_retrieval(
+            self,
+            "FastAPI task routes create list endpoint",
+            ["app/api/routes/tasks.py"],
+            n_results=8,
+            label="smoke/python_api/routes",
+        )
+
+    def test_python_api_auth_service_smoke(self):
+        if _fixture_name != "python_api":
+            raise unittest.SkipTest("python_api fixture smoke test")
+        _assert_retrieval(
+            self,
+            "AuthService create_access_token decode_token verify_password bcrypt jose jwt",
+            ["app/services/auth_service.py"],
+            n_results=8,
+            label="smoke/python_api/auth",
+        )
+
+    def test_python_api_celery_worker_smoke(self):
+        if _fixture_name != "python_api":
+            raise unittest.SkipTest("python_api fixture smoke test")
+        _assert_retrieval(
+            self,
+            "Celery background jobs worker queue retries",
+            ["app/workers/tasks.py"],
+            n_results=8,
+            label="smoke/python_api/celery",
+        )
+
+    def test_rust_cli_pipeline_smoke(self):
+        if _fixture_name != "rust_cli":
+            raise unittest.SkipTest("rust_cli fixture smoke test")
+        _assert_retrieval(
+            self,
+            "DirectorySource WalkDir spawn_blocking include_extensions max_file_size_bytes FileSource discover",
+            ["ferox-core/src/pipeline.rs"],
+            n_results=8,
+            label="smoke/rust_cli/pipeline",
+        )
+
+    def test_rust_cli_scheduler_smoke(self):
+        if _fixture_name != "rust_cli":
+            raise unittest.SkipTest("rust_cli fixture smoke test")
+        _assert_retrieval(
+            self,
+            "worker pool scheduler channel dispatch backpressure",
+            ["ferox-worker/src/scheduler.rs", "ferox-worker/src/channel.rs"],
+            n_results=8,
+            label="smoke/rust_cli/scheduler",
+        )
+
+    def test_rust_cli_cli_entry_smoke(self):
+        if _fixture_name != "rust_cli":
+            raise unittest.SkipTest("rust_cli fixture smoke test")
+        _assert_retrieval(
+            self,
+            "clap command line args parse subcommands",
+            ["ferox-cli/src/main.rs"],
+            n_results=8,
+            label="smoke/rust_cli/cli",
+        )
+
 
 class RetrievalBaseline(GoldenBaseTest):
     """Basic sanity: obviously relevant files must rank in top results."""

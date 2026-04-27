@@ -19,6 +19,7 @@ Registered fixtures
 Suites
 ------
   fast    Retrieval precision only — no model needed. Runs in ~5–15s.
+          Still requires index/retrieval embeddings.
           Use on every commit / PR.
 
   full    Retrieval precision + answer quality eval.
@@ -26,6 +27,7 @@ Suites
           Produces a graded per-category report.
 
   eval    Answer quality only — skips retrieval tests.
+          Currently Android-only (`--fixture android`).
           Useful when you only want to measure model answer quality.
 
 Usage
