@@ -214,7 +214,7 @@ class RetrievalFixtureSmoke(GoldenBaseTest):
             raise unittest.SkipTest("rust_cli fixture smoke test")
         _assert_retrieval(
             self,
-            "Tokio async processing pipeline stage execution",
+            "DirectorySource WalkDir spawn_blocking include_extensions max_file_size_bytes FileSource discover",
             ["ferox-core/src/pipeline.rs"],
             n_results=8,
             label="smoke/rust_cli/pipeline",
