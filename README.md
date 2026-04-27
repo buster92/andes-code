@@ -443,13 +443,16 @@ AndesCode tests are split by execution tier:
 - `tests/integration/` — indexer/embedding/server/model tests (opt-in).
 - `tests/eval/` — quality evaluation suites (opt-in).
 
-Default CI runs **only** `tests/unit/` so it does **not** require:
+Default CI runs **only** `tests/unit/` using `requirements-ci.txt`, so it does **not** require:
 
 - a running AndesCode server
 - Hugging Face/network downloads
 - cached embedding models
 - a loaded LLM model
 - local `audit.log`
+- full runtime dependencies from `requirements.txt` (`llama-cpp-python`, `chromadb`, `sentence-transformers`, `huggingface_hub`)
+
+Full runtime dependencies from `requirements.txt` are only required for local app usage plus opt-in integration/model/eval test tiers.
 
 Run full validation locally when you have model + server dependencies available:
 

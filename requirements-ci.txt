@@ -1,0 +1,4 @@
+# AndesCode — minimal dependencies for default CI unit tests
+# Install with: python -m pip install -r requirements-ci.txt
+
+pytest>=8.0.0
