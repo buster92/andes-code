@@ -363,6 +363,8 @@ AndesCode is designed to run fully locally and offline during inference.
 
 However, users are responsible for validating their own environment and dependencies for compliance requirements. AndesCode does not claim formal certification (e.g., SOC 2, ISO) at this stage.
 
+See `docs/security-threat-model.md` for detailed threat model and enterprise controls.
+
 ---
 
 ## FAQ
