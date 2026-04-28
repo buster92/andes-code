@@ -27,10 +27,10 @@ This is the highest-privacy operating mode for most enterprise use cases.
 
 ### REMOTE_INFERENCE mode (opt-in)
 
-In `REMOTE_INFERENCE` mode, AndesCode keeps core data prep local and only sends selected context for generation:
+In `REMOTE_INFERENCE` mode, AndesCode keeps core data prep local and sends only the data needed for remote generation:
 
 - Repository and index stay local
-- AndesCode sends selected retrieved chunks and related metadata to a user-configured private remote inference server
+- AndesCode sends the user query text (prompt), selected retrieved chunks, and related metadata (and may include client identifiers such as hostname) to a user-configured private remote inference server
 - Remote inference is only enabled when explicitly configured
 
 ### Hosted service statement
@@ -47,6 +47,7 @@ AndesCode may process and/or persist the following data classes during normal op
 - **Project map**: structural metadata about project files/relationships
 - **Symbol index**: extracted code symbol metadata
 - **Workspace index**: retrieval/search index artifacts for the workspace
+- **Query text (user prompt)**: user-provided input used to generate responses; may be transmitted in `REMOTE_INFERENCE` mode
 - **Audit logs**: operational metadata logs
 - **Model files**: local model binaries/weights used for inference
 - **Runtime cache**: cached retrieval/inference-related intermediates
@@ -59,7 +60,7 @@ AndesCode is designed for local-first operation, with limited network dependenci
 - First-run embedding model download requires network access
 - Indexing runs locally
 - `LOCAL` mode answering runs locally
-- `REMOTE_INFERENCE` mode sends selected retrieved chunks + metadata to the configured remote server
+- `REMOTE_INFERENCE` mode outbound payload can include query text (prompt), retrieved context, and related metadata
 - No third-party API is used for inference by default
 
 ## 4) Sensitive file policy
@@ -91,7 +92,7 @@ Default log locations:
 | Risk | Threat scenario | Primary mitigations |
 |---|---|---|
 | Accidental secret indexing | Sensitive files are unintentionally included in indexable scope | Keep default skip rules enabled, review indexing policy, add repository-specific deny rules, validate indexed corpus before production use |
-| Remote inference misconfiguration | Retrieved context is sent to an unintended or weakly protected remote endpoint | Disable `REMOTE_INFERENCE` unless needed, require explicit endpoint allowlisting, enforce private networking/VPN and TLS, verify remote server ownership |
+| Remote inference misconfiguration | Prompt/query text and retrieved context are sent to an unintended or weakly protected remote endpoint | Disable `REMOTE_INFERENCE` unless needed, require explicit endpoint allowlisting, enforce private networking/VPN and TLS, verify remote server ownership |
 | Model/download supply-chain risk | Downloaded model/embedding artifacts are tampered with or untrusted | Pin approved artifact sources, verify checksums/signatures where possible, mirror vetted artifacts internally |
 | Dependency installation risk | Compromised package/dependency introduces malicious code | Use dependency pinning/lockfiles, private package proxies, software composition scanning, and controlled build pipelines |
 | Local machine compromise | Endpoint malware or unauthorized local access exposes data, indexes, or runtime memory | Harden endpoint OS, use EDR/AV, full-disk encryption, least-privilege accounts, patch management, strict physical/device controls |
