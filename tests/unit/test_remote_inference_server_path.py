@@ -148,6 +148,9 @@ class TestRemoteInferenceServerPath(unittest.TestCase):
     def setUpClass(cls):
         cls.server, cls.req_type = _import_server_with_stubs()
 
+    def setUp(self):
+        self.server._set_active_index_session(True)
+
     def test_remote_ask_non_stream_happy_path(self):
         req = self.req_type(_valid_remote_request())
         result = asyncio.run(self.server.remote_inference_ask(req))
