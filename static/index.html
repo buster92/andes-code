@@ -1215,6 +1215,7 @@ let currentRawText = '';
 let debugMode = false;
 let envDebugMode = false;
 let manualDebugMode = false;
+let pendingRestore = false;
 
 // ── Init ─────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {
@@ -1264,23 +1265,24 @@ async function checkStatus() {
     syncDebugToggleState();
 
     const count = d.doc_count || 0;
-
+    const active = !!d.active_index_session;
+    const hasPersisted = !!d.has_persisted_index;
+    const restoreNeeded = !!d.restored_requires_confirmation;
     if (count > 0) {
       text.textContent = `online · ${count} chunks · local only`;
-      document.getElementById('statIndexed').textContent = '✓';
-      if (!hasIndexed) {
+      document.getElementById('statIndexed').textContent = active ? '✓' : 'pending';
+      if (active) {
         hasIndexed = true;
         unlockChat();
-        document.getElementById('indexStatus').textContent =
-          `✓ ${count} chunks loaded from previous session`;
-        document.getElementById('indexStatus').className = 'index-status success';
-        // Restore project map if available
-        if (d.project_map && Object.keys(d.project_map).length > 0) {
-          document.getElementById('currentProject').style.display = 'block';
-          document.getElementById('projectName').textContent =
-            `📁 ${d.project_map.project || 'project'} · ${d.project_map.file_count || ''} files`;
-          _renderProjectMap(d.project_map);
-        }
+      } else {
+        hasIndexed = false;
+      }
+      if (hasPersisted && restoreNeeded && !pendingRestore) {
+        const projectName = d.project_map?.project || 'project';
+        document.getElementById('indexStatus').innerHTML =
+          `Previous project found: ${projectName}. Continue or index a new project. <button class="btn btn-primary" onclick="continuePreviousProject()">Continue Previous Project</button>`;
+        document.getElementById('indexStatus').className = 'index-status';
+        pendingRestore = true;
       }
     } else {
       text.textContent = 'online · not indexed';
@@ -1593,10 +1595,27 @@ async function clearIndex() {
   try {
     await fetch(`${API}/v1/index/clear`, { method: 'POST' });
   } catch (_) {}
+  pendingRestore = false;
   const autoLine = document.getElementById('autoIndexStatus');
   if (autoLine) autoLine.textContent = 'Auto-index: idle';
 
   showToast('Index cleared — select a new project to index', 'success');
+}
+
+async function continuePreviousProject() {
+  try {
+    const resp = await fetch(`${API}/v1/index/restore`, { method: 'POST' });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) throw new Error(data.error || `Server error ${resp.status}`);
+    hasIndexed = true;
+    pendingRestore = false;
+    unlockChat(true);
+    document.getElementById('indexStatus').textContent = `✓ Restored previous project (${data.doc_count} chunks)`;
+    document.getElementById('indexStatus').className = 'index-status success';
+    showToast('Previous project restored', 'success');
+  } catch (e) {
+    showToast(e.message || 'Failed to restore previous project', 'error');
+  }
 }
 
 // ── Send message ──────────────────────────────────────────────────────────

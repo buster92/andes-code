@@ -116,6 +116,9 @@ class TestServerStreamingDebugMode(unittest.TestCase):
     def setUpClass(cls):
         cls.server = _import_server_with_stubs()
 
+    def setUp(self):
+        self.server._set_active_index_session(True)
+
     def test_debug_checkbox_request_flag_enables_debug_when_env_off(self):
         prev = os.environ.pop("ANDESCODE_DEBUG_MODE", None)
         try:
@@ -746,6 +749,39 @@ class TestServerStreamingDebugMode(unittest.TestCase):
                 os.environ.pop("ANDESCODE_EXECUTION_MODE", None)
             else:
                 os.environ["ANDESCODE_EXECUTION_MODE"] = prev_mode
+
+    def test_chat_blocked_when_no_active_index_session(self):
+        server = self.server
+        server._set_active_index_session(False)
+        response = _call_chat(server, {"messages": [{"role": "user", "content": "hi"}]})
+        self.assertIn("error", response)
+        self.assertIn("No active project is selected", response["error"])
+
+    def test_restore_endpoint_activates_previous_index(self):
+        server = self.server
+        server.INDEXER_READY = True
+        server._indexer_module = types.SimpleNamespace(
+            _load_project_map=lambda: {"project": "demo"},
+            col=types.SimpleNamespace(count=lambda: 12),
+        )
+        server._set_active_index_session(False)
+        response = asyncio.run(server.restore_index_state())
+        self.assertTrue(response["ok"])
+        self.assertTrue(response["active_index_session"])
+        self.assertEqual(response["doc_count"], 12)
+
+    def test_index_state_requires_confirmation_when_persisted_index_exists(self):
+        server = self.server
+        server.INDEXER_READY = True
+        server._indexer_module = types.SimpleNamespace(
+            _load_project_map=lambda: {"project": "demo"},
+            col=types.SimpleNamespace(count=lambda: 3),
+        )
+        server._set_active_index_session(False)
+        state = server._index_runtime_state()
+        self.assertTrue(state["has_persisted_index"])
+        self.assertTrue(state["restored_requires_confirmation"])
+        self.assertFalse(state["active_index_session"])
 
 
 if __name__ == "__main__":
