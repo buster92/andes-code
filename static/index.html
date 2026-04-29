@@ -1279,9 +1279,17 @@ async function checkStatus() {
       }
       if (hasPersisted && restoreNeeded && !pendingRestore) {
         const projectName = d.project_map?.project || 'project';
-        document.getElementById('indexStatus').innerHTML =
-          `Previous project found: ${projectName}. Continue or index a new project. <button class="btn btn-primary" onclick="continuePreviousProject()">Continue Previous Project</button>`;
-        document.getElementById('indexStatus').className = 'index-status';
+        const statusEl = document.getElementById('indexStatus');
+        statusEl.textContent = '';
+        const msg = document.createElement('span');
+        msg.textContent = `Previous project found: ${projectName}. Continue or index a new project. `;
+        const btn = document.createElement('button');
+        btn.className = 'btn btn-primary';
+        btn.textContent = 'Continue Previous Project';
+        btn.addEventListener('click', continuePreviousProject);
+        statusEl.appendChild(msg);
+        statusEl.appendChild(btn);
+        statusEl.className = 'index-status';
         pendingRestore = true;
       }
     } else {
@@ -1497,12 +1505,6 @@ async function indexCodebase() {
             let scanMsg = `Found ${e.files.toLocaleString()} source files`;
             if (unchanged > 0) scanMsg = `${e.files.toLocaleString()} files · ${newFiles} new · ${unchanged} cached`;
             setProgress(2, scanMsg);
-            // Unlock chat immediately — let developer ask while indexing continues
-            if (!hasIndexed) {
-              hasIndexed = true;
-              unlockChat(false);
-              document.getElementById('chatInput').placeholder = '⚡ Indexing in background — ask away...';
-            }
 
           } else if (e.type === 'chunks') {
             setProgress(5, `${e.total.toLocaleString()} chunks to embed`);
