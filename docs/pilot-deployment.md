@@ -39,7 +39,7 @@ Each developer:
 
 ---
 
-### Option B: Shared team machine (advanced)
+### Option B: Shared team machine (advanced/experimental for pilots)
 
 A single machine:
 
@@ -54,8 +54,8 @@ A single machine:
 
 **Cons**
 
-- requires network and endpoint security setup
-- requires access control and host hardening
+- requires access control, network hardening, and host security review
+- requires clear repository/index ownership and maintenance expectations
 - not the default path for initial pilots
 
 ---
@@ -69,7 +69,7 @@ Plan for the following baseline requirements:
 - **Memory (RAM):**
   - minimum for basic pilot: 16 GB
   - recommended for smoother experience: 32 GB+
-- **Runtime:** Python 3.12
+- **Runtime:** Python 3.10+ required; Python 3.12 recommended as a standardized pilot baseline
 - **Network:** internet access for first-run downloads only (models/dependencies), then can operate locally in LOCAL mode
 
 ---
