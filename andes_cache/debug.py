@@ -187,6 +187,13 @@ def initialize_payload(query: str, decision: dict, workspace: dict | None) -> di
             "chunks_per_file": {},
             "coverage": {},
             "cache_hit": False,
+            "retrieval_routes_used": [],
+            "graph_neighbors_added": [],
+            "symbols_matched": [],
+            "files_selected_by_graph": [],
+            "files_selected_by_semantic": [],
+            "files_selected_by_authority": [],
+            "context_sufficiency_notes": [],
         },
         "ranking": {"top_candidates": []},
         "final_context": {

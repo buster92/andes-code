@@ -76,6 +76,31 @@ class TestIndexStateDecisions(unittest.TestCase):
         decision = self.indexer.evaluate_index_state(current, stored, repo_changed=True)
         self.assertEqual(decision["decision"], self.indexer.DECISION_INCREMENTAL_REINDEX)
 
+    def test_workspace_only_rebuild_when_code_graph_version_changes(self):
+        current = {"repo_root": "/repo", "index_version": "1", "parser_version": "1", "code_graph_version": "new"}
+        stored = {"repo_root": "/repo", "index_version": "1", "parser_version": "1", "code_graph_version": "old"}
+        decision = self.indexer.evaluate_index_state(current, stored, repo_changed=False)
+        self.assertEqual(decision["decision"], self.indexer.DECISION_REBUILD_WORKSPACE_ONLY)
+
+    def test_code_graph_version_change_does_not_mask_changed_files(self):
+        current = {"repo_root": "/repo", "index_version": "1", "parser_version": "1", "code_graph_version": "new"}
+        stored = {"repo_root": "/repo", "index_version": "1", "parser_version": "1", "code_graph_version": "old"}
+        decision = self.indexer.evaluate_index_state(current, stored, repo_changed=True)
+        self.assertEqual(decision["decision"], self.indexer.DECISION_INCREMENTAL_REINDEX)
+        self.assertIn("Code graph version changed", " ".join(decision["reasons"]))
+
+    def test_missing_code_graph_version_does_not_mask_changed_files(self):
+        current = {"repo_root": "/repo", "index_version": "1", "parser_version": "1", "code_graph_version": "new"}
+        stored = {"repo_root": "/repo", "index_version": "1", "parser_version": "1"}
+        decision = self.indexer.evaluate_index_state(current, stored, repo_changed=True)
+        self.assertEqual(decision["decision"], self.indexer.DECISION_INCREMENTAL_REINDEX)
+
+    def test_full_rebuild_version_change_overrides_changed_files(self):
+        current = {"repo_root": "/repo", "index_version": "2", "parser_version": "1", "code_graph_version": "new"}
+        stored = {"repo_root": "/repo", "index_version": "1", "parser_version": "1", "code_graph_version": "old"}
+        decision = self.indexer.evaluate_index_state(current, stored, repo_changed=True)
+        self.assertEqual(decision["decision"], self.indexer.DECISION_FULL_REBUILD)
+
     def test_reuse_all_when_nothing_changed(self):
         current = {"repo_root": "/repo", "index_version": "1", "parser_version": "1"}
         stored = {"repo_root": "/repo", "index_version": "1", "parser_version": "1"}
