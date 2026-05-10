@@ -360,3 +360,110 @@ def test_hybrid_retrieve_matches_exported_symbol_from_symbol_graph() -> None:
     assert chunks[0]["file"] == "src/helper.ts"
     assert debug["symbols_matched"][0]["name"] == "helper"
     assert "exact_symbol" in debug["retrieval_routes_used"]
+
+
+def test_graph_only_chunks_get_non_perfect_score() -> None:
+    semantic = [{"file": "src/app.py", "content": "import helper", "line": 1, "score": 0.2, "symbols": ""}]
+    import_graph = {"adjacency": {"src/app.py": ["src/helper.py"]}, "reverse_adjacency": {"src/helper.py": ["src/app.py"]}}
+
+    def fetch_file(path: str, limit: int) -> list[dict]:  # noqa: ARG001
+        return [{"file": path, "content": "def helper(): pass", "line": 1, "score": 0.0, "symbols": "helper"}]
+
+    chunks, _debug = hybrid_retrieve(
+        query="explain helper",
+        semantic_candidates=semantic,
+        symbol_graph={},
+        import_graph=import_graph,
+        repo_graph_state={"files": {"src/app.py": {}, "src/helper.py": {}}},
+        fetch_file=fetch_file,
+        n_results=3,
+    )
+
+    graph_chunk = next(chunk for chunk in chunks if chunk["file"] == "src/helper.py")
+    assert graph_chunk["score"] == 0.35
+    assert graph_chunk["_graph_selected"] is True
+
+
+def test_js_ts_explicit_extension_relative_imports_resolve(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "app_js.ts").write_text('import helper from "./helper.js"\n', encoding="utf-8")
+    (src / "helper.js").write_text("export default function helper() {}\n", encoding="utf-8")
+    (src / "app_ts.ts").write_text('import { helper } from "./helper.ts"\n', encoding="utf-8")
+    (src / "helper.ts").write_text("export function helper() {}\n", encoding="utf-8")
+
+    graph = build_import_graph(
+        [src / "app_js.ts", src / "helper.js", src / "app_ts.ts", src / "helper.ts"],
+        tmp_path,
+    )
+
+    assert graph["adjacency"]["src/app_js.ts"] == ["src/helper.js"]
+    assert graph["adjacency"]["src/app_ts.ts"] == ["src/helper.ts"]
+
+
+def test_js_ts_explicit_js_extension_can_resolve_to_suffixless_ts_source(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "app.ts").write_text('import { helper } from "./helper.js"\n', encoding="utf-8")
+    (src / "helper.ts").write_text("export function helper() {}\n", encoding="utf-8")
+
+    graph = build_import_graph([src / "app.ts", src / "helper.ts"], tmp_path)
+
+    assert graph["adjacency"]["src/app.ts"] == ["src/helper.ts"]
+
+
+def test_python_from_dot_import_module_resolves(tmp_path: Path) -> None:
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "service.py").write_text("from . import helper\n", encoding="utf-8")
+    (pkg / "helper.py").write_text("def run(): pass\n", encoding="utf-8")
+
+    graph = build_import_graph([pkg / "service.py", pkg / "helper.py"], tmp_path)
+
+    assert graph["adjacency"]["pkg/service.py"] == ["pkg/helper.py"]
+
+
+def test_python_from_package_import_module_resolves(tmp_path: Path) -> None:
+    services = tmp_path / "services"
+    services.mkdir()
+    (tmp_path / "app.py").write_text("from services import auth\n", encoding="utf-8")
+    (services / "auth.py").write_text("class Auth: pass\n", encoding="utf-8")
+
+    graph = build_import_graph([tmp_path / "app.py", services / "auth.py"], tmp_path)
+
+    assert graph["adjacency"]["app.py"] == ["services/auth.py"]
+
+
+def test_python_from_nested_module_import_symbol_still_resolves_module(tmp_path: Path) -> None:
+    services = tmp_path / "services"
+    services.mkdir()
+    (tmp_path / "app.py").write_text("from services.auth import AuthService\n", encoding="utf-8")
+    (services / "auth.py").write_text("class AuthService: pass\n", encoding="utf-8")
+
+    graph = build_import_graph([tmp_path / "app.py", services / "auth.py"], tmp_path)
+
+    assert graph["adjacency"]["app.py"] == ["services/auth.py"]
+
+
+def test_python_multi_dot_relative_import_preserves_parent_depth(tmp_path: Path) -> None:
+    sub = tmp_path / "pkg" / "sub"
+    sub.mkdir(parents=True)
+    (sub / "service.py").write_text("from ..utils import f\n", encoding="utf-8")
+    (tmp_path / "pkg" / "utils.py").write_text("def f(): pass\n", encoding="utf-8")
+
+    graph = build_import_graph([sub / "service.py", tmp_path / "pkg" / "utils.py"], tmp_path)
+
+    assert graph["adjacency"]["pkg/sub/service.py"] == ["pkg/utils.py"]
+
+
+def test_python_multi_dot_relative_import_can_resolve_package_index(tmp_path: Path) -> None:
+    sub = tmp_path / "pkg" / "sub"
+    utils = tmp_path / "pkg" / "utils"
+    sub.mkdir(parents=True)
+    utils.mkdir(parents=True)
+    (sub / "service.py").write_text("from ..utils import f\n", encoding="utf-8")
+    (utils / "__init__.py").write_text("def f(): pass\n", encoding="utf-8")
+
+    graph = build_import_graph([sub / "service.py", utils / "__init__.py"], tmp_path)
+
+    assert graph["adjacency"]["pkg/sub/service.py"] == ["pkg/utils/__init__.py"]

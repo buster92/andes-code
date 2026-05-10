@@ -48,7 +48,11 @@ def hybrid_retrieve(
                 continue
             for chunk in fetch_file(file_path, 3):
                 enriched = dict(chunk)
-                enriched.setdefault("score", 0.05)
+                # Graph-only neighbors are useful context but are not semantic
+                # vector hits.  Assign a non-perfect deterministic distance so
+                # reranking does not treat fetched graph chunks with score=0.0
+                # as better vector matches than the original semantic seeds.
+                enriched["score"] = 0.35
                 enriched["_graph_selected"] = True
                 graph_chunks.append(enriched)
 
