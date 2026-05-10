@@ -126,9 +126,24 @@ def _extract_python_import_names(text: str) -> set[str]:
                 continue
             if module in {"", "."}:
                 imports.add(f".{name}")
-            elif not module.startswith(".") and "." not in module:
-                imports.add(f"{module}.{name}")
+            elif _imported_name_could_be_module(name):
+                imports.add(_join_from_import_candidate(module, name))
     return imports
+
+
+def _imported_name_could_be_module(name: str) -> bool:
+    # Avoid turning obvious class/function symbols such as AuthService or f into
+    # unresolved module edges, while still finding common module files imported
+    # via `from pkg.sub import helper` or `from .. import helper`.
+    return len(name) > 1 and name[:1].islower()
+
+
+def _join_from_import_candidate(module: str, name: str) -> str:
+    if module.startswith("."):
+        if module.strip("."):
+            return f"{module}.{name}"
+        return f"{module}{name}"
+    return f"{module}.{name}"
 
 
 def _python_imported_names(import_clause: str) -> list[str]:

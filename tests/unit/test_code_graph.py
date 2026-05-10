@@ -467,3 +467,25 @@ def test_python_multi_dot_relative_import_can_resolve_package_index(tmp_path: Pa
     graph = build_import_graph([sub / "service.py", utils / "__init__.py"], tmp_path)
 
     assert graph["adjacency"]["pkg/sub/service.py"] == ["pkg/utils/__init__.py"]
+
+
+def test_python_from_parent_import_module_resolves(tmp_path: Path) -> None:
+    sub = tmp_path / "pkg" / "sub"
+    sub.mkdir(parents=True)
+    (sub / "service.py").write_text("from .. import helper\n", encoding="utf-8")
+    (tmp_path / "pkg" / "helper.py").write_text("def run(): pass\n", encoding="utf-8")
+
+    graph = build_import_graph([sub / "service.py", tmp_path / "pkg" / "helper.py"], tmp_path)
+
+    assert graph["adjacency"]["pkg/sub/service.py"] == ["pkg/helper.py"]
+
+
+def test_python_from_nested_package_import_module_resolves(tmp_path: Path) -> None:
+    nested = tmp_path / "pkg" / "sub"
+    nested.mkdir(parents=True)
+    (tmp_path / "app.py").write_text("from pkg.sub import helper\n", encoding="utf-8")
+    (nested / "helper.py").write_text("def run(): pass\n", encoding="utf-8")
+
+    graph = build_import_graph([tmp_path / "app.py", nested / "helper.py"], tmp_path)
+
+    assert graph["adjacency"]["app.py"] == ["pkg/sub/helper.py"]
