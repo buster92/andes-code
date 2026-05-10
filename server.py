@@ -29,7 +29,7 @@ load_dotenv(Path(__file__).parent / ".env")
 from runtime_paths import get_runtime_log_path
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from llama_cpp import Llama, LlamaCache
@@ -759,9 +759,10 @@ async def chat(request: Request):
     t_start    = time.perf_counter()
     execution_mode = get_execution_mode()
     if not _get_active_index_session():
-        return {
-            "error": "No active project is selected. Continue with the previous project or index a new one first."
-        }
+        raise HTTPException(
+            status_code=409,
+            detail="No active project is selected. Continue with the previous project or index a new one first.",
+        )
 
     audit.info(f"REQUEST {request_id} | tokens={max_tokens} | messages={len(messages)}")
     audit.info(f"DEBUG_MODE {request_id} | request_flag={api_debug!r} | enabled={debug_mode}")
@@ -1061,6 +1062,8 @@ async def index_project(request: Request):
     body = await request.json()
     path = body.get("path", ".")
 
+    _set_active_index_session(False)
+
     if not _load_indexer():
         return {"error": "Indexer not available"}
 
@@ -1142,10 +1145,20 @@ async def clear_index_state():
 @app.post("/v1/index/restore")
 async def restore_index_state():
     if not INDEXER_READY or not _indexer_module:
+        _set_active_index_session(False)
         return {"ok": False, "error": "Indexer not available"}
-    project_map = _indexer_module._load_project_map() if hasattr(_indexer_module, "_load_project_map") else {}
-    doc_count = int(_indexer_module.col.count())
+    try:
+        project_map = _indexer_module._load_project_map() if hasattr(_indexer_module, "_load_project_map") else {}
+    except Exception as exc:
+        _set_active_index_session(False)
+        return {"ok": False, "error": f"Unable to read persisted project metadata: {exc}"}
+    try:
+        doc_count = int(_indexer_module.col.count())
+    except Exception as exc:
+        _set_active_index_session(False)
+        return {"ok": False, "error": f"Unable to validate persisted index chunks: {exc}"}
     if not isinstance(project_map, dict) or not project_map or doc_count <= 0:
+        _set_active_index_session(False)
         return {"ok": False, "error": "No persisted index is available to restore."}
     _set_active_index_session(True)
     return {"ok": True, "active_index_session": True, "doc_count": doc_count, "project_map": project_map}
