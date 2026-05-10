@@ -12,6 +12,7 @@ import json
 import logging
 import platform
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -28,7 +29,7 @@ load_dotenv(Path(__file__).parent / ".env")
 from runtime_paths import get_runtime_log_path
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from llama_cpp import Llama, LlamaCache
@@ -643,6 +644,43 @@ _print(f"  [4/4] Starting server on port {PORT}...")
 
 # ── Thinking tag pattern ──────────────────────────────────────────────────────
 _THINK_PATTERN = re.compile(r"<\|channel>.*?<channel\|>", re.DOTALL)
+_active_index_session = False
+_active_index_lock = threading.Lock()
+
+
+def _set_active_index_session(active: bool) -> None:
+    global _active_index_session
+    with _active_index_lock:
+        _active_index_session = bool(active)
+
+
+def _get_active_index_session() -> bool:
+    with _active_index_lock:
+        return bool(_active_index_session)
+
+
+def _index_runtime_state() -> dict:
+    doc_count = 0
+    project_map = {}
+    has_persisted_index = False
+    if INDEXER_READY and _indexer_module:
+        try:
+            doc_count = int(_indexer_module.col.count())
+        except Exception:
+            doc_count = 0
+        try:
+            project_map = _indexer_module._load_project_map() if hasattr(_indexer_module, "_load_project_map") else {}
+        except Exception:
+            project_map = {}
+        has_persisted_index = bool(doc_count > 0)
+    active = _get_active_index_session()
+    return {
+        "doc_count": doc_count,
+        "has_persisted_index": has_persisted_index,
+        "active_index_session": active,
+        "restored_requires_confirmation": bool(has_persisted_index and not active),
+        "project_map": project_map if isinstance(project_map, dict) else {},
+    }
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="AndesCode", version="1.0.0")
@@ -664,12 +702,7 @@ def serve_ui():
 @app.get("/")
 @app.get("/v1")
 def root():
-    doc_count = 0
-    if INDEXER_READY and _indexer_module:
-        try:
-            doc_count = _indexer_module.col.count()
-        except Exception:
-            pass
+    runtime_state = _index_runtime_state()
     auto_state = _auto_index_manager.status() if _auto_index_manager else {}
     integrity_probe = {}
     with _auto_status_lock:
@@ -683,7 +716,7 @@ def root():
         "product":   "AndesCode",
         "version":   "1.0.0",
         "indexer":   INDEXER_READY,
-        "doc_count": doc_count,
+        **runtime_state,
         "cache":     f"{CACHE_SIZE_GB:.0f}GB",
         "debug_mode_startup": DEBUG_MODE_STARTUP,
         "debug_mode_env_current": debug_mode_env_current,
@@ -701,7 +734,7 @@ def index_state():
     with _auto_status_lock:
         message = _auto_status_message
     integrity_probe = _read_integrity_probe_from_indexer()
-    return {**state, "status_message": message, "integrity_probe": integrity_probe}
+    return {**state, **_index_runtime_state(), "status_message": message, "integrity_probe": integrity_probe}
 
 
 @app.get("/v1/models")
@@ -725,6 +758,11 @@ async def chat(request: Request):
     request_id = str(uuid.uuid4())[:8]
     t_start    = time.perf_counter()
     execution_mode = get_execution_mode()
+    if not _get_active_index_session():
+        raise HTTPException(
+            status_code=409,
+            detail="No active project is selected. Continue with the previous project or index a new one first.",
+        )
 
     audit.info(f"REQUEST {request_id} | tokens={max_tokens} | messages={len(messages)}")
     audit.info(f"DEBUG_MODE {request_id} | request_flag={api_debug!r} | enabled={debug_mode}")
@@ -1024,6 +1062,8 @@ async def index_project(request: Request):
     body = await request.json()
     path = body.get("path", ".")
 
+    _set_active_index_session(False)
+
     if not _load_indexer():
         return {"error": "Indexer not available"}
 
@@ -1051,6 +1091,7 @@ async def index_project(request: Request):
             if event is None:
                 break
             if event["type"] == "done":
+                _set_active_index_session(True)
                 audit.info(
                     f"INDEX | path={_safe(path)} | "
                     f"indexed={event.get('indexed')} | chunks={event.get('chunks')}"
@@ -1071,7 +1112,56 @@ async def index_project(request: Request):
 async def clear_index_state():
     _auto_index_manager.stop()
     _set_auto_status("Index watcher stopped")
-    return {"ok": True, "watcher_status": _auto_index_manager.status()}
+    if INDEXER_READY and _indexer_module:
+        try:
+            _indexer_module.chroma.delete_collection(_indexer_module.COLLECTION)
+        except Exception:
+            pass
+        try:
+            _indexer_module.col = _indexer_module.chroma.get_or_create_collection(_indexer_module.COLLECTION)
+        except Exception:
+            pass
+        for p in (
+            _indexer_module.HASH_STORE,
+            _indexer_module.PROJECT_MAP,
+            _indexer_module.SYMBOL_INDEX,
+            _indexer_module.WORKSPACE_INDEX,
+            _indexer_module.INDEX_STATE,
+            _indexer_module.INTEGRITY_STATE,
+            _indexer_module.CHUNK_COUNT_STATE,
+        ):
+            try:
+                Path(p).unlink(missing_ok=True)
+            except Exception:
+                pass
+        try:
+            shutil.rmtree(_indexer_module.CACHE_DIR, ignore_errors=True)
+        except Exception:
+            pass
+    _set_active_index_session(False)
+    return {"ok": True, "doc_count": 0, "active_index_session": False, "watcher_status": _auto_index_manager.status()}
+
+
+@app.post("/v1/index/restore")
+async def restore_index_state():
+    if not INDEXER_READY or not _indexer_module:
+        _set_active_index_session(False)
+        return {"ok": False, "error": "Indexer not available"}
+    try:
+        project_map = _indexer_module._load_project_map() if hasattr(_indexer_module, "_load_project_map") else {}
+    except Exception as exc:
+        _set_active_index_session(False)
+        return {"ok": False, "error": f"Unable to read persisted project metadata: {exc}"}
+    try:
+        doc_count = int(_indexer_module.col.count())
+    except Exception as exc:
+        _set_active_index_session(False)
+        return {"ok": False, "error": f"Unable to validate persisted index chunks: {exc}"}
+    if not isinstance(project_map, dict) or not project_map or doc_count <= 0:
+        _set_active_index_session(False)
+        return {"ok": False, "error": "No persisted index is available to restore."}
+    _set_active_index_session(True)
+    return {"ok": True, "active_index_session": True, "doc_count": doc_count, "project_map": project_map}
 
 
 # ── Context builder ───────────────────────────────────────────────────────────

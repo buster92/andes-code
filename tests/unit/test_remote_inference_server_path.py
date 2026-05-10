@@ -72,6 +72,12 @@ def _import_server_with_stubs():
         def post(self, *_args, **_kwargs):
             return lambda fn: fn
 
+    class _FakeHTTPException(Exception):
+        def __init__(self, status_code: int, detail: str):
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+
     class _FakeRequest:
         def __init__(self, payload):
             self._payload = payload
@@ -80,6 +86,7 @@ def _import_server_with_stubs():
             return self._payload
 
     fake_fastapi.FastAPI = _FakeFastAPI
+    fake_fastapi.HTTPException = _FakeHTTPException
     fake_fastapi.Request = _FakeRequest
     sys.modules["fastapi"] = fake_fastapi
 
@@ -147,6 +154,9 @@ class TestRemoteInferenceServerPath(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.server, cls.req_type = _import_server_with_stubs()
+
+    def setUp(self):
+        self.server._set_active_index_session(True)
 
     def test_remote_ask_non_stream_happy_path(self):
         req = self.req_type(_valid_remote_request())

@@ -70,11 +70,18 @@ def _import_server_with_stubs():
         def post(self, *_args, **_kwargs):
             return lambda fn: fn
 
+    class _FakeHTTPException(Exception):
+        def __init__(self, status_code: int, detail: str):
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+
     class _FakeRequest:
         async def json(self):
             return {}
 
     fake_fastapi.FastAPI = _FakeFastAPI
+    fake_fastapi.HTTPException = _FakeHTTPException
     fake_fastapi.Request = _FakeRequest
     sys.modules["fastapi"] = fake_fastapi
 
@@ -115,6 +122,9 @@ class TestServerStreamingDebugMode(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.server = _import_server_with_stubs()
+
+    def setUp(self):
+        self.server._set_active_index_session(True)
 
     def test_debug_checkbox_request_flag_enables_debug_when_env_off(self):
         prev = os.environ.pop("ANDESCODE_DEBUG_MODE", None)
@@ -746,6 +756,120 @@ class TestServerStreamingDebugMode(unittest.TestCase):
                 os.environ.pop("ANDESCODE_EXECUTION_MODE", None)
             else:
                 os.environ["ANDESCODE_EXECUTION_MODE"] = prev_mode
+
+    def test_chat_blocked_when_no_active_index_session(self):
+        server = self.server
+        server._set_active_index_session(False)
+        with self.assertRaises(server.HTTPException) as raised:
+            _call_chat(server, {"messages": [{"role": "user", "content": "hi"}], "stream": False})
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("No active project is selected", raised.exception.detail)
+
+    def test_streaming_chat_blocked_when_no_active_index_session(self):
+        server = self.server
+        server._set_active_index_session(False)
+        with self.assertRaises(server.HTTPException) as raised:
+            _call_chat(server, {"messages": [{"role": "user", "content": "hi"}], "stream": True})
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("No active project is selected", raised.exception.detail)
+
+    def test_restore_endpoint_activates_previous_index(self):
+        server = self.server
+        server.INDEXER_READY = True
+        server._indexer_module = types.SimpleNamespace(
+            _load_project_map=lambda: {"project": "demo"},
+            col=types.SimpleNamespace(count=lambda: 12),
+        )
+        server._set_active_index_session(False)
+        response = asyncio.run(server.restore_index_state())
+        self.assertTrue(response["ok"])
+        self.assertTrue(response["active_index_session"])
+        self.assertEqual(response["doc_count"], 12)
+
+
+    def test_restore_endpoint_handles_project_map_exception_without_activating(self):
+        server = self.server
+        server.INDEXER_READY = True
+
+        def _raise_project_map():
+            raise RuntimeError("metadata corrupt")
+
+        server._indexer_module = types.SimpleNamespace(
+            _load_project_map=_raise_project_map,
+            col=types.SimpleNamespace(count=lambda: 12),
+        )
+        server._set_active_index_session(True)
+        response = asyncio.run(server.restore_index_state())
+        self.assertFalse(response["ok"])
+        self.assertIn("Unable to read persisted project metadata", response["error"])
+        self.assertFalse(server._get_active_index_session())
+
+    def test_restore_endpoint_handles_count_exception_without_activating(self):
+        server = self.server
+        server.INDEXER_READY = True
+
+        def _raise_count():
+            raise RuntimeError("chroma unavailable")
+
+        server._indexer_module = types.SimpleNamespace(
+            _load_project_map=lambda: {"project": "demo"},
+            col=types.SimpleNamespace(count=_raise_count),
+        )
+        server._set_active_index_session(True)
+        response = asyncio.run(server.restore_index_state())
+        self.assertFalse(response["ok"])
+        self.assertIn("Unable to validate persisted index chunks", response["error"])
+        self.assertFalse(server._get_active_index_session())
+
+    def test_manual_index_start_deactivates_existing_session_until_done(self):
+        server = self.server
+        original_load_indexer = server._load_indexer
+        original_run_index_stream = server._run_index_stream
+        original_streaming_response = server.StreamingResponse
+        try:
+            server._set_active_index_session(True)
+            server._load_indexer = lambda: True
+
+            def _fake_run_index_stream(path, source, emit_event, change_batch=None):
+                emit_event({"type": "scan", "files": 1, "new": 1, "unchanged": 0})
+                emit_event({"type": "done", "indexed": 1, "chunks": 1})
+                return True
+
+            class _Req:
+                async def json(self):
+                    return {"path": "/tmp/demo"}
+
+            server._run_index_stream = _fake_run_index_stream
+            server.StreamingResponse = lambda gen, **_kwargs: gen
+            stream = asyncio.run(server.index_project(_Req()))
+            self.assertFalse(server._get_active_index_session())
+
+            async def _drain():
+                events = []
+                async for payload in stream:
+                    events.append(payload)
+                return events
+
+            events = asyncio.run(_drain())
+            self.assertTrue(any('"type": "done"' in event for event in events))
+            self.assertTrue(server._get_active_index_session())
+        finally:
+            server._load_indexer = original_load_indexer
+            server._run_index_stream = original_run_index_stream
+            server.StreamingResponse = original_streaming_response
+
+    def test_index_state_requires_confirmation_when_persisted_index_exists(self):
+        server = self.server
+        server.INDEXER_READY = True
+        server._indexer_module = types.SimpleNamespace(
+            _load_project_map=lambda: {"project": "demo"},
+            col=types.SimpleNamespace(count=lambda: 3),
+        )
+        server._set_active_index_session(False)
+        state = server._index_runtime_state()
+        self.assertTrue(state["has_persisted_index"])
+        self.assertTrue(state["restored_requires_confirmation"])
+        self.assertFalse(state["active_index_session"])
 
 
 if __name__ == "__main__":
