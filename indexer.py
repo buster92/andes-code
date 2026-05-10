@@ -2528,14 +2528,18 @@ def evaluate_index_state(current_state: dict, stored_state: dict | None, repo_ch
         for field, reason in workspace_only_fields
         if stored_state.get(field) != current_state.get(field)
     ]
-    if workspace_reasons:
-        return {"decision": DECISION_REBUILD_WORKSPACE_ONLY, "reasons": workspace_reasons}
 
     if repo_changed:
+        reasons = ["Detected changed files; running incremental reindex"]
+        if workspace_reasons:
+            reasons.extend(workspace_reasons)
         return {
             "decision": DECISION_INCREMENTAL_REINDEX,
-            "reasons": ["Detected changed files; running incremental reindex"],
+            "reasons": reasons,
         }
+
+    if workspace_reasons:
+        return {"decision": DECISION_REBUILD_WORKSPACE_ONLY, "reasons": workspace_reasons}
 
     return {
         "decision": DECISION_REUSE_ALL,
