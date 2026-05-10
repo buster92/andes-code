@@ -480,7 +480,107 @@ def test_duplicate_graph_and_semantic_files_are_not_fetched_twice() -> None:
 
     assert fetched == ["stores/token_store.py"]
     assert [chunk["file"] for chunk in chunks].count("services/auth.py") == 1
-    assert "services/auth.py" not in debug["files_selected_by_graph"]
+    assert "services/auth.py" in debug["files_selected_by_graph"]
+    assert "services/auth.py" in debug["graph_boosted_existing_files"]
+
+
+def test_existing_semantic_file_receives_exact_symbol_boost_without_refetch() -> None:
+    semantic = [{"file": "services/auth.py", "content": "class AuthService: pass", "line": 1, "score": 0.62, "symbols": "AuthService"}]
+    symbol_graph = {
+        "by_name": {"AuthService": [{"name": "AuthService", "file_path": "services/auth.py", "references": []}]},
+        "by_file": {"services/auth.py": [{"name": "AuthService", "file_path": "services/auth.py", "references": []}]},
+    }
+    fetched: list[str] = []
+
+    def fetch_file(path: str, limit: int) -> list[dict]:  # noqa: ARG001
+        fetched.append(path)
+        return [{"file": path, "content": path, "line": 1, "score": 0.0, "symbols": ""}]
+
+    chunks, debug = hybrid_retrieve(
+        query="Explain AuthService",
+        semantic_candidates=semantic,
+        symbol_graph=symbol_graph,
+        import_graph={},
+        repo_graph_state={"files": {"services/auth.py": {}}},
+        fetch_file=fetch_file,
+        n_results=5,
+    )
+
+    auth_chunks = [chunk for chunk in chunks if chunk["file"] == "services/auth.py"]
+    assert fetched == []
+    assert len(auth_chunks) == 1
+    assert auth_chunks[0]["score"] == 0.10
+    assert auth_chunks[0]["_graph_selected"] is True
+    assert auth_chunks[0]["_graph_route"] == "exact_symbol"
+    assert debug["graph_route_by_file"]["services/auth.py"] == "exact_symbol"
+    assert debug["graph_boosted_existing_files"] == ["services/auth.py"]
+
+
+def test_existing_semantic_file_receives_direct_import_boost_when_applicable() -> None:
+    semantic = [
+        {"file": "app.py", "content": "import token store", "line": 1, "score": 0.2, "symbols": ""},
+        {"file": "stores/token_store.py", "content": "class TokenStore: pass", "line": 1, "score": 0.62, "symbols": "TokenStore"},
+    ]
+    import_graph = {
+        "adjacency": {"app.py": ["stores/token_store.py"]},
+        "reverse_adjacency": {"stores/token_store.py": ["app.py"]},
+    }
+    fetched: list[str] = []
+
+    def fetch_file(path: str, limit: int) -> list[dict]:  # noqa: ARG001
+        fetched.append(path)
+        return [{"file": path, "content": path, "line": 1, "score": 0.0, "symbols": ""}]
+
+    chunks, debug = hybrid_retrieve(
+        query="Explain token persistence",
+        semantic_candidates=semantic,
+        symbol_graph={},
+        import_graph=import_graph,
+        repo_graph_state={"files": {"app.py": {}, "stores/token_store.py": {}}},
+        fetch_file=fetch_file,
+        n_results=5,
+    )
+
+    token_chunk = next(chunk for chunk in chunks if chunk["file"] == "stores/token_store.py")
+    assert fetched == []
+    assert token_chunk["score"] == 0.30
+    assert token_chunk["_graph_route"] == "direct_import_neighbor"
+    assert debug["graph_route_by_file"]["stores/token_store.py"] == "direct_import_neighbor"
+    assert "stores/token_store.py" in debug["graph_boosted_existing_files"]
+
+
+def test_graph_only_neighbor_still_fetched_when_existing_files_are_boosted() -> None:
+    semantic = [{"file": "services/auth.py", "content": "class AuthService: pass", "line": 1, "score": 0.62, "symbols": "AuthService"}]
+    symbol_graph = {
+        "by_name": {"AuthService": [{"name": "AuthService", "file_path": "services/auth.py", "references": []}]},
+        "by_file": {"services/auth.py": [{"name": "AuthService", "file_path": "services/auth.py", "references": []}]},
+    }
+    import_graph = {
+        "adjacency": {"services/auth.py": ["stores/token_store.py"]},
+        "reverse_adjacency": {"stores/token_store.py": ["services/auth.py"]},
+    }
+    fetched: list[str] = []
+
+    def fetch_file(path: str, limit: int) -> list[dict]:  # noqa: ARG001
+        fetched.append(path)
+        return [{"file": path, "content": path, "line": 1, "score": 0.0, "symbols": ""}]
+
+    chunks, debug = hybrid_retrieve(
+        query="Explain AuthService token storage",
+        semantic_candidates=semantic,
+        symbol_graph=symbol_graph,
+        import_graph=import_graph,
+        repo_graph_state={"files": {"services/auth.py": {}, "stores/token_store.py": {}}},
+        fetch_file=fetch_file,
+        n_results=5,
+    )
+
+    assert fetched == ["stores/token_store.py"]
+    assert [chunk["file"] for chunk in chunks].count("services/auth.py") == 1
+    token_chunk = next(chunk for chunk in chunks if chunk["file"] == "stores/token_store.py")
+    assert token_chunk["score"] == 0.30
+    assert token_chunk["_graph_route"] == "direct_import_neighbor"
+    assert debug["graph_boosted_existing_files"] == ["services/auth.py"]
 
 
 def test_reference_neighbors_are_capped() -> None:
@@ -543,6 +643,7 @@ def test_debug_payload_includes_graph_routes_scores_and_seed_files() -> None:
     assert debug["graph_score_by_file"]["services/auth.py"] == 0.10
     assert debug["graph_seed_files"] == ["app.py", "services/auth.py"]
     assert debug["graph_expansion_limits"]["import_neighbors"] == 10
+
 
 def test_js_ts_explicit_extension_relative_imports_resolve(tmp_path: Path) -> None:
     src = tmp_path / "src"

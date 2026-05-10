@@ -64,35 +64,46 @@ def hybrid_retrieve(
 
     graph_route_by_file: dict[str, str] = {}
     graph_score_by_file: dict[str, float] = {}
-    _record_graph_routes(graph_route_by_file, graph_score_by_file, symbol_files, "exact_symbol", already_selected_files)
-    _record_graph_routes(graph_route_by_file, graph_score_by_file, filename_files, "filename_match", already_selected_files)
+    _record_graph_routes(graph_route_by_file, graph_score_by_file, symbol_files, "exact_symbol")
+    _record_graph_routes(graph_route_by_file, graph_score_by_file, filename_files, "filename_match")
     _record_graph_routes(
         graph_route_by_file,
         graph_score_by_file,
         direct_import_neighbors,
         "direct_import_neighbor",
-        already_selected_files,
     )
     _record_graph_routes(
         graph_route_by_file,
         graph_score_by_file,
         reverse_import_neighbors,
         "reverse_import_neighbor",
-        already_selected_files,
     )
     _record_graph_routes(
         graph_route_by_file,
         graph_score_by_file,
         reference_neighbors,
         "reference_neighbor",
-        already_selected_files,
     )
 
     graph_files = sorted(graph_route_by_file, key=lambda f: (graph_score_by_file[f], f))
 
+    boosted_authority_chunks, authority_boosted_files = _apply_graph_metadata_to_chunks(
+        authority_chunks,
+        graph_route_by_file,
+        graph_score_by_file,
+    )
+    boosted_semantic_candidates, semantic_boosted_files = _apply_graph_metadata_to_chunks(
+        semantic_candidates,
+        graph_route_by_file,
+        graph_score_by_file,
+    )
+    graph_boosted_existing_files = sorted(set(authority_boosted_files) | set(semantic_boosted_files))
+
     graph_chunks: list[dict] = []
     if fetch_file:
         for file_path in graph_files:
+            if file_path in already_selected_files:
+                continue
             for chunk in fetch_file(file_path, 3):
                 enriched = dict(chunk)
                 route = graph_route_by_file[file_path]
@@ -106,12 +117,14 @@ def hybrid_retrieve(
                 enriched["_graph_score_reason"] = _graph_score_reason(route, score)
                 graph_chunks.append(enriched)
 
-    combined = _dedupe_chunks([*authority_chunks, *semantic_candidates, *graph_chunks])
+    combined = _dedupe_chunks([*boosted_authority_chunks, *boosted_semantic_candidates, *graph_chunks])
     notes = []
     if not graph_artifacts_available:
         notes.append("Graph artifacts missing or empty; hybrid retrieval could not expand neighbors.")
     if graph_chunks:
         notes.append(f"Graph retrieval added {len(_files_from_chunks(graph_chunks))} neighboring file(s).")
+    if graph_boosted_existing_files:
+        notes.append(f"Graph retrieval boosted {len(graph_boosted_existing_files)} existing selected file(s).")
     if reference_neighbors:
         notes.append(
             f"Reference-neighbor expansion added up to {reference_neighbor_limit} lower-confidence file(s); "
@@ -156,6 +169,7 @@ def hybrid_retrieve(
             "import_neighbors": import_neighbor_limit,
             "reference_neighbors": reference_neighbor_limit,
         },
+        "graph_boosted_existing_files": graph_boosted_existing_files,
     }
     return combined, debug
 
@@ -239,16 +253,41 @@ def _record_graph_routes(
     graph_score_by_file: dict[str, float],
     files: set[str] | list[str],
     route: str,
-    excluded_files: set[str],
 ) -> None:
     score = _GRAPH_ROUTE_SCORES[route]
     for file_path in files:
-        if not file_path or file_path in excluded_files:
+        if not file_path:
             continue
         current_score = graph_score_by_file.get(file_path)
         if current_score is None or score < current_score:
             graph_route_by_file[file_path] = route
             graph_score_by_file[file_path] = score
+
+
+def _apply_graph_metadata_to_chunks(
+    chunks: list[dict],
+    graph_route_by_file: dict[str, str],
+    graph_score_by_file: dict[str, float],
+) -> tuple[list[dict], list[str]]:
+    boosted_chunks: list[dict] = []
+    boosted_files: list[str] = []
+    for chunk in chunks or []:
+        file_path = chunk.get("file") or chunk.get("path")
+        if not file_path or file_path not in graph_route_by_file:
+            boosted_chunks.append(chunk)
+            continue
+
+        route = graph_route_by_file[file_path]
+        graph_score = graph_score_by_file[file_path]
+        boosted = dict(chunk)
+        existing_score = boosted.get("score")
+        boosted["score"] = min(existing_score, graph_score) if isinstance(existing_score, (int, float)) else graph_score
+        boosted["_graph_selected"] = True
+        boosted["_graph_route"] = route
+        boosted["_graph_score_reason"] = _graph_score_reason(route, graph_score)
+        boosted_chunks.append(boosted)
+        boosted_files.append(file_path)
+    return boosted_chunks, boosted_files
 
 
 def _graph_score_reason(route: str, score: float) -> str:

@@ -1169,6 +1169,7 @@ def _initialize_hybrid_debug(default_route: str = "") -> dict:
         "graph_score_by_file": {},
         "graph_seed_files": [],
         "graph_expansion_limits": {},
+        "graph_boosted_existing_files": [],
     }
 
 
