@@ -54,6 +54,11 @@ def hybrid_retrieve(
         import_graph,
         limit=import_neighbor_limit,
     )
+    existing_direct_import_routes, existing_reverse_import_routes = _import_routes_between_selected_files(
+        import_seed_files,
+        import_graph,
+        already_selected_files | symbol_files | filename_files,
+    )
     reference_neighbors = expand_reference_neighbors(
         seed_files,
         symbols_matched,
@@ -69,13 +74,13 @@ def hybrid_retrieve(
     _record_graph_routes(
         graph_route_by_file,
         graph_score_by_file,
-        direct_import_neighbors,
+        [*direct_import_neighbors, *existing_direct_import_routes],
         "direct_import_neighbor",
     )
     _record_graph_routes(
         graph_route_by_file,
         graph_score_by_file,
-        reverse_import_neighbors,
+        [*reverse_import_neighbors, *existing_reverse_import_routes],
         "reverse_import_neighbor",
     )
     _record_graph_routes(
@@ -149,7 +154,12 @@ def hybrid_retrieve(
         routes.append("exact_symbol")
     if filename_files:
         routes.append("file_name")
-    if direct_import_neighbors or reverse_import_neighbors:
+    if (
+        direct_import_neighbors
+        or reverse_import_neighbors
+        or existing_direct_import_routes
+        or existing_reverse_import_routes
+    ):
         routes.append("import_neighbors")
     if reference_neighbors:
         routes.append("reference_neighbors")
@@ -201,20 +211,21 @@ def match_filenames(query: str, repo_graph_state: dict) -> list[str]:
 def expand_import_neighbors_by_route(seed_files: set[str], graph: dict, limit: int = 12) -> tuple[list[str], list[str]]:
     adjacency = graph.get("adjacency", {}) if isinstance(graph, dict) else {}
     reverse = graph.get("reverse_adjacency", {}) if isinstance(graph, dict) else {}
+    seed_set = set(seed_files)
     direct: list[str] = []
     reverse_neighbors: list[str] = []
-    seen_direct: set[str] = set()
-    seen_reverse: set[str] = set()
-    for seed in sorted(seed_files):
+    seen_direct: set[str] = set(seed_set)
+    seen_reverse: set[str] = set(seed_set)
+    for seed in sorted(seed_set):
         for neighbor in adjacency.get(seed, []) or []:
-            if neighbor == seed or neighbor in seen_direct:
+            if neighbor in seen_direct:
                 continue
             seen_direct.add(neighbor)
             direct.append(neighbor)
             if len(direct) + len(reverse_neighbors) >= limit:
                 return direct, reverse_neighbors
         for neighbor in reverse.get(seed, []) or []:
-            if neighbor == seed or neighbor in seen_direct or neighbor in seen_reverse:
+            if neighbor in seen_direct or neighbor in seen_reverse:
                 continue
             seen_reverse.add(neighbor)
             reverse_neighbors.append(neighbor)
@@ -222,6 +233,31 @@ def expand_import_neighbors_by_route(seed_files: set[str], graph: dict, limit: i
                 return direct, reverse_neighbors
     return direct, reverse_neighbors
 
+
+def _import_routes_between_selected_files(
+    seed_files: set[str],
+    graph: dict,
+    selected_files: set[str],
+) -> tuple[list[str], list[str]]:
+    adjacency = graph.get("adjacency", {}) if isinstance(graph, dict) else {}
+    reverse = graph.get("reverse_adjacency", {}) if isinstance(graph, dict) else {}
+    seed_set = set(seed_files)
+    direct: list[str] = []
+    reverse_neighbors: list[str] = []
+    seen_direct: set[str] = set()
+    seen_reverse: set[str] = set()
+    for seed in sorted(seed_set):
+        for neighbor in adjacency.get(seed, []) or []:
+            if neighbor == seed or neighbor not in selected_files or neighbor in seen_direct:
+                continue
+            seen_direct.add(neighbor)
+            direct.append(neighbor)
+        for neighbor in reverse.get(seed, []) or []:
+            if neighbor == seed or neighbor not in selected_files or neighbor in seen_direct or neighbor in seen_reverse:
+                continue
+            seen_reverse.add(neighbor)
+            reverse_neighbors.append(neighbor)
+    return direct, reverse_neighbors
 
 def expand_reference_neighbors(
     seed_files: set[str],
