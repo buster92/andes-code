@@ -75,6 +75,15 @@ from andes_cache.debug import (
     populate_retrieval_snapshot,
 )
 
+from andes_cache.code_graph.repo_graph import (
+    build_repo_graph as build_code_repo_graph,
+    load_graph_artifacts,
+    SYMBOL_GRAPH_FILE,
+    IMPORT_GRAPH_FILE,
+    REPO_GRAPH_STATE_FILE,
+)
+from andes_cache.code_graph.graph_ranker import hybrid_retrieve
+
 # ── Config ────────────────────────────────────────────────────────────────────
 EMBED_MODEL   = "all-MiniLM-L6-v2"
 CHROMA_PATH   = str(Path(__file__).parent / "index")
@@ -82,6 +91,9 @@ COLLECTION    = "codebase"
 HASH_STORE    = Path(__file__).parent / "index" / ".file_hashes.json"
 PROJECT_MAP   = Path(__file__).parent / "index" / "project_map.json"
 SYMBOL_INDEX  = Path(__file__).parent / "index" / "symbol_index.json"
+SYMBOL_GRAPH = Path(__file__).parent / "index" / SYMBOL_GRAPH_FILE
+IMPORT_GRAPH = Path(__file__).parent / "index" / IMPORT_GRAPH_FILE
+REPO_GRAPH_STATE = Path(__file__).parent / "index" / REPO_GRAPH_STATE_FILE
 WORKSPACE_INDEX = Path(__file__).parent / "index" / "workspace_index.json"
 INDEX_STATE = Path(__file__).parent / "index" / "index_state.json"
 INTEGRITY_STATE = Path(__file__).parent / "index" / "integrity_state.json"
@@ -304,7 +316,7 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
         new_files = [(fp, _file_hash(fp)) for fp in all_files]
         changed_rel_paths = [str(fp.relative_to(root_path)) for fp, _ in new_files] + removed_paths
         unchanged = []
-        for f in [PROJECT_MAP, SYMBOL_INDEX, WORKSPACE_INDEX]:
+        for f in [PROJECT_MAP, SYMBOL_INDEX, WORKSPACE_INDEX, SYMBOL_GRAPH, IMPORT_GRAPH, REPO_GRAPH_STATE]:
             try:
                 f.unlink()
             except Exception:
@@ -369,6 +381,7 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
         _save_json(PROJECT_MAP, pmap)
         _save_json(SYMBOL_INDEX, symidx)
         _save_json(WORKSPACE_INDEX, workspace)
+        _build_and_save_code_graph(root_path, all_indexed)
         CACHE.workspace_set(repo_fp, "symbol_index", symidx)
         _save_hashes(_preserve_embedded_hash_state(hashes, root_path, repo_fp))
         _validate_and_repair_authoritative_integrity(root_path)
@@ -392,6 +405,8 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
     if not new_files and unchanged:
         # Nothing changed — still emit map event so UI can display it
         pmap = _load_project_map()
+        if not SYMBOL_GRAPH.exists() or not IMPORT_GRAPH.exists() or not REPO_GRAPH_STATE.exists():
+            _build_and_save_code_graph(root_path, all_files)
         _save_hashes(next_hashes | {"__root__": str(root_path), "__fingerprint__": repo_fp})
         if removed_paths:
             chunk_counts = _load_chunk_count_state()
@@ -484,6 +499,7 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
     _save_json(PROJECT_MAP, pmap)
     _save_json(SYMBOL_INDEX, symidx)
     _save_json(WORKSPACE_INDEX, workspace)
+    _build_and_save_code_graph(root_path, all_indexed)
     CACHE.workspace_set(repo_fp, "symbol_index", symidx)
     _validate_and_repair_authoritative_integrity(root_path)
     _save_index_state(_with_timestamp(current_state, "last_indexed_at"))
@@ -544,6 +560,8 @@ def search(
     decision = classify_query_intent_details(query)
     intent = decision["intent"]
     retrieval_route = decision["retrieval_route"]
+    hybrid_enabled = _hybrid_retrieval_enabled()
+    cache_retrieval_route = f"{retrieval_route}:hybrid" if hybrid_enabled else retrieval_route
     workspace_index = _load_workspace_index()
     payload = debug_payload or (initialize_payload(query, decision, workspace_index) if debug_enabled else None)
     authoritative_files_detected = (
@@ -622,6 +640,7 @@ def search(
 
     if payload is not None:
         payload["retrieval"]["route_taken"] = retrieval_route
+        payload["retrieval"].update(_initialize_hybrid_debug(default_route=retrieval_route))
         _update_authoritative_debug([], mode="semantic_fallback_blocked")
     repo_fp = get_repo_fingerprint()
     # For declaration queries, check whether the startup integrity probe flagged
@@ -638,7 +657,7 @@ def search(
             query=query,
             index_version=INDEX_VERSION,
             intent=intent,
-            retrieval_route=retrieval_route,
+            retrieval_route=cache_retrieval_route,
         )
         if cached and _startup_probe_unhealthy:
             cached = None  # index health signal overrides stale cache
@@ -734,7 +753,7 @@ def search(
                 index_version=INDEX_VERSION,
                 value=final,
                 intent=intent,
-                retrieval_route=retrieval_route,
+                retrieval_route=cache_retrieval_route,
             )
         if payload is not None:
             payload = populate_retrieval_snapshot(
@@ -781,7 +800,7 @@ def search(
                     index_version=INDEX_VERSION,
                     value=final,
                     intent=intent,
-                    retrieval_route=retrieval_route,
+                    retrieval_route=cache_retrieval_route,
                 )
             if payload is not None:
                 payload = populate_retrieval_snapshot(
@@ -812,7 +831,7 @@ def search(
                 index_version=INDEX_VERSION,
                 value=final,
                 intent=intent,
-                retrieval_route=retrieval_route,
+                retrieval_route=cache_retrieval_route,
             )
         if payload is not None:
             payload = populate_retrieval_snapshot(
@@ -906,6 +925,23 @@ def search(
         for c in candidates:
             if any(mf in c["file"] for mf in matched_files):
                 c["score"] *= 0.8   # lower distance = better match
+
+    if hybrid_enabled:
+        artifacts = _load_code_graph_artifacts()
+        candidates, graph_debug = hybrid_retrieve(
+            query=query,
+            semantic_candidates=candidates,
+            symbol_graph=artifacts.get("symbol_graph", {}),
+            import_graph=artifacts.get("import_graph", {}),
+            repo_graph_state=artifacts.get("repo_graph_state", {}),
+            fetch_file=lambda file_path, limit: _fetch_exact_file(file_path, max_results=limit),
+            n_results=max(n_results, 8 if arch_patterns.search(query) else n_results),
+            authority_chunks=authoritative_forced_candidates,
+        )
+        for c in candidates:
+            if c.get("_graph_selected"):
+                c.setdefault("_debug_reason", "graph neighbor")
+        _attach_hybrid_debug(payload, graph_debug)
 
     ranked = _rerank(query, candidates, track_reasons=payload is not None)
     final_ranked = ranked[:n_results]
@@ -1025,7 +1061,7 @@ def search(
             index_version=INDEX_VERSION,
             value=final,
             intent=intent,
-            retrieval_route=retrieval_route,
+            retrieval_route=cache_retrieval_route,
         )
     if payload is not None:
         payload = populate_retrieval_snapshot(
@@ -1091,6 +1127,44 @@ def explain_missing_authority(query: str, n_results: int = 5) -> dict:
 def get_chunks_for_file(filename: str) -> list[dict]:
     """Retrieve ALL indexed chunks for a specific file."""
     return _fetch_all_from_file(filename, max_results=999)
+
+
+def _hybrid_retrieval_enabled() -> bool:
+    return os.getenv("ANDESCODE_HYBRID_RETRIEVAL", "0") == "1"
+
+
+def _build_and_save_code_graph(root_path: Path, files: list[Path]) -> None:
+    try:
+        build_code_repo_graph(root_path, files, index_dir=Path(CHROMA_PATH))
+    except Exception as e:
+        logging.warning(f"Could not build code graph artifacts: {e}")
+
+
+def _load_code_graph_artifacts() -> dict:
+    try:
+        return load_graph_artifacts(Path(CHROMA_PATH))
+    except Exception:
+        return {"symbol_graph": {}, "import_graph": {}, "repo_graph_state": {}}
+
+
+def _initialize_hybrid_debug(default_route: str = "") -> dict:
+    return {
+        "retrieval_routes_used": [default_route] if default_route else [],
+        "graph_neighbors_added": [],
+        "symbols_matched": [],
+        "files_selected_by_graph": [],
+        "files_selected_by_semantic": [],
+        "files_selected_by_authority": [],
+        "context_sufficiency_notes": [],
+    }
+
+
+def _attach_hybrid_debug(payload: dict | None, graph_debug: dict) -> None:
+    if payload is None:
+        return
+    retrieval = payload.setdefault("retrieval", {})
+    for key, value in _initialize_hybrid_debug().items():
+        retrieval[key] = graph_debug.get(key, value)
 
 
 def build_project_map(root_path: Path, files: list, chunks: list, workspace: dict | None = None) -> dict:
