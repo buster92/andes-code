@@ -290,3 +290,19 @@ def test_indexer_search_hybrid_retrieval_adds_import_neighbor_and_uses_hybrid_ca
     assert "import_neighbors" in debug["retrieval"]["retrieval_routes_used"]
     assert "semantic:hybrid" in cache_get_routes
     assert "semantic:hybrid" in cache_set_routes
+
+
+def test_ambiguous_basename_import_does_not_create_edge(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    left = src / "left"
+    right = src / "right"
+    left.mkdir(parents=True)
+    right.mkdir(parents=True)
+    (src / "app.ts").write_text('import helper from "helper"\n', encoding="utf-8")
+    (left / "helper.ts").write_text("export const helper = 1\n", encoding="utf-8")
+    (right / "helper.ts").write_text("export const helper = 2\n", encoding="utf-8")
+
+    graph = build_import_graph([src / "app.ts", left / "helper.ts", right / "helper.ts"], tmp_path)
+
+    assert graph["unresolved"]["src/app.ts"] == ["helper"]
+    assert "src/app.ts" not in graph["adjacency"]

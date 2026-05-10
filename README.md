@@ -50,6 +50,7 @@ AndesCode is built for developers who work with client code under NDA, operate i
 - 🔍 **Codebase-aware** — indexes your project, builds a project map, injects relevant context automatically
 - 🗺️ **Project intelligence** — detects language, stack, entry points, domain, and key symbols on indexing
 - 🔎 **Smart retrieval** — two-step planning (model selects relevant files first), query routing by filename/symbol/intent, and 4-axis re-ranking
+- 🕸️ **Optional graph-aware retrieval** — when enabled, AndesCode builds local code graph artifacts and can expand semantic retrieval with symbol, import, and reference neighbors for complex multi-file questions
 - 🎯 **Token-aware context packing** — prompt assembly is budgeted against model context window, with deterministic priority-based truncation instead of overflow failures
 - 🧱 **Multi-layer caching** — repo-fingerprint-scoped workspace/retrieval/neighborhood/prompt-prefix/patch-plan caches with strict invalidation
 - 📌 **Deterministic routing for repo questions** — config/dependency/manifest questions use a source-of-truth config-first path before inferred code usage
@@ -110,6 +111,8 @@ Index your project
 Files are chunked with language-aware boundary detection
 Embeddings stored in ChromaDB (local)
 Project map built: language, stack, domain, entry points, symbol index
+Optional local code graph artifacts built under the existing index directory:
+  symbol_graph.json, import_graph.json, repo_graph_state.json
 Workspace intelligence cached to disk (schema-versioned, artifact-level reuse)
         ↓
 You ask a question in the AndesCode window
@@ -124,6 +127,10 @@ Step 1 — Planning: model scans your project map and identifies
         ↓
 Step 2 — Retrieval: those files are loaded in full, plus
          semantic search fills any gaps the planner missed
+         Default retrieval is unchanged. If ANDESCODE_HYBRID_RETRIEVAL=1,
+         AndesCode can also blend semantic candidates with graph neighbors
+         from imports, symbols, filename matches, references, and existing
+         source-of-truth chunks.
         ↓
 Token-aware packing keeps anchor/planned/neighbor files first and
 truncates lower-priority context when needed to stay under model limits
@@ -184,7 +191,7 @@ generate_diff_preview(old_text, new_text, file_path="src/example.py")
 - ChromaDB vector embeddings of your code
 - Every query and every response
 - Runtime logs in `~/Documents/AndesCode/` (`server.log`, `app.log`)
-- Project map, symbol index, and file hash cache
+- Project map, symbol index, optional code graph artifacts, and file hash cache
 
 ### Offline enforcement
 
@@ -295,9 +302,12 @@ HF_HUB_OFFLINE=1
 TOKENIZERS_PARALLELISM=false
 ANDESCODE_EXECUTION_MODE=LOCAL  # LOCAL (default) or REMOTE_INFERENCE
 ANDESCODE_REMOTE_SERVER_URL=http://127.0.0.1:8080  # used only in REMOTE_INFERENCE mode
+ANDESCODE_HYBRID_RETRIEVAL=0  # set to 1 to enable experimental graph-aware retrieval
 ```
 
 For large projects or architectural questions, increase `CONTEXT_CHUNKS` to 7–10. The retrieval pipeline automatically widens its candidate pool for broad queries — this setting controls how many final chunks land in the prompt.
+
+`ANDESCODE_HYBRID_RETRIEVAL` is disabled by default. Set it to `1` when testing complex multi-file questions that may benefit from local graph expansion. It uses only local graph artifacts stored in the existing index directory and does not change AndesCode's privacy behavior.
 
 ### Execution modes
 
@@ -348,7 +358,7 @@ See `docs/indexing-policy.md` for the exact indexing and skip policy.
 ## Roadmap
 
 - [ ] File watcher — automatic incremental re-index on save
-- [ ] AST-aware chunking — deeper boundary detection beyond regex
+- [ ] Full AST-aware chunking and richer tree-sitter extraction across languages — deeper boundary detection beyond regex
 - [ ] KVTC context compression — fit larger codebases in context
 - [ ] Private tunnel (Tailscale/WireGuard) for mobile access
 - [ ] iOS/Android chat client
@@ -398,6 +408,15 @@ Debug mode is off by default. You can enable it via:
 
 When enabled, AndesCode emits a deterministic debug payload with intent, source-of-truth selection, retrieval/ranking decisions, and failure signals. The web UI shows it in a collapsible panel.
 
+When graph-aware retrieval is enabled, debug payloads also include fields that show whether graph retrieval actually changed the selected context:
+- `retrieval_routes_used`: retrieval components that contributed candidates, such as semantic vector search, source-of-truth retrieval, exact symbol lookup, filename lookup, import neighbors, or reference neighbors.
+- `graph_neighbors_added`: graph-expanded files added beyond the semantic seed files.
+- `symbols_matched`: exact symbol matches found in `symbol_graph.json`.
+- `files_selected_by_graph`: files selected by symbol/import/reference/filename graph logic.
+- `files_selected_by_semantic`: files selected by semantic vector search before graph expansion.
+- `files_selected_by_authority`: source-of-truth files force-included for config/dependency/declaration questions.
+- `context_sufficiency_notes`: concise notes such as whether graph artifacts were missing, graph neighbors were added, or no high-confidence graph neighbors were found.
+
 For declaration/config/dependency questions, debug payloads now include authoritative retrieval guarantees:
 - `authoritative_files_detected`: authoritative paths found in workspace metadata.
 - `authoritative_files_required`: authoritative paths that must be retrieved for this query.
@@ -434,7 +453,7 @@ PRs welcome.
 Highest-value contributions right now:
 
 - Windows / Linux setup testing and documentation
-- AST-aware chunking (deeper than current regex-based boundary detection)
+- Full AST-aware chunking and richer tree-sitter extraction across languages (beyond PR #53's v1 graph-aware retrieval)
 - File watcher for automatic incremental re-indexing
 
 ## Test tiers and CI defaults

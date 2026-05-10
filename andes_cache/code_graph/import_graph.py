@@ -114,6 +114,8 @@ def _resolve_relative_path_import(import_name: str, source: str, module_map: dic
 
 def _module_map(files: list[Path], root: Path, registry: ParserRegistry) -> dict[str, str]:
     mapping: dict[str, str] = {}
+    basename_candidates: dict[str, set[str]] = defaultdict(set)
+
     for fp in files:
         rel = str(fp.relative_to(root))
         language = registry.language_for_path(fp)
@@ -123,7 +125,7 @@ def _module_map(files: list[Path], root: Path, registry: ParserRegistry) -> dict
         # edges unless an indexed file already maps to the candidate.
         mapping.setdefault(no_suffix, rel)
         mapping.setdefault(no_suffix.replace("/", "."), rel)
-        mapping.setdefault(Path(rel).stem, rel)
+        basename_candidates[Path(rel).stem].add(rel)
         if language in {"kt", "java"}:
             try:
                 text = fp.read_text(encoding="utf-8", errors="ignore")
@@ -132,4 +134,12 @@ def _module_map(files: list[Path], root: Path, registry: ParserRegistry) -> dict
             package = re.search(r"^\s*package\s+([A-Za-z0-9_.]+)", text, re.MULTILINE)
             if package:
                 mapping.setdefault(f"{package.group(1)}.{fp.stem}", rel)
+
+    # Basename-only imports are a useful fallback for small Python scripts, but
+    # they are unsafe when multiple files share the same basename.  In that case
+    # omit the ambiguous key so callers preserve the import as unresolved rather
+    # than creating a misleading edge to whichever file happened to appear first.
+    for basename, rels in basename_candidates.items():
+        if len(rels) == 1:
+            mapping.setdefault(basename, next(iter(rels)))
     return mapping
