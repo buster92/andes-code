@@ -123,6 +123,12 @@ def _regex_symbols(text: str, file_path: str, language: str) -> list[CodeSymbol]
 
     if language == "kt":
         pattern = re.compile(r"^\s*(?:public\s+|private\s+|internal\s+|protected\s+|open\s+|data\s+|sealed\s+)*(fun|class|object|interface|typealias)\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE)
+    elif language in {"js", "jsx", "ts", "tsx"}:
+        pattern = re.compile(
+            r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?"
+            r"(function|class|interface|type|const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)",
+            re.MULTILINE,
+        )
     else:
         pattern = re.compile(r"^\s*(def|class|async\s+def|function|interface|type|object|const)\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE)
 
@@ -151,7 +157,7 @@ def _normalize_kind(kind: str) -> str:
     if kind == "typealias":
         return "type"
     if kind not in _SYMBOL_KINDS:
-        return "constant" if kind == "const" else kind
+        return "constant" if kind in {"const", "let", "var"} else kind
     return kind
 
 

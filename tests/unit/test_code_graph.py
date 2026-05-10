@@ -306,3 +306,57 @@ def test_ambiguous_basename_import_does_not_create_edge(tmp_path: Path) -> None:
 
     assert graph["unresolved"]["src/app.ts"] == ["helper"]
     assert "src/app.ts" not in graph["adjacency"]
+
+
+def test_js_ts_exported_symbols_are_indexed_with_expected_kinds() -> None:
+    text = """
+export function helper() {}
+export class AuthService {}
+export const API_URL = "https://example.test"
+export default function createClient() {}
+export default class Client {}
+function localHelper() {}
+class LocalClient {}
+const LOCAL_TOKEN = "token"
+interface AuthPayload {}
+type AuthResult = { ok: boolean }
+"""
+
+    symbols = extract_symbols(text, "src/api.ts", "ts")
+
+    by_name = {symbol.name: symbol for symbol in symbols}
+    assert by_name["helper"].kind == "function"
+    assert by_name["AuthService"].kind == "class"
+    assert by_name["API_URL"].kind == "constant"
+    assert by_name["createClient"].kind == "function"
+    assert by_name["Client"].kind == "class"
+    assert by_name["localHelper"].kind == "function"
+    assert by_name["LocalClient"].kind == "class"
+    assert by_name["LOCAL_TOKEN"].kind == "constant"
+    assert by_name["AuthPayload"].kind == "interface"
+    assert by_name["AuthResult"].kind == "type"
+
+
+def test_hybrid_retrieve_matches_exported_symbol_from_symbol_graph() -> None:
+    symbol = extract_symbols('export function helper() { return 1 }\n', "src/helper.ts", "ts")[0]
+    symbol_graph = {
+        "by_name": {symbol.name: [symbol.to_dict()]},
+        "by_file": {symbol.file_path: [symbol.to_dict()]},
+    }
+
+    def fetch_file(path: str, limit: int) -> list[dict]:  # noqa: ARG001
+        return [{"file": path, "content": "export function helper() { return 1 }", "line": 1, "score": 0.0, "symbols": "helper"}]
+
+    chunks, debug = hybrid_retrieve(
+        query="Where is helper defined?",
+        semantic_candidates=[],
+        symbol_graph=symbol_graph,
+        import_graph={},
+        repo_graph_state={"files": {"src/helper.ts": {}}},
+        fetch_file=fetch_file,
+        n_results=3,
+    )
+
+    assert chunks[0]["file"] == "src/helper.ts"
+    assert debug["symbols_matched"][0]["name"] == "helper"
+    assert "exact_symbol" in debug["retrieval_routes_used"]

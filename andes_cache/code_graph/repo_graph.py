@@ -13,7 +13,7 @@ from .symbol_extractor import extract_symbols_for_file
 SYMBOL_GRAPH_FILE = "symbol_graph.json"
 IMPORT_GRAPH_FILE = "import_graph.json"
 REPO_GRAPH_STATE_FILE = "repo_graph_state.json"
-CODE_GRAPH_VERSION = "1"
+CODE_GRAPH_VERSION = "2"
 
 
 def build_repo_graph(root: Path, files: list[Path], index_dir: Path | None = None) -> RepoGraph:
