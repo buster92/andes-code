@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from andes_cache.code_graph.graph_ranker import hybrid_retrieve
-from andes_cache.code_graph.import_graph import build_import_graph, expand_import_neighbors
+from andes_cache.code_graph.import_graph import build_import_graph, expand_import_neighbors, extract_import_names
 from andes_cache.code_graph.parser_registry import ParserHandle, ParserRegistry
 from andes_cache.code_graph.repo_graph import CODE_GRAPH_VERSION, build_repo_graph, graph_artifacts_current, load_graph_artifacts
 from andes_cache.code_graph.symbol_extractor import extract_symbols
@@ -489,3 +489,54 @@ def test_python_from_nested_package_import_module_resolves(tmp_path: Path) -> No
     graph = build_import_graph([tmp_path / "app.py", nested / "helper.py"], tmp_path)
 
     assert graph["adjacency"]["app.py"] == ["pkg/sub/helper.py"]
+
+
+def test_python_comma_separated_imports_resolve_all_modules(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("import helper, utils\n", encoding="utf-8")
+    (tmp_path / "helper.py").write_text("def run(): pass\n", encoding="utf-8")
+    (tmp_path / "utils.py").write_text("def run(): pass\n", encoding="utf-8")
+
+    graph = build_import_graph([tmp_path / "app.py", tmp_path / "helper.py", tmp_path / "utils.py"], tmp_path)
+
+    assert graph["adjacency"]["app.py"] == ["helper.py", "utils.py"]
+
+
+def test_python_comma_separated_imports_strip_aliases() -> None:
+    imports = extract_import_names("import os, sys as system\nimport pkg.helper, pkg.utils as utils\n", "py")
+
+    assert imports == ["os", "pkg.helper", "pkg.utils", "sys"]
+    assert "system" not in imports
+    assert "utils" not in imports
+
+
+def test_js_ts_side_effect_import_resolves_extensionless_neighbor(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "app.ts").write_text('import "./setup"\n', encoding="utf-8")
+    (src / "setup.ts").write_text("export const ready = true\n", encoding="utf-8")
+
+    graph = build_import_graph([src / "app.ts", src / "setup.ts"], tmp_path)
+
+    assert graph["adjacency"]["src/app.ts"] == ["src/setup.ts"]
+
+
+def test_js_ts_side_effect_import_resolves_explicit_extension(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "app.ts").write_text('import "./setup.ts"\n', encoding="utf-8")
+    (src / "setup.ts").write_text("export const ready = true\n", encoding="utf-8")
+
+    graph = build_import_graph([src / "app.ts", src / "setup.ts"], tmp_path)
+
+    assert graph["adjacency"]["src/app.ts"] == ["src/setup.ts"]
+
+
+def test_js_ts_side_effect_import_resolves_parent_neighbor(tmp_path: Path) -> None:
+    app = tmp_path / "src" / "features"
+    app.mkdir(parents=True)
+    (app / "app.ts").write_text('import "../polyfills"\n', encoding="utf-8")
+    (tmp_path / "src" / "polyfills.ts").write_text("export {}\n", encoding="utf-8")
+
+    graph = build_import_graph([app / "app.ts", tmp_path / "src" / "polyfills.ts"], tmp_path)
+
+    assert graph["adjacency"]["src/features/app.ts"] == ["src/polyfills.ts"]

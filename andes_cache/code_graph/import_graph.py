@@ -21,6 +21,7 @@ def extract_import_names(text: str, language: str) -> list[str]:
     elif language in {"js", "jsx", "ts", "tsx"}:
         imports.update(re.findall(r"from\s+[\"']([^\"']+)[\"']", text))
         imports.update(re.findall(r"require\([\"']([^\"']+)[\"']\)", text))
+        imports.update(re.findall(r"^\s*import\s+(?!type\b)[\"']([^\"']+)[\"']", text, re.MULTILINE))
     elif language == "go":
         block = "\n".join(re.findall(r"import\s*\((.*?)\)", text, re.DOTALL))
         imports.update(re.findall(r'"([^"]+)"', block))
@@ -115,7 +116,8 @@ def _resolve_relative_path_import(import_name: str, source: str, module_map: dic
 
 def _extract_python_import_names(text: str) -> set[str]:
     imports: set[str] = set()
-    imports.update(re.findall(r"^\s*import\s+([A-Za-z0-9_\.]+)", text, re.MULTILINE))
+    for match in re.finditer(r"^\s*import\s+([^#\n]+)", text, re.MULTILINE):
+        imports.update(_python_imported_names(match.group(1)))
     for match in re.finditer(r"^\s*from\s+([A-Za-z0-9_\.]*|\.+[A-Za-z0-9_\.]*)\s+import\s+([^#\n]+)", text, re.MULTILINE):
         module = match.group(1).strip()
         imported_names = _python_imported_names(match.group(2))
