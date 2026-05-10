@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import posixpath
 import re
 from collections import defaultdict
 from pathlib import Path
 
 from .models import ImportEdge
 from .parser_registry import ParserRegistry
+
+_INDEX_BASENAMES = ("index",)
 
 
 def extract_import_names(text: str, language: str) -> list[str]:
@@ -79,6 +82,9 @@ def expand_import_neighbors(seed_files: list[str] | set[str], graph: dict, limit
 
 
 def resolve_import(import_name: str, source: str, module_map: dict[str, str]) -> str:
+    if import_name.startswith(("./", "../")):
+        return _resolve_relative_path_import(import_name, source, module_map)
+
     candidates = [import_name]
     if import_name.startswith("."):
         parent = Path(source).parent.as_posix().replace("/", ".")
@@ -93,14 +99,31 @@ def resolve_import(import_name: str, source: str, module_map: dict[str, str]) ->
     return ""
 
 
+def _resolve_relative_path_import(import_name: str, source: str, module_map: dict[str, str]) -> str:
+    source_dir = Path(source).parent.as_posix()
+    joined = posixpath.normpath(posixpath.join(source_dir, import_name))
+    if joined.startswith("../") or joined == "..":
+        return ""
+    candidates = [joined]
+    candidates.extend(f"{joined}/{basename}" for basename in _INDEX_BASENAMES)
+    for candidate in candidates:
+        if candidate in module_map:
+            return module_map[candidate]
+    return ""
+
+
 def _module_map(files: list[Path], root: Path, registry: ParserRegistry) -> dict[str, str]:
     mapping: dict[str, str] = {}
     for fp in files:
         rel = str(fp.relative_to(root))
         language = registry.language_for_path(fp)
         no_suffix = fp.relative_to(root).with_suffix("").as_posix()
-        mapping[no_suffix.replace("/", ".")] = rel
-        mapping[Path(rel).stem] = rel
+        # Slash-style keys support JS/TS relative imports; dotted keys support
+        # Python/JVM imports.  Keep exact keys deterministic and do not invent
+        # edges unless an indexed file already maps to the candidate.
+        mapping.setdefault(no_suffix, rel)
+        mapping.setdefault(no_suffix.replace("/", "."), rel)
+        mapping.setdefault(Path(rel).stem, rel)
         if language in {"kt", "java"}:
             try:
                 text = fp.read_text(encoding="utf-8", errors="ignore")
@@ -108,5 +131,5 @@ def _module_map(files: list[Path], root: Path, registry: ParserRegistry) -> dict
                 text = ""
             package = re.search(r"^\s*package\s+([A-Za-z0-9_.]+)", text, re.MULTILINE)
             if package:
-                mapping[f"{package.group(1)}.{fp.stem}"] = rel
+                mapping.setdefault(f"{package.group(1)}.{fp.stem}", rel)
     return mapping

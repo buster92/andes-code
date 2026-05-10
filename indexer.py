@@ -76,7 +76,9 @@ from andes_cache.debug import (
 )
 
 from andes_cache.code_graph.repo_graph import (
+    CODE_GRAPH_VERSION,
     build_repo_graph as build_code_repo_graph,
+    graph_artifacts_current,
     load_graph_artifacts,
     SYMBOL_GRAPH_FILE,
     IMPORT_GRAPH_FILE,
@@ -405,7 +407,7 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
     if not new_files and unchanged:
         # Nothing changed — still emit map event so UI can display it
         pmap = _load_project_map()
-        if not SYMBOL_GRAPH.exists() or not IMPORT_GRAPH.exists() or not REPO_GRAPH_STATE.exists():
+        if not _graph_artifacts_current():
             _build_and_save_code_graph(root_path, all_files)
         _save_hashes(next_hashes | {"__root__": str(root_path), "__fingerprint__": repo_fp})
         if removed_paths:
@@ -1138,6 +1140,13 @@ def _build_and_save_code_graph(root_path: Path, files: list[Path]) -> None:
         build_code_repo_graph(root_path, files, index_dir=Path(CHROMA_PATH))
     except Exception as e:
         logging.warning(f"Could not build code graph artifacts: {e}")
+
+
+def _graph_artifacts_current() -> bool:
+    try:
+        return graph_artifacts_current(Path(CHROMA_PATH), expected_version=CODE_GRAPH_VERSION)
+    except Exception:
+        return False
 
 
 def _load_code_graph_artifacts() -> dict:
@@ -2482,6 +2491,7 @@ def _build_current_index_state(root_path: Path, repo_fp: str) -> dict:
         "workspace_extraction_version": WORKSPACE_EXTRACTION_VERSION,
         "source_of_truth_version": SOURCE_OF_TRUTH_VERSION,
         "module_detection_version": MODULE_DETECTION_VERSION,
+        "code_graph_version": CODE_GRAPH_VERSION,
         "timestamps": {"evaluated_at": _utc_now_iso()},
     }
 
@@ -2511,6 +2521,7 @@ def evaluate_index_state(current_state: dict, stored_state: dict | None, repo_ch
         ("workspace_extraction_version", "Workspace extraction version changed; rebuilding workspace metadata"),
         ("source_of_truth_version", "Source-of-truth version changed; refreshing authoritative file map"),
         ("module_detection_version", "Module detection version changed; rebuilding workspace metadata"),
+        ("code_graph_version", "Code graph version changed; rebuilding graph artifacts"),
     )
     workspace_reasons = [
         reason

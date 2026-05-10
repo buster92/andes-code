@@ -36,6 +36,7 @@ def hybrid_retrieve(
     filename_files = set(match_filenames(query, repo_graph_state))
     import_seed_files = set(semantic_files[: max(n_results, 1)]) | filename_files
     seed_files = import_seed_files | symbol_files
+    graph_artifacts_available = _graph_artifacts_available(symbol_graph, import_graph, repo_graph_state)
     graph_neighbors = expand_import_neighbors(import_seed_files, import_graph, limit=max(n_results * 2, 8))
     reference_neighbors = expand_reference_neighbors(seed_files, symbols_matched, symbol_graph, repo_graph_state, limit=max(n_results, 5))
     graph_files = [f for f in sorted(symbol_files | filename_files | set(graph_neighbors) | set(reference_neighbors)) if f]
@@ -53,11 +54,13 @@ def hybrid_retrieve(
 
     combined = _dedupe_chunks([*authority_chunks, *semantic_candidates, *graph_chunks])
     notes = []
+    if not graph_artifacts_available:
+        notes.append("Graph artifacts missing or empty; hybrid retrieval could not expand neighbors.")
     if graph_chunks:
         notes.append(f"Graph retrieval added {len(_files_from_chunks(graph_chunks))} neighboring file(s).")
     if symbols_matched:
         notes.append(f"Matched symbol(s): {', '.join(sorted({s.get('name', '') for s in symbols_matched})[:8])}.")
-    if not notes:
+    if graph_artifacts_available and not graph_chunks and not symbols_matched:
         notes.append("Graph retrieval found no additional high-confidence neighbors.")
 
     routes = ["semantic_vector"]
@@ -148,3 +151,12 @@ def _dedupe_chunks(chunks: list[dict]) -> list[dict]:
         seen.add(key)
         out.append(chunk)
     return out
+
+
+def _graph_artifacts_available(symbol_graph: dict, import_graph: dict, repo_graph_state: dict) -> bool:
+    if not any(isinstance(obj, dict) and obj for obj in (symbol_graph, import_graph, repo_graph_state)):
+        return False
+    return bool(
+        (isinstance(symbol_graph, dict) and (symbol_graph.get("symbols") or symbol_graph.get("by_name")))
+        or (isinstance(import_graph, dict) and (import_graph.get("edges") or import_graph.get("adjacency")))
+    )

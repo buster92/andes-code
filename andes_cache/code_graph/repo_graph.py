@@ -13,6 +13,7 @@ from .symbol_extractor import extract_symbols_for_file
 SYMBOL_GRAPH_FILE = "symbol_graph.json"
 IMPORT_GRAPH_FILE = "import_graph.json"
 REPO_GRAPH_STATE_FILE = "repo_graph_state.json"
+CODE_GRAPH_VERSION = "1"
 
 
 def build_repo_graph(root: Path, files: list[Path], index_dir: Path | None = None) -> RepoGraph:
@@ -54,6 +55,7 @@ def persist_repo_graph(graph: RepoGraph, import_graph: dict, index_dir: Path, ro
     _write_json(index_dir / IMPORT_GRAPH_FILE, import_graph)
     _write_json(index_dir / REPO_GRAPH_STATE_FILE, {
         "repo_root": str(root),
+        "code_graph_version": CODE_GRAPH_VERSION,
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "symbol_count": len(graph.symbols),
         "import_edge_count": import_graph.get("edge_count", 0),
@@ -68,6 +70,13 @@ def load_graph_artifacts(index_dir: Path) -> dict[str, Any]:
         "import_graph": _read_json(index_dir / IMPORT_GRAPH_FILE, {}),
         "repo_graph_state": _read_json(index_dir / REPO_GRAPH_STATE_FILE, {}),
     }
+
+
+def graph_artifacts_current(index_dir: Path, expected_version: str = CODE_GRAPH_VERSION) -> bool:
+    state = _read_json(index_dir / REPO_GRAPH_STATE_FILE, {})
+    if not isinstance(state, dict) or state.get("code_graph_version") != expected_version:
+        return False
+    return (index_dir / SYMBOL_GRAPH_FILE).exists() and (index_dir / IMPORT_GRAPH_FILE).exists()
 
 
 def _reference_index(symbols) -> dict[str, list[str]]:

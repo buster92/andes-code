@@ -76,6 +76,12 @@ class TestIndexStateDecisions(unittest.TestCase):
         decision = self.indexer.evaluate_index_state(current, stored, repo_changed=True)
         self.assertEqual(decision["decision"], self.indexer.DECISION_INCREMENTAL_REINDEX)
 
+    def test_workspace_only_rebuild_when_code_graph_version_changes(self):
+        current = {"repo_root": "/repo", "index_version": "1", "parser_version": "1", "code_graph_version": "new"}
+        stored = {"repo_root": "/repo", "index_version": "1", "parser_version": "1", "code_graph_version": "old"}
+        decision = self.indexer.evaluate_index_state(current, stored, repo_changed=False)
+        self.assertEqual(decision["decision"], self.indexer.DECISION_REBUILD_WORKSPACE_ONLY)
+
     def test_reuse_all_when_nothing_changed(self):
         current = {"repo_root": "/repo", "index_version": "1", "parser_version": "1"}
         stored = {"repo_root": "/repo", "index_version": "1", "parser_version": "1"}
