@@ -1165,6 +1165,11 @@ def _initialize_hybrid_debug(default_route: str = "") -> dict:
         "files_selected_by_semantic": [],
         "files_selected_by_authority": [],
         "context_sufficiency_notes": [],
+        "graph_route_by_file": {},
+        "graph_score_by_file": {},
+        "graph_seed_files": [],
+        "graph_expansion_limits": {},
+        "graph_boosted_existing_files": [],
     }
 
 

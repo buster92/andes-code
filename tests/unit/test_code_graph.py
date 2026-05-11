@@ -6,7 +6,7 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
-from andes_cache.code_graph.graph_ranker import hybrid_retrieve
+from andes_cache.code_graph.graph_ranker import expand_import_neighbors_by_route, hybrid_retrieve
 from andes_cache.code_graph.import_graph import build_import_graph, expand_import_neighbors, extract_import_names
 from andes_cache.code_graph.parser_registry import ParserHandle, ParserRegistry
 from andes_cache.code_graph.repo_graph import CODE_GRAPH_VERSION, build_repo_graph, graph_artifacts_current, load_graph_artifacts
@@ -100,6 +100,91 @@ def test_hybrid_retrieval_includes_graph_neighbor_files() -> None:
     assert any(chunk["file"] == "services/auth.py" for chunk in chunks)
     assert "services/auth.py" in debug["files_selected_by_graph"]
     assert "import_neighbors" in debug["retrieval_routes_used"]
+
+
+def test_import_neighbor_expansion_skips_seed_to_seed_edges_for_limit() -> None:
+    import_graph = {
+        "adjacency": {
+            "app.py": ["services/auth.py"],
+            "services/auth.py": ["stores/token_store.py"],
+        },
+        "reverse_adjacency": {
+            "services/auth.py": ["app.py"],
+            "stores/token_store.py": ["services/auth.py"],
+        },
+    }
+
+    direct, reverse = expand_import_neighbors_by_route(
+        {"app.py", "services/auth.py"},
+        import_graph,
+        limit=1,
+    )
+
+    assert direct == ["stores/token_store.py"]
+    assert reverse == []
+
+
+def test_import_neighbor_expansion_dedupes_across_direct_and_reverse_routes() -> None:
+    import_graph = {
+        "adjacency": {
+            "x.py": ["a.py"],
+            "b.py": ["x.py", "y.py"],
+        },
+        "reverse_adjacency": {
+            "a.py": ["x.py"],
+            "x.py": ["b.py"],
+            "y.py": ["b.py"],
+        },
+    }
+
+    direct, reverse = expand_import_neighbors_by_route(
+        {"a.py", "b.py"},
+        import_graph,
+        limit=2,
+    )
+
+    assert direct == ["x.py", "y.py"]
+    assert reverse == []
+    assert direct.count("x.py") + reverse.count("x.py") == 1
+
+
+def test_hybrid_import_expansion_does_not_count_seed_to_seed_edges_against_limit() -> None:
+    semantic = [
+        {"file": "app.py", "content": "from services.auth import AuthService", "line": 1, "score": 0.2, "symbols": ""},
+        {"file": "services/auth.py", "content": "from stores.token_store import TokenStore", "line": 1, "score": 0.3, "symbols": "AuthService"},
+    ]
+    import_graph = {
+        "adjacency": {
+            "app.py": ["services/auth.py"],
+            "services/auth.py": ["stores/token_store.py"],
+        },
+        "reverse_adjacency": {
+            "services/auth.py": ["app.py"],
+            "stores/token_store.py": ["services/auth.py"],
+        },
+    }
+    fetched: list[str] = []
+
+    def fetch_file(path: str, limit: int) -> list[dict]:  # noqa: ARG001
+        fetched.append(path)
+        return [{"file": path, "content": "class TokenStore: pass", "line": 1, "score": 0.0, "symbols": "TokenStore"}]
+
+    chunks, debug = hybrid_retrieve(
+        query="Explain auth token storage",
+        semantic_candidates=semantic,
+        symbol_graph={},
+        import_graph=import_graph,
+        repo_graph_state={"files": {"app.py": {}, "services/auth.py": {}, "stores/token_store.py": {}}},
+        fetch_file=fetch_file,
+        n_results=2,
+    )
+
+    assert fetched == ["stores/token_store.py"]
+    assert [chunk["file"] for chunk in chunks].count("services/auth.py") == 1
+    token_chunk = next(chunk for chunk in chunks if chunk["file"] == "stores/token_store.py")
+    assert token_chunk["_graph_route"] == "direct_import_neighbor"
+    assert debug["graph_route_by_file"]["stores/token_store.py"] == "direct_import_neighbor"
+    assert "services/auth.py" not in debug["graph_neighbors_added"]
 
 
 def test_symbol_extraction_fallback_when_tree_sitter_unavailable() -> None:
@@ -380,8 +465,269 @@ def test_graph_only_chunks_get_non_perfect_score() -> None:
     )
 
     graph_chunk = next(chunk for chunk in chunks if chunk["file"] == "src/helper.py")
-    assert graph_chunk["score"] == 0.35
+    assert graph_chunk["score"] == 0.30
     assert graph_chunk["_graph_selected"] is True
+    assert graph_chunk["_graph_route"] == "direct_import_neighbor"
+
+
+def test_exact_symbol_match_expands_direct_imports() -> None:
+    symbol_graph = {
+        "by_name": {"AuthService": [{"name": "AuthService", "file_path": "services/auth.py", "references": []}]},
+        "by_file": {"services/auth.py": [{"name": "AuthService", "file_path": "services/auth.py", "references": []}]},
+    }
+    import_graph = {
+        "adjacency": {"services/auth.py": ["stores/token_store.py"]},
+        "reverse_adjacency": {"stores/token_store.py": ["services/auth.py"]},
+    }
+
+    def fetch_file(path: str, limit: int) -> list[dict]:  # noqa: ARG001
+        return [{"file": path, "content": f"content for {path}", "line": 1, "score": 0.0, "symbols": ""}]
+
+    chunks, debug = hybrid_retrieve(
+        query="How does AuthService persist tokens?",
+        semantic_candidates=[],
+        symbol_graph=symbol_graph,
+        import_graph=import_graph,
+        repo_graph_state={"files": {"services/auth.py": {}, "stores/token_store.py": {}}},
+        fetch_file=fetch_file,
+        n_results=3,
+    )
+
+    files = [chunk["file"] for chunk in chunks]
+    assert "services/auth.py" in files
+    assert "stores/token_store.py" in files
+    assert debug["graph_route_by_file"]["services/auth.py"] == "exact_symbol"
+    assert debug["graph_route_by_file"]["stores/token_store.py"] == "direct_import_neighbor"
+    assert "services/auth.py" in debug["graph_seed_files"]
+
+
+def test_graph_route_scoring_ranks_exact_import_then_reference() -> None:
+    symbol_graph = {
+        "by_name": {"AuthService": [{"name": "AuthService", "file_path": "services/auth.py", "references": []}]},
+        "by_file": {
+            "services/auth.py": [{"name": "AuthService", "file_path": "services/auth.py", "references": []}],
+            "controllers/login.py": [{"name": "LoginController", "file_path": "controllers/login.py", "references": ["AuthService"]}],
+        },
+    }
+    import_graph = {
+        "adjacency": {"services/auth.py": ["stores/token_store.py"]},
+        "reverse_adjacency": {"stores/token_store.py": ["services/auth.py"]},
+    }
+
+    def fetch_file(path: str, limit: int) -> list[dict]:  # noqa: ARG001
+        return [{"file": path, "content": path, "line": 1, "score": 0.0, "symbols": ""}]
+
+    chunks, debug = hybrid_retrieve(
+        query="Explain AuthService",
+        semantic_candidates=[],
+        symbol_graph=symbol_graph,
+        import_graph=import_graph,
+        repo_graph_state={"files": {"services/auth.py": {}, "stores/token_store.py": {}, "controllers/login.py": {}}},
+        fetch_file=fetch_file,
+        n_results=5,
+    )
+
+    graph_chunks = [chunk for chunk in chunks if chunk.get("_graph_selected")]
+    assert [chunk["file"] for chunk in graph_chunks] == [
+        "services/auth.py",
+        "stores/token_store.py",
+        "controllers/login.py",
+    ]
+    assert [chunk["score"] for chunk in graph_chunks] == [0.10, 0.30, 0.55]
+    assert debug["graph_route_by_file"]["controllers/login.py"] == "reference_neighbor"
+
+
+def test_duplicate_graph_and_semantic_files_are_not_fetched_twice() -> None:
+    semantic = [{"file": "services/auth.py", "content": "class AuthService: pass", "line": 1, "score": 0.2, "symbols": "AuthService"}]
+    symbol_graph = {
+        "by_name": {"AuthService": [{"name": "AuthService", "file_path": "services/auth.py", "references": []}]},
+        "by_file": {"services/auth.py": [{"name": "AuthService", "file_path": "services/auth.py", "references": []}]},
+    }
+    import_graph = {
+        "adjacency": {"services/auth.py": ["stores/token_store.py"]},
+        "reverse_adjacency": {"stores/token_store.py": ["services/auth.py"]},
+    }
+    fetched: list[str] = []
+
+    def fetch_file(path: str, limit: int) -> list[dict]:  # noqa: ARG001
+        fetched.append(path)
+        return [{"file": path, "content": path, "line": 1, "score": 0.0, "symbols": ""}]
+
+    chunks, debug = hybrid_retrieve(
+        query="Explain AuthService",
+        semantic_candidates=semantic,
+        symbol_graph=symbol_graph,
+        import_graph=import_graph,
+        repo_graph_state={"files": {"services/auth.py": {}, "stores/token_store.py": {}}},
+        fetch_file=fetch_file,
+        n_results=5,
+    )
+
+    assert fetched == ["stores/token_store.py"]
+    assert [chunk["file"] for chunk in chunks].count("services/auth.py") == 1
+    assert "services/auth.py" in debug["files_selected_by_graph"]
+    assert "services/auth.py" in debug["graph_boosted_existing_files"]
+
+
+def test_existing_semantic_file_receives_exact_symbol_boost_without_refetch() -> None:
+    semantic = [{"file": "services/auth.py", "content": "class AuthService: pass", "line": 1, "score": 0.62, "symbols": "AuthService"}]
+    symbol_graph = {
+        "by_name": {"AuthService": [{"name": "AuthService", "file_path": "services/auth.py", "references": []}]},
+        "by_file": {"services/auth.py": [{"name": "AuthService", "file_path": "services/auth.py", "references": []}]},
+    }
+    fetched: list[str] = []
+
+    def fetch_file(path: str, limit: int) -> list[dict]:  # noqa: ARG001
+        fetched.append(path)
+        return [{"file": path, "content": path, "line": 1, "score": 0.0, "symbols": ""}]
+
+    chunks, debug = hybrid_retrieve(
+        query="Explain AuthService",
+        semantic_candidates=semantic,
+        symbol_graph=symbol_graph,
+        import_graph={},
+        repo_graph_state={"files": {"services/auth.py": {}}},
+        fetch_file=fetch_file,
+        n_results=5,
+    )
+
+    auth_chunks = [chunk for chunk in chunks if chunk["file"] == "services/auth.py"]
+    assert fetched == []
+    assert len(auth_chunks) == 1
+    assert auth_chunks[0]["score"] == 0.10
+    assert auth_chunks[0]["_graph_selected"] is True
+    assert auth_chunks[0]["_graph_route"] == "exact_symbol"
+    assert debug["graph_route_by_file"]["services/auth.py"] == "exact_symbol"
+    assert debug["graph_boosted_existing_files"] == ["services/auth.py"]
+
+
+def test_existing_semantic_file_receives_direct_import_boost_when_applicable() -> None:
+    semantic = [
+        {"file": "app.py", "content": "import token store", "line": 1, "score": 0.2, "symbols": ""},
+        {"file": "stores/token_store.py", "content": "class TokenStore: pass", "line": 1, "score": 0.62, "symbols": "TokenStore"},
+    ]
+    import_graph = {
+        "adjacency": {"app.py": ["stores/token_store.py"]},
+        "reverse_adjacency": {"stores/token_store.py": ["app.py"]},
+    }
+    fetched: list[str] = []
+
+    def fetch_file(path: str, limit: int) -> list[dict]:  # noqa: ARG001
+        fetched.append(path)
+        return [{"file": path, "content": path, "line": 1, "score": 0.0, "symbols": ""}]
+
+    chunks, debug = hybrid_retrieve(
+        query="Explain token persistence",
+        semantic_candidates=semantic,
+        symbol_graph={},
+        import_graph=import_graph,
+        repo_graph_state={"files": {"app.py": {}, "stores/token_store.py": {}}},
+        fetch_file=fetch_file,
+        n_results=5,
+    )
+
+    token_chunk = next(chunk for chunk in chunks if chunk["file"] == "stores/token_store.py")
+    assert fetched == []
+    assert token_chunk["score"] == 0.30
+    assert token_chunk["_graph_route"] == "direct_import_neighbor"
+    assert debug["graph_route_by_file"]["stores/token_store.py"] == "direct_import_neighbor"
+    assert "stores/token_store.py" in debug["graph_boosted_existing_files"]
+
+
+def test_graph_only_neighbor_still_fetched_when_existing_files_are_boosted() -> None:
+    semantic = [{"file": "services/auth.py", "content": "class AuthService: pass", "line": 1, "score": 0.62, "symbols": "AuthService"}]
+    symbol_graph = {
+        "by_name": {"AuthService": [{"name": "AuthService", "file_path": "services/auth.py", "references": []}]},
+        "by_file": {"services/auth.py": [{"name": "AuthService", "file_path": "services/auth.py", "references": []}]},
+    }
+    import_graph = {
+        "adjacency": {"services/auth.py": ["stores/token_store.py"]},
+        "reverse_adjacency": {"stores/token_store.py": ["services/auth.py"]},
+    }
+    fetched: list[str] = []
+
+    def fetch_file(path: str, limit: int) -> list[dict]:  # noqa: ARG001
+        fetched.append(path)
+        return [{"file": path, "content": path, "line": 1, "score": 0.0, "symbols": ""}]
+
+    chunks, debug = hybrid_retrieve(
+        query="Explain AuthService token storage",
+        semantic_candidates=semantic,
+        symbol_graph=symbol_graph,
+        import_graph=import_graph,
+        repo_graph_state={"files": {"services/auth.py": {}, "stores/token_store.py": {}}},
+        fetch_file=fetch_file,
+        n_results=5,
+    )
+
+    assert fetched == ["stores/token_store.py"]
+    assert [chunk["file"] for chunk in chunks].count("services/auth.py") == 1
+    token_chunk = next(chunk for chunk in chunks if chunk["file"] == "stores/token_store.py")
+    assert token_chunk["score"] == 0.30
+    assert token_chunk["_graph_route"] == "direct_import_neighbor"
+    assert debug["graph_boosted_existing_files"] == ["services/auth.py"]
+
+
+def test_reference_neighbors_are_capped() -> None:
+    symbol_graph = {
+        "by_name": {"AuthService": [{"name": "AuthService", "file_path": "services/auth.py", "references": []}]},
+        "by_file": {"services/auth.py": [{"name": "AuthService", "file_path": "services/auth.py", "references": []}]},
+    }
+    for idx in range(5):
+        path = f"controllers/ref_{idx}.py"
+        symbol_graph["by_file"][path] = [{"name": f"Ref{idx}", "file_path": path, "references": ["AuthService"]}]
+
+    def fetch_file(path: str, limit: int) -> list[dict]:  # noqa: ARG001
+        return [{"file": path, "content": path, "line": 1, "score": 0.0, "symbols": ""}]
+
+    _chunks, debug = hybrid_retrieve(
+        query="Explain AuthService callers",
+        semantic_candidates=[],
+        symbol_graph=symbol_graph,
+        import_graph={},
+        repo_graph_state={"files": {path: {} for path in symbol_graph["by_file"]}},
+        fetch_file=fetch_file,
+        n_results=10,
+    )
+
+    reference_files = [
+        file_path
+        for file_path, route in debug["graph_route_by_file"].items()
+        if route == "reference_neighbor"
+    ]
+    assert len(reference_files) == 3
+    assert debug["graph_expansion_limits"]["reference_neighbors"] == 3
+    assert any("Reference-neighbor expansion" in note for note in debug["context_sufficiency_notes"])
+
+
+def test_debug_payload_includes_graph_routes_scores_and_seed_files() -> None:
+    semantic = [{"file": "app.py", "content": "AuthService()", "line": 1, "score": 0.2, "symbols": ""}]
+    symbol_graph = {
+        "by_name": {"AuthService": [{"name": "AuthService", "file_path": "services/auth.py", "references": []}]},
+        "by_file": {"services/auth.py": [{"name": "AuthService", "file_path": "services/auth.py", "references": []}]},
+    }
+    import_graph = {
+        "adjacency": {"services/auth.py": ["stores/token_store.py"]},
+        "reverse_adjacency": {"stores/token_store.py": ["services/auth.py"]},
+    }
+
+    def fetch_file(path: str, limit: int) -> list[dict]:  # noqa: ARG001
+        return [{"file": path, "content": path, "line": 1, "score": 0.0, "symbols": ""}]
+
+    _chunks, debug = hybrid_retrieve(
+        query="Explain AuthService",
+        semantic_candidates=semantic,
+        symbol_graph=symbol_graph,
+        import_graph=import_graph,
+        repo_graph_state={"files": {"app.py": {}, "services/auth.py": {}, "stores/token_store.py": {}}},
+        fetch_file=fetch_file,
+        n_results=5,
+    )
+
+    assert debug["graph_route_by_file"]["services/auth.py"] == "exact_symbol"
+    assert debug["graph_score_by_file"]["services/auth.py"] == 0.10
+    assert debug["graph_seed_files"] == ["app.py", "services/auth.py"]
+    assert debug["graph_expansion_limits"]["import_neighbors"] == 10
 
 
 def test_js_ts_explicit_extension_relative_imports_resolve(tmp_path: Path) -> None:
