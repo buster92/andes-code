@@ -124,6 +124,30 @@ def test_import_neighbor_expansion_skips_seed_to_seed_edges_for_limit() -> None:
     assert reverse == []
 
 
+def test_import_neighbor_expansion_dedupes_across_direct_and_reverse_routes() -> None:
+    import_graph = {
+        "adjacency": {
+            "x.py": ["a.py"],
+            "b.py": ["x.py", "y.py"],
+        },
+        "reverse_adjacency": {
+            "a.py": ["x.py"],
+            "x.py": ["b.py"],
+            "y.py": ["b.py"],
+        },
+    }
+
+    direct, reverse = expand_import_neighbors_by_route(
+        {"a.py", "b.py"},
+        import_graph,
+        limit=2,
+    )
+
+    assert direct == ["x.py", "y.py"]
+    assert reverse == []
+    assert direct.count("x.py") + reverse.count("x.py") == 1
+
+
 def test_hybrid_import_expansion_does_not_count_seed_to_seed_edges_against_limit() -> None:
     semantic = [
         {"file": "app.py", "content": "from services.auth import AuthService", "line": 1, "score": 0.2, "symbols": ""},

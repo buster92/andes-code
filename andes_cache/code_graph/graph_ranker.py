@@ -214,20 +214,23 @@ def expand_import_neighbors_by_route(seed_files: set[str], graph: dict, limit: i
     seed_set = set(seed_files)
     direct: list[str] = []
     reverse_neighbors: list[str] = []
-    seen_direct: set[str] = set(seed_set)
-    seen_reverse: set[str] = set(seed_set)
+    seen_neighbors: set[str] = set(seed_set)
+
+    # Prefer direct-import routes globally when a file is reachable through both
+    # directions, and make every selected neighbor consume capacity at most once.
     for seed in sorted(seed_set):
         for neighbor in adjacency.get(seed, []) or []:
-            if neighbor in seen_direct:
+            if neighbor in seen_neighbors:
                 continue
-            seen_direct.add(neighbor)
+            seen_neighbors.add(neighbor)
             direct.append(neighbor)
             if len(direct) + len(reverse_neighbors) >= limit:
                 return direct, reverse_neighbors
+    for seed in sorted(seed_set):
         for neighbor in reverse.get(seed, []) or []:
-            if neighbor in seen_direct or neighbor in seen_reverse:
+            if neighbor in seen_neighbors:
                 continue
-            seen_reverse.add(neighbor)
+            seen_neighbors.add(neighbor)
             reverse_neighbors.append(neighbor)
             if len(direct) + len(reverse_neighbors) >= limit:
                 return direct, reverse_neighbors
