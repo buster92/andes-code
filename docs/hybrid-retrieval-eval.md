@@ -47,6 +47,8 @@ The eval writes reports to `tests/eval/reports/` by default:
 
 The eval does not require a loaded LLM. It writes a fresh golden fixture, indexes it, runs the same retrieval cases with `ANDESCODE_HYBRID_RETRIEVAL=0`, then runs the same cases with `ANDESCODE_HYBRID_RETRIEVAL=1`. Each case uses the same query, `n_results`, fixture, and expected files in both modes.
 
+> **Index warning:** The eval indexes temporary golden fixtures using the normal AndesCode index location. Running it may replace your currently active indexed project. Re-index your real project after the eval before returning to normal use.
+
 ## How to read the report
 
 The JSON and Markdown reports include one row per query/test id with:

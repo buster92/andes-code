@@ -165,6 +165,8 @@ def _run_search(case: RetrievalCase, hybrid_enabled: bool) -> dict[str, Any]:
         "debug": {
             "retrieval_routes_used": retrieval_debug.get("retrieval_routes_used", []),
             "graph_route_by_file": retrieval_debug.get("graph_route_by_file", {}),
+            "graph_score_by_file": retrieval_debug.get("graph_score_by_file", {}),
+            "graph_expansion_limits": retrieval_debug.get("graph_expansion_limits", {}),
             "graph_seed_files": retrieval_debug.get("graph_seed_files", []),
             "context_sufficiency_notes": retrieval_debug.get("context_sufficiency_notes", []),
             "graph_neighbors_added": retrieval_debug.get("graph_neighbors_added", []),
@@ -209,6 +211,8 @@ def _case_report(case: RetrievalCase) -> dict[str, Any]:
         "classification": _classification(baseline["pass"], hybrid["pass"]),
         "graph_routes_used": hybrid["debug"].get("retrieval_routes_used", []),
         "graph_route_by_file": hybrid["debug"].get("graph_route_by_file", {}),
+        "graph_score_by_file": hybrid["debug"].get("graph_score_by_file", {}),
+        "graph_expansion_limits": hybrid["debug"].get("graph_expansion_limits", {}),
         "graph_seed_files": hybrid["debug"].get("graph_seed_files", []),
         "graph_neighbors_added": hybrid["debug"].get("graph_neighbors_added", []),
         "graph_boosted_existing_files": hybrid["debug"].get("graph_boosted_existing_files", []),
@@ -247,6 +251,12 @@ def _md_list(values: list[Any]) -> str:
     if not values:
         return "_(none)_"
     return "<br>".join(f"`{value}`" for value in values)
+
+
+def _md_mapping(mapping: dict[str, Any]) -> list[str]:
+    if not mapping:
+        return ["  - _(none)_"]
+    return [f"  - `{key}` → `{value}`" for key, value in sorted(mapping.items())]
 
 
 def _write_markdown(report: dict[str, Any], path: Path) -> None:
@@ -306,11 +316,9 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
                 "- Graph route by file:",
             ]
         )
-        if case["graph_route_by_file"]:
-            for file_path, route in sorted(case["graph_route_by_file"].items()):
-                lines.append(f"  - `{file_path}` → `{route}`")
-        else:
-            lines.append("  - _(none)_")
+        lines.extend(_md_mapping(case["graph_route_by_file"]))
+        lines.append("- Graph score by file:")
+        lines.extend(_md_mapping(case["graph_score_by_file"]))
         lines.append("- Context sufficiency notes:")
         for note in case["context_sufficiency_notes"]:
             lines.append(f"  - {note}")
