@@ -241,7 +241,7 @@ def index_codebase(root: str) -> dict:
     return result
 
 
-def index_codebase_stream(root: str) -> Generator[dict, None, None]:
+def index_codebase_stream(root: str, force_refresh: bool = False) -> Generator[dict, None, None]:
     """
     Index a codebase with incremental support. Yields SSE progress events.
     On completion builds project map + symbol index for smart retrieval.
@@ -298,6 +298,11 @@ def index_codebase_stream(root: str) -> Generator[dict, None, None]:
     current_state = _build_current_index_state(root_path, repo_fp)
     stored_state = _load_index_state()
     decision = evaluate_index_state(current_state, stored_state, repo_changed=repo_changed)
+    if force_refresh:
+        decision = {
+            "decision": DECISION_FULL_REBUILD,
+            "reasons": ["Forced reindex requested; rebuilding vectors and graph artifacts"],
+        }
     if removed_paths and decision["decision"] != DECISION_FULL_REBUILD:
         decision = {
             "decision": DECISION_FULL_REBUILD,

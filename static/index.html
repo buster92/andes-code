@@ -67,6 +67,15 @@
   .sidebar-header {
     padding: 24px 20px 20px;
     border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .sidebar-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
   }
 
   .logo {
@@ -320,6 +329,7 @@
     border: 1px solid var(--border);
   }
   .btn-ghost:hover { border-color: var(--border2); color: var(--text); }
+  .btn-ghost:disabled, .icon-btn:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
 
   .index-status {
     font-size: 11px;
@@ -398,6 +408,7 @@
   .sidebar-footer {
     padding: 12px 20px;
     border-top: 1px solid var(--border);
+    flex-shrink: 0;
   }
 
   .model-badge {
@@ -1047,6 +1058,7 @@
       </div>
     </div>
 
+    <div class="sidebar-scroll" id="sidebarScroll">
     <!-- Index section -->
     <div class="sidebar-section">
       <div class="section-label" style="display:flex;justify-content:space-between;align-items:center;">Index Codebase<span style="font-size:9px;color:var(--success);font-family:var(--font-mono);">isolated</span></div>
@@ -1071,7 +1083,7 @@
             data-lpignore="true"
             data-1p-ignore="true"
           />
-          <button class="icon-btn pick-btn" onclick="pickFolder()" title="Browse folder">
+          <button class="icon-btn pick-btn" id="pickFolderBtn" onclick="pickFolder()" title="Browse folder">
             📁
           </button>
         </div>
@@ -1092,8 +1104,11 @@
         <div id="currentProject" style="display:none;margin-top:4px;">
           <div style="display:flex;align-items:center;justify-content:space-between;padding:7px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);">
             <span style="font-family:var(--font-mono);font-size:11px;color:var(--success);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" id="projectName"></span>
-            <button onclick="clearIndex()" style="font-family:var(--font-mono);font-size:10px;color:var(--text-dim);background:transparent;border:none;cursor:pointer;padding:0 0 0 8px;white-space:nowrap;" title="Clear index">✕ clear</button>
+            <button id="clearIndexBtn" onclick="clearIndex()" style="font-family:var(--font-mono);font-size:10px;color:var(--text-dim);background:transparent;border:none;cursor:pointer;padding:0 0 0 8px;white-space:nowrap;" title="Clear index">✕ clear</button>
           </div>
+          <button class="btn btn-ghost" id="reindexBtn" onclick="reindexCodebase()" style="width:100%;margin-top:8px;">
+            <span>↻</span> Reindex Project
+          </button>
         </div>
 
         <!-- Project intelligence panel — shown after indexing -->
@@ -1135,6 +1150,7 @@
       </div>
     </div>
     <div class="history-list" id="historyList"></div>
+    </div>
 
     <!-- Footer -->
     <div class="sidebar-footer">
@@ -1216,6 +1232,9 @@ let debugMode = false;
 let envDebugMode = false;
 let manualDebugMode = false;
 let pendingRestore = false;
+let isIndexing = false;
+let currentProjectPath = "";
+let conversationCreatedAt = new Date().toISOString();
 
 // ── Init ─────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {
@@ -1252,6 +1271,41 @@ function syncDebugToggleState() {
   }
 }
 
+
+function clearRestorePrompt() {
+  pendingRestore = false;
+  const statusEl = document.getElementById('indexStatus');
+  if (statusEl && statusEl.querySelector('button')) {
+    statusEl.textContent = '';
+    statusEl.className = 'index-status';
+  }
+}
+
+function setIndexingState(active, labelText = 'Indexing...') {
+  isIndexing = !!active;
+  const indexBtn = document.getElementById('indexBtn');
+  const reindexBtn = document.getElementById('reindexBtn');
+  const pathInput = document.getElementById('indexPath');
+  const pickBtn = document.getElementById('pickFolderBtn');
+  const clearBtn = document.getElementById('clearIndexBtn');
+  const chatInput = document.getElementById('chatInput');
+  const sendBtn = document.getElementById('sendBtn');
+  const intel = document.getElementById('projectIntel');
+
+  [pathInput, pickBtn, clearBtn, indexBtn, reindexBtn].forEach(el => { if (el) el.disabled = isIndexing; });
+  if (indexBtn) indexBtn.innerHTML = isIndexing ? `<span class="spinner"></span> ${labelText}` : '<span>⚡</span> Index Project';
+  if (reindexBtn) reindexBtn.innerHTML = isIndexing ? '<span class="spinner"></span> Reindexing...' : '<span>↻</span> Reindex Project';
+  if (chatInput) {
+    chatInput.disabled = isIndexing || !hasIndexed;
+    chatInput.placeholder = isIndexing ? 'Indexing in progress...' : (hasIndexed ? 'Ask anything about your codebase...' : 'Index a project first ⬆');
+  }
+  if (sendBtn) sendBtn.disabled = isIndexing || !hasIndexed;
+  if (active) {
+    clearRestorePrompt();
+    if (intel) intel.classList.remove('visible');
+  }
+}
+
 // ── Server status ─────────────────────────────────────────────────────────
 async function checkStatus() {
   const dot  = document.getElementById('statusDot');
@@ -1268,16 +1322,30 @@ async function checkStatus() {
     const active = !!d.active_index_session;
     const hasPersisted = !!d.has_persisted_index;
     const restoreNeeded = !!d.restored_requires_confirmation;
+    const auto = d.auto_index || {};
+    const serverIndexing = isIndexing || !!auto.auto_index_in_progress;
+    if (serverIndexing) clearRestorePrompt();
     if (count > 0) {
       text.textContent = `online · ${count} chunks · local only`;
       document.getElementById('statIndexed').textContent = active ? '✓' : 'pending';
       if (active) {
         hasIndexed = true;
-        unlockChat();
+        if (d.indexed_root) {
+          currentProjectPath = d.indexed_root;
+          const input = document.getElementById('indexPath');
+          if (input && !input.value.trim()) input.value = d.indexed_root;
+          const proj = document.getElementById('currentProject');
+          const nameEl = document.getElementById('projectName');
+          const projectName = d.project_map?.project || d.indexed_root.split(/[\\/]/).filter(Boolean).pop() || 'project';
+          if (nameEl) nameEl.textContent = `📁 ${projectName} · indexed`;
+          if (proj) proj.style.display = 'block';
+          if (d.project_map) _renderProjectMap(d.project_map);
+        }
+        if (!serverIndexing) unlockChat();
       } else {
         hasIndexed = false;
       }
-      if (hasPersisted && restoreNeeded && !pendingRestore) {
+      if (hasPersisted && restoreNeeded && !pendingRestore && !serverIndexing) {
         const projectName = d.project_map?.project || 'project';
         const statusEl = document.getElementById('indexStatus');
         statusEl.textContent = '';
@@ -1296,7 +1364,6 @@ async function checkStatus() {
       text.textContent = 'online · not indexed';
     }
 
-    const auto = d.auto_index || {};
     const autoLine = document.getElementById('autoIndexStatus');
     if (autoLine) {
       const rootName = (auto.indexed_root || '').split('/').filter(Boolean).pop();
@@ -1372,6 +1439,7 @@ function unlockChat(autoFocus = false) {
 
 // ── Indexing ──────────────────────────────────────────────────────────────────
 async function pickFolder() {
+  if (isIndexing) return;
   const status = document.getElementById('indexStatus');
   const input  = document.getElementById('indexPath');
 
@@ -1388,6 +1456,7 @@ async function pickFolder() {
                   || folderPath.split('\\').filter(Boolean).pop()
                   || folderPath;
         input.value        = folderPath;
+        currentProjectPath = folderPath;
         status.textContent = `✓ ${name} — click Index Project`;
         status.className   = 'index-status success';
       } else {
@@ -1423,6 +1492,7 @@ async function pickFolder() {
       parts.pop();
       const dirPath = parts.join(sep);
       input.value        = dirPath;
+      currentProjectPath = dirPath;
       status.textContent = `✓ ${parts[parts.length - 1]} — click Index Project`;
       status.className   = 'index-status success';
     } else {
@@ -1440,7 +1510,7 @@ async function pickFolder() {
   picker.click();
 }
 
-async function indexCodebase() {
+async function indexCodebase(forceRefresh = false) {
   const pathVal = document.getElementById('indexPath').value.trim();
   const btn     = document.getElementById('indexBtn');
   const status  = document.getElementById('indexStatus');
@@ -1455,8 +1525,7 @@ async function indexCodebase() {
     return;
   }
 
-  btn.disabled      = true;
-  btn.innerHTML     = '<span class="spinner"></span> Indexing...';
+  setIndexingState(true, forceRefresh ? 'Reindexing...' : 'Indexing...');
   status.textContent = '';
   status.className  = 'index-status';
   wrap.classList.add('visible');
@@ -1474,7 +1543,7 @@ async function indexCodebase() {
     const resp = await fetch(`${API}/v1/index`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ path: pathVal }),
+      body:    JSON.stringify({ path: pathVal, force_refresh: !!forceRefresh }),
     });
 
     if (!resp.ok) throw new Error(`Server error ${resp.status}`);
@@ -1527,6 +1596,7 @@ async function indexCodebase() {
             setProgress(100, doneMsg);
             indexedFiles = e.indexed;
             hasIndexed   = true;
+            currentProjectPath = pathVal;
             document.getElementById('statIndexed').textContent = e.indexed;
             document.getElementById('chatInput').placeholder   = 'Ask anything about your codebase...';
             status.textContent = '';
@@ -1565,8 +1635,7 @@ async function indexCodebase() {
     bar.style.background = 'var(--danger)';
     showToast(errMsg.replace('✗ ', ''), 'error');
   } finally {
-    btn.disabled  = false;
-    btn.innerHTML = '<span>⚡</span> Index Project';
+    setIndexingState(false);
     // Hide progress bar after a delay so user sees the 100%
     setTimeout(() => {
       wrap.classList.remove('visible');
@@ -1576,11 +1645,18 @@ async function indexCodebase() {
   }
 }
 
+async function reindexCodebase() {
+  const input = document.getElementById('indexPath');
+  if (!input.value.trim() && currentProjectPath) input.value = currentProjectPath;
+  await indexCodebase(true);
+}
+
 async function clearIndex() {
   if (!confirm('Clear the current index? You will need to re-index before asking questions.')) return;
 
   hasIndexed   = false;
   indexedFiles = null;
+  currentProjectPath = '';
   document.getElementById('currentProject').style.display  = 'none';
   document.getElementById('projectName').textContent        = '';
   document.getElementById('indexStatus').textContent        = '';
@@ -1605,6 +1681,7 @@ async function clearIndex() {
 }
 
 async function continuePreviousProject() {
+  if (isIndexing) return;
   try {
     const resp = await fetch(`${API}/v1/index/restore`, { method: 'POST' });
     const data = await resp.json();
@@ -2313,18 +2390,29 @@ function newConversation() {
     </div>
   `;
   document.getElementById('topbarTitle').textContent = 'New conversation';
+  conversationCreatedAt = new Date().toISOString();
 }
 
-function exportConversation() {
+async function exportConversation() {
   if (conversation.length === 0) { showToast('Nothing to export', 'error'); return; }
-  const text = conversation.map(m =>
-    `[${m.role.toUpperCase()}]\n${m.content}\n`
-  ).join('\n---\n\n');
-  const a    = document.createElement('a');
-  a.href     = 'data:text/plain;charset=utf-8,' + encodeURIComponent(text);
-  a.download = `andescode-${Date.now()}.txt`;
-  a.click();
-  showToast('Conversation exported', 'success');
+  const title = document.getElementById('topbarTitle').textContent || 'AndesCode Conversation';
+  try {
+    const resp = await fetch(`${API}/v1/conversation/export`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title,
+        created_at: conversationCreatedAt,
+        messages: conversation,
+      }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || !data.ok) throw new Error(data.detail || data.error || `Server error ${resp.status}`);
+    showToast(`Exported to ${data.path}`, 'success');
+  } catch (e) {
+    const msg = e.message || 'Export failed';
+    showToast(`Export failed: ${msg}`, 'error');
+  }
 }
 
 function toggleSidebar() {
