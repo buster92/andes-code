@@ -51,6 +51,7 @@ AndesCode is built for developers who work with client code under NDA, operate i
 - 🗺️ **Project intelligence** — detects language, stack, entry points, domain, and key symbols on indexing
 - 🔎 **Smart retrieval** — two-step planning (model selects relevant files first), query routing by filename/symbol/intent, and 4-axis re-ranking
 - 🕸️ **Optional graph-aware retrieval** — when enabled, AndesCode builds local code graph artifacts and can expand semantic retrieval with symbol, import, and reference neighbors for complex multi-file questions
+  - Evaluation guide: [`docs/hybrid-retrieval-eval.md`](docs/hybrid-retrieval-eval.md)
 - 🎯 **Token-aware context packing** — prompt assembly is budgeted against model context window, with deterministic priority-based truncation instead of overflow failures
 - 🧱 **Multi-layer caching** — repo-fingerprint-scoped workspace/retrieval/neighborhood/prompt-prefix/patch-plan caches with strict invalidation
 - 📌 **Deterministic routing for repo questions** — config/dependency/manifest questions use a source-of-truth config-first path before inferred code usage

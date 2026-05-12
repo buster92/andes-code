@@ -30,6 +30,10 @@ Suites
           Currently Android-only (`--fixture android`).
           Useful when you only want to measure model answer quality.
 
+  hybrid-ab
+          Model-free A/B comparison: baseline retrieval vs graph-aware hybrid
+          retrieval. Emits JSON and Markdown reports under tests/eval/reports/.
+
 Usage
 -----
   # Fast battery — no model, run on every commit
@@ -43,6 +47,9 @@ Usage
 
   # Specific fixture
   python3 tests/eval_runner.py --suite full --fixture android
+
+  # Hybrid retrieval A/B report (no model)
+  python3 tests/eval_runner.py --suite hybrid-ab --fixture android
 
   # Point at a non-default server
   python3 tests/eval_runner.py --suite full --url http://localhost:9090
@@ -173,6 +180,27 @@ def run_full(url: str, fixture_name: str, auto_index: bool):
     return fast_ok and eval_ok
 
 
+def run_hybrid_ab(fixture_name: str):
+    """Baseline vs hybrid retrieval comparison — no model needed."""
+    from hybrid_retrieval_ab_eval import DEFAULT_REPORT_DIR, run_fixture
+
+    _, description = load_fixture(fixture_name)
+    print(f"  Fixture:  {description}")
+    print("  Suite:    hybrid-ab (baseline vs hybrid retrieval, no model)\n")
+    try:
+        report, json_path, md_path = run_fixture(fixture_name, DEFAULT_REPORT_DIR)
+    except RuntimeError as exc:
+        print(f"❌ {exc}")
+        return False
+    summary = report["summary"]
+    print(f"  Baseline: {summary['baseline_pass_count']}/{summary['total_cases']} pass")
+    print(f"  Hybrid:   {summary['hybrid_pass_count']}/{summary['total_cases']} pass")
+    print(f"  Improvements={summary['net_improvements']} Regressions={summary['net_regressions']} Unchanged={summary['unchanged_cases']}")
+    print(f"  JSON:     {json_path}")
+    print(f"  Markdown: {md_path}")
+    return True
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -184,12 +212,13 @@ examples:
   python3 tests/eval_runner.py --suite fast
   python3 tests/eval_runner.py --suite full --auto-index
   python3 tests/eval_runner.py --suite eval --url http://localhost:9090
+  python3 tests/eval_runner.py --suite hybrid-ab --fixture android
   python3 tests/eval_runner.py --list-fixtures
         """
     )
     parser.add_argument(
-        "--suite", choices=["fast", "eval", "full"], default="fast",
-        help="fast=retrieval only (no model)  eval=answer quality  full=both"
+        "--suite", choices=["fast", "eval", "full", "hybrid-ab"], default="fast",
+        help="fast=retrieval only (no model)  hybrid-ab=baseline vs hybrid report  eval=answer quality  full=both"
     )
     parser.add_argument(
         "--fixture", default=DEFAULT_FIXTURE,
@@ -227,6 +256,7 @@ examples:
         "fast": lambda: run_fast(args.fixture, args.auto_index),
         "eval": lambda: run_eval(args.url, args.fixture, args.auto_index),
         "full": lambda: run_full(args.url, args.fixture, args.auto_index),
+        "hybrid-ab": lambda: run_hybrid_ab(args.fixture),
     }
     success = dispatch[args.suite]()
     sys.exit(0 if success else 1)
