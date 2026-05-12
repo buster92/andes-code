@@ -1,12 +1,12 @@
-"""A/B retrieval evaluation for AndesCode hybrid code-graph retrieval.
+"""Model-free A/B eval for AndesCode graph-aware hybrid retrieval.
 
-Runs the same model-free retrieval cases twice against a golden fixture:
+Runs the same retrieval precision cases twice against a golden fixture:
 
-* baseline: ``ANDESCODE_HYBRID_RETRIEVAL=0``
-* hybrid: ``ANDESCODE_HYBRID_RETRIEVAL=1``
+* baseline retrieval: ``ANDESCODE_HYBRID_RETRIEVAL=0``
+* hybrid retrieval: ``ANDESCODE_HYBRID_RETRIEVAL=1``
 
-The output is intentionally pilot-friendly: a JSON report for automation and a
-Markdown report for copying into docs, README updates, or launch evidence.
+The eval measures retrieval quality, not answer quality. It emits pilot-friendly
+JSON and Markdown reports under ``tests/eval/reports/`` by default.
 """
 
 from __future__ import annotations
@@ -34,6 +34,17 @@ prepend_sys_path(EVAL_DIR)
 
 DEFAULT_REPORT_DIR = EVAL_DIR / "reports"
 
+HYBRID_DEBUG_DEFAULTS: dict[str, Any] = {
+    "retrieval_routes_used": [],
+    "graph_route_by_file": {},
+    "graph_score_by_file": {},
+    "graph_expansion_limits": {},
+    "graph_seed_files": [],
+    "context_sufficiency_notes": [],
+    "graph_neighbors_added": [],
+    "graph_boosted_existing_files": [],
+}
+
 
 @dataclass(frozen=True)
 class RetrievalCase:
@@ -48,8 +59,9 @@ class RetrievalCase:
 
 
 # These cases are deliberately hard multi-file/codebase-understanding queries,
-# not answer-quality prompts. They keep the eval model-free while stressing the
-# graph expansion paths that hybrid retrieval is meant to improve.
+# not answer-quality prompts. They keep the model-free A/B eval focused on
+# retrieval evidence while stressing graph expansion paths that hybrid retrieval
+# is meant to improve.
 EVAL_CASES: list[RetrievalCase] = [
     RetrievalCase(
         fixture="android",
@@ -132,7 +144,7 @@ def _matches_expected(retrieved_files: list[str], expected: str) -> bool:
     return any(expected in file_path for file_path in retrieved_files)
 
 
-def _passed(retrieved_files: list[str], expected_files: list[str]) -> bool:
+def _passes_expected_files(retrieved_files: list[str], expected_files: list[str]) -> bool:
     return all(_matches_expected(retrieved_files, expected) for expected in expected_files)
 
 
@@ -147,7 +159,23 @@ def _unique_files(results: list[dict[str, Any]]) -> list[str]:
     return files
 
 
-def _run_search(case: RetrievalCase, hybrid_enabled: bool) -> dict[str, Any]:
+def _copy_default(value: Any) -> Any:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, list):
+        return list(value)
+    return value
+
+
+def _extract_hybrid_debug(retrieval_debug: dict[str, Any]) -> dict[str, Any]:
+    """Return the graph-aware debug fields used by JSON and Markdown reports."""
+    return {
+        field: retrieval_debug.get(field, _copy_default(default))
+        for field, default in HYBRID_DEBUG_DEFAULTS.items()
+    }
+
+
+def _run_retrieval_case(case: RetrievalCase, hybrid_enabled: bool) -> dict[str, Any]:
     from indexer import search
 
     os.environ["ANDESCODE_HYBRID_RETRIEVAL"] = "1" if hybrid_enabled else "0"
@@ -161,17 +189,8 @@ def _run_search(case: RetrievalCase, hybrid_enabled: bool) -> dict[str, Any]:
     retrieval_debug = (debug or {}).get("retrieval", {}) if isinstance(debug, dict) else {}
     return {
         "retrieved_files": retrieved_files,
-        "pass": _passed(retrieved_files, case.expected_files),
-        "debug": {
-            "retrieval_routes_used": retrieval_debug.get("retrieval_routes_used", []),
-            "graph_route_by_file": retrieval_debug.get("graph_route_by_file", {}),
-            "graph_score_by_file": retrieval_debug.get("graph_score_by_file", {}),
-            "graph_expansion_limits": retrieval_debug.get("graph_expansion_limits", {}),
-            "graph_seed_files": retrieval_debug.get("graph_seed_files", []),
-            "context_sufficiency_notes": retrieval_debug.get("context_sufficiency_notes", []),
-            "graph_neighbors_added": retrieval_debug.get("graph_neighbors_added", []),
-            "graph_boosted_existing_files": retrieval_debug.get("graph_boosted_existing_files", []),
-        },
+        "pass": _passes_expected_files(retrieved_files, case.expected_files),
+        "debug": _extract_hybrid_debug(retrieval_debug),
     }
 
 
@@ -184,8 +203,8 @@ def _classification(baseline_pass: bool, hybrid_pass: bool) -> str:
 
 
 def _case_report(case: RetrievalCase) -> dict[str, Any]:
-    baseline = _run_search(case, hybrid_enabled=False)
-    hybrid = _run_search(case, hybrid_enabled=True)
+    baseline = _run_retrieval_case(case, hybrid_enabled=False)
+    hybrid = _run_retrieval_case(case, hybrid_enabled=True)
     baseline_files = baseline["retrieved_files"]
     hybrid_files = hybrid["retrieved_files"]
     files_added = [file_path for file_path in hybrid_files if file_path not in baseline_files]
@@ -357,7 +376,10 @@ def run_fixture(fixture_name: str, report_dir: Path) -> tuple[dict[str, Any], Pa
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "fixture": fixture_name,
             "fixture_description": description,
-            "n_results_policy": "Each case fixes n_results and runs the same value for baseline and hybrid.",
+            "n_results_policy": (
+                "Each case fixes n_results and runs the same value for "
+                "baseline retrieval and hybrid retrieval."
+            ),
             "modes": {
                 "baseline": {"ANDESCODE_HYBRID_RETRIEVAL": "0"},
                 "hybrid": {"ANDESCODE_HYBRID_RETRIEVAL": "1"},
@@ -389,7 +411,9 @@ def run_fixture(fixture_name: str, report_dir: Path) -> tuple[dict[str, Any], Pa
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run model-free baseline vs hybrid retrieval A/B eval.")
+    parser = argparse.ArgumentParser(
+        description="Run the model-free A/B eval for baseline retrieval vs hybrid retrieval."
+    )
     parser.add_argument(
         "--fixture",
         default=DEFAULT_FIXTURE,
@@ -412,7 +436,7 @@ def main(argv: list[str] | None = None) -> int:
     report_dir = Path(args.report_dir)
     any_regression = False
     for fixture_name in fixtures:
-        print(f"🏔️  AndesCode hybrid retrieval A/B eval — fixture: {fixture_name}")
+        print(f"🏔️  AndesCode model-free A/B eval — fixture: {fixture_name}")
         try:
             report, json_path, md_path = run_fixture(fixture_name, report_dir)
         except RuntimeError as exc:

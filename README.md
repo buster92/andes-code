@@ -50,8 +50,8 @@ AndesCode is built for developers who work with client code under NDA, operate i
 - 🔍 **Codebase-aware** — indexes your project, builds a project map, injects relevant context automatically
 - 🗺️ **Project intelligence** — detects language, stack, entry points, domain, and key symbols on indexing
 - 🔎 **Smart retrieval** — two-step planning (model selects relevant files first), query routing by filename/symbol/intent, and 4-axis re-ranking
-- 🕸️ **Optional graph-aware retrieval** — when enabled, AndesCode builds local code graph artifacts and can expand semantic retrieval with symbol, import, and reference neighbors for complex multi-file questions
-  - Evaluation guide: [`docs/hybrid-retrieval-eval.md`](docs/hybrid-retrieval-eval.md)
+- 🕸️ **Optional graph-aware hybrid retrieval** — when enabled, AndesCode builds local code graph artifacts and can expand baseline retrieval with symbol, import, and reference neighbors for complex multi-file questions
+  - Model-free A/B eval guide: [`docs/hybrid-retrieval-eval.md`](docs/hybrid-retrieval-eval.md)
 - 🎯 **Token-aware context packing** — prompt assembly is budgeted against model context window, with deterministic priority-based truncation instead of overflow failures
 - 🧱 **Multi-layer caching** — repo-fingerprint-scoped workspace/retrieval/neighborhood/prompt-prefix/patch-plan caches with strict invalidation
 - 📌 **Deterministic routing for repo questions** — config/dependency/manifest questions use a source-of-truth config-first path before inferred code usage
@@ -303,12 +303,12 @@ HF_HUB_OFFLINE=1
 TOKENIZERS_PARALLELISM=false
 ANDESCODE_EXECUTION_MODE=LOCAL  # LOCAL (default) or REMOTE_INFERENCE
 ANDESCODE_REMOTE_SERVER_URL=http://127.0.0.1:8080  # used only in REMOTE_INFERENCE mode
-ANDESCODE_HYBRID_RETRIEVAL=0  # set to 1 to enable experimental graph-aware retrieval
+ANDESCODE_HYBRID_RETRIEVAL=0  # set to 1 to enable experimental graph-aware hybrid retrieval
 ```
 
 For large projects or architectural questions, increase `CONTEXT_CHUNKS` to 7–10. The retrieval pipeline automatically widens its candidate pool for broad queries — this setting controls how many final chunks land in the prompt.
 
-`ANDESCODE_HYBRID_RETRIEVAL` is disabled by default. Set it to `1` when testing complex multi-file questions that may benefit from local graph expansion. It uses only local graph artifacts stored in the existing index directory and does not change AndesCode's privacy behavior.
+`ANDESCODE_HYBRID_RETRIEVAL` is disabled by default. Set it to `1` when testing complex multi-file questions that may benefit from local graph expansion. It uses only local graph artifacts stored in the existing index directory and does not change AndesCode's privacy behavior. See the model-free A/B eval guide for pilot measurement: [`docs/hybrid-retrieval-eval.md`](docs/hybrid-retrieval-eval.md).
 
 ### Execution modes
 
@@ -399,7 +399,7 @@ Check that indexing completed — you should see `✅ Done — X files`. For lar
 Run `python3 indexer.py /path/to/your/project` again. MD5 hashing ensures only changed files are re-processed — unchanged files are reused from the existing index instantly.
 
 **How do I inspect cache behavior?**  
-See `docs/cache-debugging.md` for cache layout, metrics, and invalidation troubleshooting. You can run `python benchmark_cache.py` for cold vs warm cache instrumentation.
+See `docs/cache-debugging.md` for cache layout, metrics, and invalidation troubleshooting. You can run `python3 benchmark_cache.py` for cold vs warm cache instrumentation.
 
 **How do I enable structured retrieval debug mode?**  
 Debug mode is off by default. You can enable it via:
@@ -409,7 +409,7 @@ Debug mode is off by default. You can enable it via:
 
 When enabled, AndesCode emits a deterministic debug payload with intent, source-of-truth selection, retrieval/ranking decisions, and failure signals. The web UI shows it in a collapsible panel.
 
-When graph-aware retrieval is enabled, debug payloads also include fields that show whether graph retrieval actually changed the selected context:
+When graph-aware hybrid retrieval is enabled, debug payloads also include fields that show whether graph retrieval actually changed the selected context:
 - `retrieval_routes_used`: retrieval components that contributed candidates, such as semantic vector search, source-of-truth retrieval, exact symbol lookup, filename lookup, import neighbors, or reference neighbors.
 - `graph_neighbors_added`: graph-expanded files added beyond the semantic seed files.
 - `symbols_matched`: exact symbol matches found in `symbol_graph.json`.
@@ -454,7 +454,7 @@ PRs welcome.
 Highest-value contributions right now:
 
 - Windows / Linux setup testing and documentation
-- Full AST-aware chunking and richer tree-sitter extraction across languages (beyond PR #53's v1 graph-aware retrieval)
+- Full AST-aware chunking and richer tree-sitter extraction across languages (beyond PR #53's v1 graph-aware hybrid retrieval)
 - File watcher for automatic incremental re-indexing
 
 ## Test tiers and CI defaults
@@ -479,7 +479,7 @@ Full runtime dependencies from `requirements.txt` are only required for local ap
 Run full validation locally when you have model + server dependencies available:
 
 ```bash
-ANDESCODE_RUN_INTEGRATION_TESTS=1 ANDESCODE_RUN_MODEL_TESTS=1 python -m pytest tests/integration -v
+ANDESCODE_RUN_INTEGRATION_TESTS=1 ANDESCODE_RUN_MODEL_TESTS=1 python3 -m pytest tests/integration -v
 ANDESCODE_RUN_EVAL_TESTS=1 python3 tests/eval/eval_runner.py --suite fast --fixture android
 ```
 

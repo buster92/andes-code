@@ -1,6 +1,8 @@
 # AndesCode Pilot Demo Questions
 
-These hard questions are designed to demonstrate AndesCode on multi-file codebase understanding rather than single-file lookup. A strong answer should cite the files it used, explain the flow, and identify uncertainty when the retrieved context is incomplete.
+These enterprise pilot questions are designed to demonstrate AndesCode on hard multi-file codebase understanding rather than single-file lookup. Use them alongside the model-free A/B eval reports: the eval measures whether retrieval found the right files, while these questions help humans judge whether the retrieved context supports a clear answer.
+
+A strong answer should cite the files it used, explain the flow across components, identify likely files to change when applicable, and state uncertainty when retrieved context is incomplete.
 
 ## 1. Dependency tracing: upload orchestration
 

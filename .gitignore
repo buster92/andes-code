@@ -5,3 +5,5 @@ models/
 __pycache__/
 *.pyc
 .DS_Store
+
+tests/eval/reports/
