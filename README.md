@@ -146,6 +146,36 @@ Everything logged locally. Code never uploaded.
 ```
 
 
+## Edit Suggestion Mode v1
+
+Edit Suggestion Mode v1 is a read-only investigation path for requests that sound like code changes, bug fixes, performance improvements, or implementation guidance. Examples include “fix this bug,” “make this faster,” “suggest one update,” “change this behavior,” “why is this failing?”, and “what code should I edit?”
+
+When triggered, AndesCode changes from normal Q&A into a stricter repo-grounded workflow:
+
+- Classifies the request as `edit_suggestion` before retrieval.
+- Combines semantic retrieval with filename/path hints, symbol/reference signals, import-neighborhood expansion, and related test/config discovery.
+- Loads full indexed contents for likely edit targets before recommending a patch-level change.
+- Traces the likely call or data path from retrieved imports, symbols, methods, classes, and references.
+- Checks whether the requested mechanism already exists in the retrieved files so it does not suggest an existing cache/retry/validation/test mechanism as if it were new.
+
+Edit Suggestion Mode responses must use this contract:
+
+1. **Finding** — the current behavior grounded in retrieved files.
+2. **Evidence** — concrete file paths plus symbols, methods, or classes used to reach the finding.
+3. **Recommended change** — one minimal change, not a broad option list.
+4. **Patch plan** — file-by-file changes with method/function names; snippets only when they come from retrieved context.
+5. **Validation** — specific commands inferred from repo structure, or an explicit note that no test command could be inferred.
+6. **Confidence** — high/medium/low based on retrieved-context completeness.
+
+What it does **not** do yet:
+
+- It does not automatically modify files.
+- It does not run risky shell commands as part of answering.
+- It does not replace Safe Edit/Apply v1; it only improves investigation and patch recommendations before any future apply flow.
+
+This differs from normal Q&A because AndesCode must read concrete files first. If it cannot identify relevant files or symbols, it must say: “I do not have enough repo-grounded context to propose a safe edit.” It then lists the missing files or symbols instead of giving generic architecture advice.
+
+
 ## Safe Edit/Apply (v1)
 
 AndesCode includes a minimal, deterministic file edit primitive for controlled code updates.

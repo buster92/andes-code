@@ -58,7 +58,7 @@ class LocalAskOrchestrator:
         result = self.answer_engine.generate(prompt, max_tokens=max_tokens)
         text = self.strip_thinking(result["choices"][0]["text"], strip_edges=True)
         filtered_text, _ = self.validate_high_signal_output(text, is_performance)
-        return filtered_text, debug_payload if debug_mode else None
+        return filtered_text, debug_payload
 
 
 @dataclass

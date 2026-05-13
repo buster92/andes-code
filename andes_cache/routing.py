@@ -10,6 +10,7 @@ RUNTIME_USAGE_OR_REFERENCE = "runtime_usage_or_reference"
 ARCHITECTURE_OVERVIEW = "architecture_overview"
 SYMBOL_LOOKUP = "symbol_lookup"
 CODE_FIX_OR_PATCH = "code_fix_or_patch"
+EDIT_SUGGESTION = "edit_suggestion"
 GENERIC_SEMANTIC = "generic_semantic"
 
 
@@ -27,8 +28,28 @@ def classify_query_intent_details(query: str) -> dict:
     # - "where is X configured" => declaration_or_configuration
     # - "where is X defined" => symbol_lookup
     # - "where is X used" => runtime_usage_or_reference
-    patch_score = _score(
-        q, words, {"fix", "patch", "edit", "change", "refactor", "bug", "implement"}
+    edit_suggestion_score = _score(
+        q,
+        words,
+        {
+            "fix",
+            "patch",
+            "edit",
+            "change",
+            "refactor",
+            "bug",
+            "implement",
+            "improve",
+            "faster",
+            "performance",
+            "optimize",
+            "optimise",
+            "failing",
+            "failure",
+            "suggest",
+            "update",
+            "modify",
+        },
     )
     decl_score = _score(
         q,
@@ -88,8 +109,11 @@ def classify_query_intent_details(query: str) -> dict:
     )
     dependency_question = bool(re.search(r"\b(dependency|dependencies|library|libraries|package|packages)\b", q))
 
-    if patch_score > 0:
-        intent = CODE_FIX_OR_PATCH
+    if edit_suggestion_score > 0 or re.search(
+        r"\b(why is (?:this|it|the .+) failing|what code should i edit|suggest one update|make .+ faster|change .+ behavior)\b",
+        q,
+    ):
+        intent = EDIT_SUGGESTION
     elif re.search(r"\b(where is .*defined|definition of)\b", q):
         intent = SYMBOL_LOOKUP
     elif re.search(r"\b(where is .*configured)\b", q):
@@ -156,6 +180,8 @@ def retrieval_route_for_intent(intent: str) -> str:
         return "runtime_usage"
     if intent == SYMBOL_LOOKUP:
         return "symbol_lookup"
+    if intent == EDIT_SUGGESTION:
+        return "edit_suggestion"
     return "semantic"
 
 
@@ -169,10 +195,12 @@ def semantic_cache_allowed(intent: str, retrieval_route: str) -> bool:
 
 def orchestration_plan(intent: str) -> dict:
     fast = is_fast_path_intent(intent)
+    edit = intent == EDIT_SUGGESTION
     return {
         "skip_patch_plan": fast,
         "skip_patch_diagnosis": fast,
         "skip_neighborhood": fast,
+        "edit_suggestion": edit,
     }
 
 

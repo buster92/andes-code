@@ -61,6 +61,14 @@ from ask_orchestrator import (
 )
 from execution_mode import ExecutionMode, execution_mode_env_key, get_execution_mode
 from local_retrieval import normalize_local_retrieval
+from edit_suggestion import (
+    EDIT_SUGGESTION,
+    build_edit_suggestion_context,
+    edit_suggestion_policy,
+    enforce_edit_suggestion_output,
+    is_edit_suggestion_query,
+    safe_context_fallback,
+)
 from remote_inference_schema import (
     RemoteInferenceRequest,
     RemoteProtocol,
@@ -175,7 +183,10 @@ def _is_performance_query(query: str) -> bool:
 
 
 def _reasoning_policy_for_query(query: str) -> tuple[str, str]:
-    # Performance queries take the highest priority — they need execution-path analysis.
+    # Explicit edit requests get the strict read-only patch recommendation contract.
+    if is_edit_suggestion_query(query):
+        return (edit_suggestion_policy(), EDIT_SUGGESTION)
+    # Pure performance analysis remains high-signal and execution-path focused.
     if _is_performance_query(query):
         return (_HIGH_SIGNAL_PERFORMANCE_POLICY, "performance")
     # Declaration/dependency queries get structured source-of-truth guidance so the
@@ -1128,9 +1139,11 @@ async def chat(request: Request):
         )
         audit.info(f"DEBUG_PAYLOAD {request_id} | generated={bool(debug_payload)}")
         user_query = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+        if is_edit_suggestion_query(user_query):
+            text = enforce_edit_suggestion_output(text, _edit_context_from_debug_payload(debug_payload, user_query))
         is_performance = _is_performance_query(user_query)
         _, filtered_out = _validate_high_signal_output(text, is_performance)
-        query_type = "performance" if is_performance else "general"
+        query_type = EDIT_SUGGESTION if is_edit_suggestion_query(user_query) else ("performance" if is_performance else "general")
         audit.info(
             f"HIGH_SIGNAL {request_id} | query_type={query_type} | "
             f"applied={is_performance} | filtered_out_items={filtered_out}"
@@ -1539,15 +1552,21 @@ def _build_context(
 
         # ── Code retrieval ────────────────────────────────────────────────────
         retrieval_debug = None
-        if debug_mode:
+        if debug_mode or return_debug:
             chunks, retrieval_debug = search_codebase(
                 query,
                 n_results=CONTEXT_CHUNKS,
-                debug_mode=debug_mode,
+                debug_mode=(debug_mode or return_debug),
                 return_debug=True,
             )
         else:
             chunks = search_codebase(query, n_results=CONTEXT_CHUNKS, debug_mode=debug_mode)
+
+        edit_full_files: list[str] = []
+        if is_edit_suggestion_query(query):
+            chunks, edit_full_files = _expand_edit_suggestion_chunks(query, chunks, pmap, ws)
+            if retrieval_debug is not None:
+                retrieval_debug.setdefault("edit_suggestion", {})["full_files_loaded"] = list(edit_full_files)
 
         normalized = normalize_local_retrieval(
             query=query,
@@ -1562,11 +1581,14 @@ def _build_context(
             retrieval_debug["normalized_retrieval"] = normalized.to_debug_dict()
 
         if not normalized_chunks:
+            empty_retrieval_context = ""
+            if is_edit_suggestion_query(query):
+                empty_retrieval_context = safe_context_fallback(["relevant files", "symbols or methods in relevant files"])
             sections = build_prompt_sections(
                 system_prefix=_BASE_SYSTEM,
                 reasoning_policy=reasoning_policy,
                 workspace_prefix=map_section,
-                retrieval_context="",
+                retrieval_context=empty_retrieval_context,
                 user_turn="",
             )
             if cache and repo_fp and workspace_signature:
@@ -1628,6 +1650,113 @@ def _build_context(
         audit.warning(f"CONTEXT_FAIL {request_id} | {_safe(e)}")
         return (messages, None) if return_debug else messages
 
+
+
+def _merge_indexed_file_chunks(filename: str) -> dict | None:
+    """Load all indexed chunks for a file as one prompt chunk for edit targeting."""
+    if not INDEXER_READY or not _indexer_module or not filename:
+        return None
+    try:
+        file_chunks = _indexer_module.get_chunks_for_file(filename)
+    except Exception as exc:
+        audit.warning(f"EDIT_FULL_FILE_FETCH_FAIL | {filename} | {exc}")
+        return None
+    if not file_chunks:
+        return None
+    ordered = sorted(file_chunks, key=lambda c: int(c.get("line", c.get("start_line", 1)) or 1))
+    content = "\n".join(str(c.get("content") or "") for c in ordered if c.get("content"))
+    if not content.strip():
+        return None
+    first = ordered[0]
+    last = ordered[-1]
+    return {
+        "file": filename,
+        "content": content,
+        "language": first.get("language", ""),
+        "symbols": " ".join(str(c.get("symbols") or "") for c in ordered if c.get("symbols")),
+        "score": max(float(c.get("score") or 0.0) for c in ordered),
+        "line": int(first.get("line", first.get("start_line", 1)) or 1),
+        "end_line": int(last.get("end_line", last.get("line", 1)) or 1),
+        "full_file": True,
+        "coverage": {"returned": len(ordered), "total": len(ordered), "partial": False},
+        "source_type": first.get("source_type", "source_code"),
+        "authority": first.get("authority", "referenced"),
+        "authority_reason": first.get("authority_reason", "edit_full_file_load"),
+    }
+
+
+def _discover_edit_related_files(query: str, chunks: list[dict], pmap: dict, workspace: dict) -> list[str]:
+    """Combine filename, semantic, symbol, import-neighborhood, config, and test signals."""
+    discovered: list[str] = []
+
+    def add(path: str | None) -> None:
+        if path and path not in discovered:
+            discovered.append(path)
+
+    for anchor in _extract_anchor_files(query):
+        add(anchor)
+    for chunk in chunks[:5]:
+        add(chunk.get("file"))
+
+    file_symbols = pmap.get("file_symbols", {}) if isinstance(pmap, dict) else {}
+    query_lower = (query or "").lower()
+    role_terms = ("viewmodel", "view_model", "service", "repository", "repo", "test", "config")
+    for fname, symbols in file_symbols.items():
+        stem = Path(fname).stem.lower()
+        symbol_blob = " ".join(symbols or []).lower() if isinstance(symbols, list) else ""
+        if any(term in query_lower and term in (stem + " " + symbol_blob) for term in role_terms):
+            add(fname)
+        elif any(sym.lower() in query_lower for sym in (symbols or []) if len(str(sym)) >= 4):
+            add(fname)
+
+    imports = ((workspace or {}).get("import_graph", {}) or {}).get("samples", {}) if isinstance(workspace, dict) else {}
+    if not isinstance(imports, dict):
+        imports = {}
+    seeds = list(discovered)
+    for seed in seeds:
+        for dep in imports.get(seed, []) if isinstance(imports.get(seed, []), (list, tuple, set)) else []:
+            add(dep)
+        for source, deps in imports.items():
+            if isinstance(deps, (list, tuple, set)) and seed in deps:
+                add(source)
+
+    file_to_module = (workspace or {}).get("file_to_module_map", {}) if isinstance(workspace, dict) else {}
+    candidate_files = set(file_to_module) | set(file_symbols)
+    for seed in list(discovered):
+        stem = Path(seed).stem.lower()
+        for fname in sorted(candidate_files):
+            lower = fname.lower()
+            if stem and stem in lower and "test" in lower:
+                add(fname)
+            if any(role in lower for role in ("viewmodel", "view_model", "service", "repository", "repo")) and Path(fname).parent == Path(seed).parent:
+                add(fname)
+
+    config_files = ((workspace or {}).get("config_graph", {}) or {}).get("config_files", []) if isinstance(workspace, dict) else []
+    for cfg in config_files[:3]:
+        add(cfg)
+    for manifest in ((workspace or {}).get("manifests", []) or [])[:3] if isinstance(workspace, dict) else []:
+        add(manifest)
+
+    return discovered[:10]
+
+
+def _expand_edit_suggestion_chunks(query: str, chunks: list[dict], pmap: dict, workspace: dict) -> tuple[list[dict], list[str]]:
+    """Load full indexed files for likely edit targets and keep semantic chunks for support."""
+    related_files = _discover_edit_related_files(query, chunks, pmap, workspace)
+    expanded: list[dict] = []
+    loaded: list[str] = []
+    for fname in related_files:
+        merged = _merge_indexed_file_chunks(fname)
+        if merged:
+            expanded.append(merged)
+            loaded.append(fname)
+    seen_identity = {(c.get("file"), c.get("line"), c.get("content")) for c in expanded}
+    for chunk in chunks:
+        identity = (chunk.get("file"), chunk.get("line"), chunk.get("content"))
+        if identity not in seen_identity:
+            expanded.append(chunk)
+            seen_identity.add(identity)
+    return expanded or chunks, loaded
 
 def _remote_error_payload(code: str, message: str, *, request_id: str = "", details: dict | None = None) -> dict:
     return {
@@ -2230,9 +2359,23 @@ def _pack_context_section(
             budget_tokens=budget.context_budget_tokens,
         )
     packed = pack_chunks_to_budget(candidates, budget.context_budget_tokens)
-    extracted_paths = _extract_execution_paths([c["chunk"] for c in packed.chunks], max_paths=5)
-    path_section = _render_execution_path_context(extracted_paths) if _is_performance_query(query) else ""
-    code_section = path_section + "## Retrieved Code (Validation Context)\n\n"
+    packed_raw_chunks = [c["chunk"] for c in packed.chunks]
+    extracted_paths = _extract_execution_paths(packed_raw_chunks, max_paths=5)
+    path_section = _render_execution_path_context(extracted_paths) if (_is_performance_query(query) or is_edit_suggestion_query(query)) else ""
+    edit_section = ""
+    if is_edit_suggestion_query(query):
+        edit_ctx = build_edit_suggestion_context(packed_raw_chunks, query=query)
+        edit_lines = [
+            "## Edit Suggestion Retrieval Checklist",
+            "",
+            "- Likely edit/entry files read: " + (", ".join(edit_ctx.files) if edit_ctx.files else "none"),
+            "- Symbols/methods/classes found: " + (", ".join(edit_ctx.symbols[:20]) if edit_ctx.symbols else "none"),
+            "- Existing mechanisms detected: " + ("; ".join(edit_ctx.existing_mechanisms) if edit_ctx.existing_mechanisms else "none in retrieved context"),
+            "- Inferred validation commands: " + ("; ".join(edit_ctx.validation_commands) if edit_ctx.validation_commands else "no test command could be inferred"),
+            "",
+        ]
+        edit_section = "\n".join(edit_lines)
+    code_section = path_section + edit_section + "## Retrieved Code (Validation Context)\n\n"
     for c in packed.chunks:
         code_section += c["text"]
     if packed.truncated:
@@ -2346,7 +2489,7 @@ def _plan_files(query: str, pmap: dict) -> list[str]:
 def _diagnose_query(query: str, intent: str) -> dict:
     """Deterministic diagnosis stage before planning/generation."""
     mode = "architecture" if intent == "architecture_overview" else "bugfix"
-    patch_intent = intent == "code_fix_or_patch"
+    patch_intent = intent in {"code_fix_or_patch", EDIT_SUGGESTION}
     return {
         "mode": mode,
         "safe_semantic": semantic_cache_allowed(intent, retrieval_route_for_intent(intent)),
@@ -2537,6 +2680,12 @@ def _build_context_from_plan(
         neighbor_files.extend(neighborhood)
     for fname in expanded_files:
         try:
+            if is_edit_suggestion_query(query):
+                merged = _merge_indexed_file_chunks(fname)
+                if merged:
+                    all_chunks.append(merged)
+                    files_loaded.append(fname)
+                    continue
             file_chunks = _indexer_module.get_chunks_for_file(fname)
             if file_chunks:
                 all_chunks.extend(file_chunks)
@@ -2567,6 +2716,14 @@ def _build_context_from_plan(
                     semantic_fallback_files.append(c["file"])
     except Exception:
         pass
+
+    if is_edit_suggestion_query(query):
+        all_chunks, edit_loaded = _expand_edit_suggestion_chunks(query, all_chunks, pmap, workspace)
+        for fname in edit_loaded:
+            if fname not in files_loaded:
+                files_loaded.append(fname)
+        if debug_payload is not None:
+            debug_payload.setdefault("edit_suggestion", {})["full_files_loaded"] = list(edit_loaded)
 
     if not all_chunks:
         authoritative_retrieved = sorted(
@@ -2680,6 +2837,7 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
     retrieval_signature = ""
     filtered_out = 0
     is_performance = False
+    buffer_answer_for_contract = False
     stream_path = "direct_retrieval"
     cached_semantic = False
     debug_emitted = False
@@ -2695,6 +2853,7 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
         decision = classify_query_intent_details(query)
         intent = decision["intent"]
         retrieval_route = decision["retrieval_route"]
+        buffer_answer_for_contract = intent == EDIT_SUGGESTION
         _phase_log(request_id, "intent_classified", intent=intent, retrieval_route=retrieval_route)
         orchestration = orchestration_plan(intent)
         diagnosis = _diagnose_query(query, intent)
@@ -2823,7 +2982,7 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                     in_think = True
                     t_think_start = time.perf_counter()
                     if before.strip():
-                        if not emitted_answer:
+                        if not buffer_answer_for_contract and not emitted_answer:
                             yield _make_chunk("\n\n---\n\n", request_id)
                             emitted_answer = True
                         if t_first_token is None:
@@ -2831,7 +2990,8 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                             _phase_log(request_id, "first_token_emitted", seconds=f"{t_first_token - t_start:.2f}")
                         token_count += 1
                         final_text += before
-                        yield _make_chunk(before, request_id)
+                        if not buffer_answer_for_contract:
+                            yield _make_chunk(before, request_id)
                     continue
                 if in_think:
                     if think_close in buffer:
@@ -2844,7 +3004,7 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                     emit = _strip_thinking(buffer[:-len(think_open)])
                     buffer = buffer[-len(think_open):]
                     if emit:
-                        if not emitted_answer:
+                        if not buffer_answer_for_contract and not emitted_answer:
                             yield _make_chunk("\n\n---\n\n", request_id)
                             emitted_answer = True
                         if t_first_token is None:
@@ -2852,19 +3012,28 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                             _phase_log(request_id, "first_token_emitted", seconds=f"{t_first_token - t_start:.2f}")
                         token_count += 1
                         final_text += emit
-                        yield _make_chunk(emit, request_id)
+                        if not buffer_answer_for_contract:
+                            yield _make_chunk(emit, request_id)
 
             if buffer and not in_think:
                 remainder = _strip_thinking(buffer)
                 if remainder:
-                    if not emitted_answer:
+                    if not buffer_answer_for_contract and not emitted_answer:
                         yield _make_chunk("\n\n---\n\n", request_id)
                         emitted_answer = True
                     final_text += remainder
-                    yield _make_chunk(remainder, request_id)
+                    if not buffer_answer_for_contract:
+                        yield _make_chunk(remainder, request_id)
 
             filtered_text, filtered_out = _validate_high_signal_output(final_text, is_performance)
-            if is_performance and filtered_text.strip() and filtered_text.strip() != final_text.strip():
+            if buffer_answer_for_contract:
+                filtered_text = enforce_edit_suggestion_output(
+                    filtered_text,
+                    _edit_context_from_debug_payload(debug_payload, query),
+                )
+                yield _make_chunk("\n\n---\n\n", request_id)
+                yield _make_chunk(filtered_text, request_id)
+            elif is_performance and filtered_text.strip() and filtered_text.strip() != final_text.strip():
                 yield _make_chunk(
                     "\n\n🔎 Refined high-signal summary:\n",
                     request_id,
@@ -2889,7 +3058,7 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                 chunks=token_count,
             )
 
-        query_type = "performance" if is_performance else "general"
+        query_type = EDIT_SUGGESTION if intent == EDIT_SUGGESTION else ("performance" if is_performance else "general")
         audit.info(
             f"HIGH_SIGNAL {request_id} | query_type={query_type} | "
             f"applied={is_performance} | filtered_out_items={filtered_out}"
@@ -2954,6 +3123,17 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _edit_context_from_debug_payload(debug_payload: dict | None, query: str):
+    if not isinstance(debug_payload, dict):
+        return build_edit_suggestion_context([], query=query)
+    retrieval = debug_payload.get("normalized_retrieval") or debug_payload.get("retrieval") or {}
+    chunks = retrieval.get("chunks", []) if isinstance(retrieval, dict) else []
+    if chunks and "content" in chunks[0] and "file" not in chunks[0]:
+        # dataclass-asdict shape from LocalRetrievedChunk uses path rather than file.
+        chunks = [{**c, "file": c.get("path", "")} for c in chunks]
+    return build_edit_suggestion_context(chunks if isinstance(chunks, list) else [], query=query)
 
 def _messages_to_prompt(messages: list) -> str:
     prompt = ""
