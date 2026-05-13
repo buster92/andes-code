@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 
+from edit_suggestion import is_edit_suggestion_query
+
 DECLARATION_OR_CONFIGURATION = "declaration_or_configuration"
 DEPENDENCY_OR_BUILD_INVENTORY = "dependency_or_build_inventory"
 RUNTIME_USAGE_OR_REFERENCE = "runtime_usage_or_reference"
@@ -28,29 +30,6 @@ def classify_query_intent_details(query: str) -> dict:
     # - "where is X configured" => declaration_or_configuration
     # - "where is X defined" => symbol_lookup
     # - "where is X used" => runtime_usage_or_reference
-    edit_suggestion_score = _score(
-        q,
-        words,
-        {
-            "fix",
-            "patch",
-            "edit",
-            "change",
-            "refactor",
-            "bug",
-            "implement",
-            "improve",
-            "faster",
-            "performance",
-            "optimize",
-            "optimise",
-            "failing",
-            "failure",
-            "suggest",
-            "update",
-            "modify",
-        },
-    )
     decl_score = _score(
         q,
         words,
@@ -109,10 +88,7 @@ def classify_query_intent_details(query: str) -> dict:
     )
     dependency_question = bool(re.search(r"\b(dependency|dependencies|library|libraries|package|packages)\b", q))
 
-    if edit_suggestion_score > 0 or re.search(
-        r"\b(why is (?:this|it|the .+) failing|what code should i edit|suggest one update|make .+ faster|change .+ behavior)\b",
-        q,
-    ):
+    if is_edit_suggestion_query(query):
         intent = EDIT_SUGGESTION
     elif re.search(r"\b(where is .*defined|definition of)\b", q):
         intent = SYMBOL_LOOKUP

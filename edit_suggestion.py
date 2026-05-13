@@ -19,15 +19,16 @@ _SAFE_FALLBACK = "I do not have enough repo-grounded context to propose a safe e
 _EDIT_INTENT_PATTERNS = [
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
-        r"\bimprove\s+(?:this|it|the|[\w./-]+)",
+        r"\bimprove\s+(?:this|it|the|[\w./-]+|performance)\b",
         r"\bfix\s+(?:this|it|the|a\s+)?(?:bug|failure|error|issue|test|crash)?\b",
         r"\bmake\s+(?:this|it|the|[\w./-]+)\s+faster\b",
-        r"\bsuggest\s+(?:one\s+)?(?:update|change|edit|fix|improvement)\b",
+        r"\bsuggest\s+(?:one|a|an)\s+(?:concrete\s+)?(?:update|change|edit|fix|improvement)\b",
         r"\bchange\s+(?:this|it|the)\s+behavior\b",
         r"\bwhy\s+is\s+(?:this|it|the|[\w./-]+)\s+failing\b",
         r"\bwhat\s+code\s+should\s+i\s+edit\b",
-        r"\b(?:implement|add|update|modify|refactor|patch)\b",
-        r"\b(?:optimi[sz]e|improve\s+performance|performance\s+improvement)\b",
+        r"^\s*(?:please\s+)?update\s+[\w./-]+\s+(?:to|so|for|with)\b",
+        r"^\s*(?:please\s+)?add\s+(?:a|an|the|one|new|missing|some)?\s*[\w-]+\s*(?:check|guard|test|feature|method|function|class|field|parameter|validation|cache|retry|handler|endpoint|implementation)?\b",
+        r"\b(?:implement|modify|refactor|patch|optimi[sz]e)\b",
     )
 ]
 

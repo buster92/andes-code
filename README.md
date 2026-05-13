@@ -148,9 +148,9 @@ Everything logged locally. Code never uploaded.
 
 ## Edit Suggestion Mode v1
 
-Edit Suggestion Mode v1 is a read-only investigation path for requests that sound like code changes, bug fixes, performance improvements, or implementation guidance. Examples include “fix this bug,” “make this faster,” “suggest one update,” “change this behavior,” “why is this failing?”, and “what code should I edit?”
+Edit Suggestion Mode v1 is a read-only investigation path for requests that clearly ask for code changes, bug fixes, performance improvements, concrete updates, or implementation guidance. Examples include “fix this bug,” “make this faster,” “suggest one update,” “change this behavior,” “why is this failing?”, and “what code should I edit?”
 
-When triggered, AndesCode changes from normal Q&A into a stricter repo-grounded workflow:
+Broad analysis questions such as “explain the performance path,” “where is AddToCart defined?”, or “how does updateSchedule work?” stay in normal Q&A unless the user also asks for a concrete edit. When triggered, AndesCode changes from normal Q&A into a stricter repo-grounded workflow:
 
 - Classifies the request as `edit_suggestion` before retrieval.
 - Combines semantic retrieval with filename/path hints, symbol/reference signals, import-neighborhood expansion, and related test/config discovery.

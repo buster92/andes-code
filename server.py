@@ -1577,6 +1577,13 @@ def _build_context(
             index_state=index_state if isinstance(index_state, dict) else {},
         )
         normalized_chunks = normalized.to_prompt_chunks()
+        if return_debug and retrieval_debug is None:
+            retrieval_debug = {
+                "query": query,
+                "intent": EDIT_SUGGESTION if is_edit_suggestion_query(query) else "direct_retrieval",
+                "retrieval_route": "direct_retrieval",
+                "retrieval": {"route_taken": "direct_retrieval", "files_retrieved": []},
+            }
         if retrieval_debug is not None:
             retrieval_debug["normalized_retrieval"] = normalized.to_debug_dict()
 
@@ -2580,7 +2587,7 @@ def _build_context_from_plan(
     semantic_fallback_files = []
 
     debug_payload = None
-    if debug_mode:
+    if debug_mode or return_debug:
         debug_payload = {
             "query": query,
             "intent": (diagnosis or {}).get("intent", "planned_context"),
