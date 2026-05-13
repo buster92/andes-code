@@ -308,12 +308,21 @@ ANDESCODE_HYBRID_RETRIEVAL=0  # set to 1 to enable experimental graph-aware hybr
 
 For large projects or architectural questions, increase `CONTEXT_CHUNKS` to 7–10. The retrieval pipeline automatically widens its candidate pool for broad queries — this setting controls how many final chunks land in the prompt.
 
+### Index freshness model
+
+AndesCode does **not** continuously watch your files or run background automatic index refresh. This keeps idle CPU near baseline when the app is open but no query or indexing job is running.
+
+- **Index Project** creates or incrementally refreshes the current project index.
+- **Reindex Project** is the explicit full rebuild path; it rebuilds vectors, workspace metadata, symbol index, and graph artifacts.
+- When you return focus to AndesCode, it may do a throttled freshness check and show a non-blocking prompt if the project changed. Choosing **Refresh Index** runs a normal incremental refresh; dismissing does nothing.
+- When you ask a question, AndesCode checks whether the indexed files changed before retrieval/model generation. If files changed, it runs an incremental index refresh first, then continues with retrieval and answer generation. If that refresh fails, AndesCode stops instead of answering from stale context.
+
 `ANDESCODE_HYBRID_RETRIEVAL` is disabled by default. Set it to `1` when testing complex multi-file questions that may benefit from local graph expansion. It uses only local graph artifacts stored in the existing index directory and does not change AndesCode's privacy behavior. See the model-free A/B eval guide for pilot measurement: [`docs/hybrid-retrieval-eval.md`](docs/hybrid-retrieval-eval.md).
 
 ### Execution modes
 
 - `LOCAL` (default): existing end-to-end behavior (local indexing, retrieval, and inference).
-- `REMOTE_INFERENCE`: local indexing + local retrieval remain on the client host. The client builds a strict structured payload (`query`, workspace metadata, retrieval metadata, retrieved chunks, options) and sends it to `${ANDESCODE_REMOTE_SERVER_URL}/v1/ask` for inference-only generation. Server-side `/v1/ask` answers only from that payload.
+- `REMOTE_INFERENCE`: local indexing + local retrieval remain on the client host. Before building the remote payload, the client checks index freshness and performs any needed local incremental refresh. The client then builds a strict structured payload (`query`, workspace metadata, retrieval metadata, retrieved chunks, options) and sends it to `${ANDESCODE_REMOTE_SERVER_URL}/v1/ask` for inference-only generation. Server-side `/v1/ask` answers only from that payload and must not scan, watch, or index the repository.
 - Remote payload contract reference: `docs/remote-inference-contract.md`.
 
 #### Remote inference v1 boundaries (explicit)
@@ -358,7 +367,7 @@ See `docs/indexing-policy.md` for the exact indexing and skip policy.
 
 ## Roadmap
 
-- [ ] File watcher — automatic incremental re-index on save
+- [ ] Lightweight explicit freshness UX improvements
 - [ ] Full AST-aware chunking and richer tree-sitter extraction across languages — deeper boundary detection beyond regex
 - [ ] KVTC context compression — fit larger codebases in context
 - [ ] Private tunnel (Tailscale/WireGuard) for mobile access
@@ -455,7 +464,7 @@ Highest-value contributions right now:
 
 - Windows / Linux setup testing and documentation
 - Full AST-aware chunking and richer tree-sitter extraction across languages (beyond PR #53's v1 graph-aware hybrid retrieval)
-- File watcher for automatic incremental re-indexing
+- Lightweight explicit freshness checks and indexing UX improvements
 
 ## Test tiers and CI defaults
 
