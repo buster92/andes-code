@@ -8,6 +8,7 @@ os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"]            = "false"
 
 import contextlib
+import hashlib
 import inspect
 import json
 import logging
@@ -549,6 +550,26 @@ def _indexable_current_hashes(root_path: Path) -> dict[str, str]:
     return snapshot
 
 
+def _freshness_change_signature(
+    *,
+    indexed_root: str,
+    changed_count: int,
+    deleted_count: int,
+    changed_paths: list[str] | None = None,
+    deleted_paths: list[str] | None = None,
+) -> str:
+    """Stable opaque signature for one observed freshness-change state."""
+    digest_input = {
+        "indexed_root": indexed_root,
+        "changed_count": int(changed_count),
+        "deleted_count": int(deleted_count),
+        "changed_paths": sorted(changed_paths or []),
+        "deleted_paths": sorted(deleted_paths or []),
+    }
+    encoded = json.dumps(digest_input, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24]
+
+
 def _index_freshness_payload() -> dict:
     t0 = time.perf_counter()
     checked_at = datetime.now(timezone.utc).isoformat()
@@ -560,6 +581,7 @@ def _index_freshness_payload() -> dict:
             "changed": False,
             "changed_count": 0,
             "deleted_count": 0,
+            "change_signature": "",
             "checked_at": checked_at,
             "check_duration_ms": int((time.perf_counter() - t0) * 1000),
             "error": "Indexer not available",
@@ -574,6 +596,7 @@ def _index_freshness_payload() -> dict:
             "changed": False,
             "changed_count": 0,
             "deleted_count": 0,
+            "change_signature": "",
             "checked_at": checked_at,
             "check_duration_ms": int((time.perf_counter() - t0) * 1000),
             "error": f"Unable to read index snapshot: {exc}",
@@ -589,26 +612,37 @@ def _index_freshness_payload() -> dict:
             "changed": False,
             "changed_count": 0,
             "deleted_count": 0,
+            "change_signature": "",
             "checked_at": checked_at,
             "check_duration_ms": int((time.perf_counter() - t0) * 1000),
         }
     root_path = Path(indexed_root)
     if not root_path.exists():
+        deleted_paths = sorted(indexed_hashes)
+        deleted_count = len(deleted_paths)
         return {
             "ok": True,
             "has_index": True,
             "indexed_root": indexed_root,
             "changed": True,
             "changed_count": 0,
-            "deleted_count": len(indexed_hashes),
+            "deleted_count": deleted_count,
+            "change_signature": _freshness_change_signature(
+                indexed_root=indexed_root,
+                changed_count=0,
+                deleted_count=deleted_count,
+                deleted_paths=deleted_paths,
+            ),
             "checked_at": checked_at,
             "check_duration_ms": int((time.perf_counter() - t0) * 1000),
         }
     current_hashes = _indexable_current_hashes(root_path)
     current_paths = set(current_hashes)
     indexed_paths = set(indexed_hashes)
-    changed_count = sum(1 for rel, digest in current_hashes.items() if indexed_hashes.get(rel) != digest)
-    deleted_count = len(indexed_paths - current_paths)
+    changed_paths = sorted(rel for rel, digest in current_hashes.items() if indexed_hashes.get(rel) != digest)
+    deleted_paths = sorted(indexed_paths - current_paths)
+    changed_count = len(changed_paths)
+    deleted_count = len(deleted_paths)
     changed = bool(changed_count or deleted_count)
     return {
         "ok": True,
@@ -617,6 +651,16 @@ def _index_freshness_payload() -> dict:
         "changed": changed,
         "changed_count": changed_count,
         "deleted_count": deleted_count,
+        "change_signature": (
+            _freshness_change_signature(
+                indexed_root=indexed_root,
+                changed_count=changed_count,
+                deleted_count=deleted_count,
+                changed_paths=changed_paths,
+                deleted_paths=deleted_paths,
+            )
+            if changed else ""
+        ),
         "checked_at": checked_at,
         "check_duration_ms": int((time.perf_counter() - t0) * 1000),
     }

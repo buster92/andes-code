@@ -50,6 +50,7 @@ class TestIndexFreshness(unittest.TestCase):
         self.assertFalse(result["changed"])
         self.assertEqual(result["changed_count"], 0)
         self.assertEqual(result["deleted_count"], 0)
+        self.assertEqual(result["change_signature"], "")
 
     def test_freshness_changed_when_file_hash_differs(self):
         self.file.write_text("print('two')\n")
@@ -57,6 +58,29 @@ class TestIndexFreshness(unittest.TestCase):
         self.assertTrue(result["changed"])
         self.assertEqual(result["changed_count"], 1)
         self.assertEqual(result["deleted_count"], 0)
+        self.assertTrue(result["change_signature"])
+        self.assertEqual(result["change_signature"], self.server._index_freshness_payload()["change_signature"])
+
+    def test_freshness_change_signature_tracks_changed_paths(self):
+        other = self.root / "other.py"
+        other.write_text("print('other one')\n")
+        app_initial = "hash:" + self.file.read_text()
+        other_initial = "hash:" + other.read_text()
+        self.indexer._load_hashes = lambda: {
+            "__root__": str(self.root),
+            "app.py": app_initial,
+            "other.py": other_initial,
+        }
+
+        self.file.write_text("print('two')\n")
+        app_changed = self.server._index_freshness_payload()
+        self.file.write_text("print('one')\n")
+        other.write_text("print('other two')\n")
+        other_changed = self.server._index_freshness_payload()
+
+        self.assertEqual(app_changed["changed_count"], 1)
+        self.assertEqual(other_changed["changed_count"], 1)
+        self.assertNotEqual(app_changed["change_signature"], other_changed["change_signature"])
 
     def test_freshness_reports_deleted_indexed_file(self):
         self.file.unlink()
@@ -64,6 +88,7 @@ class TestIndexFreshness(unittest.TestCase):
         self.assertTrue(result["changed"])
         self.assertEqual(result["changed_count"], 0)
         self.assertEqual(result["deleted_count"], 1)
+        self.assertTrue(result["change_signature"])
 
     def test_query_time_refresh_before_non_stream_answer_uses_incremental(self):
         self.file.write_text("print('two')\n")
@@ -134,7 +159,13 @@ class TestStaticFreshnessUi(unittest.TestCase):
     def test_focus_check_prompts_but_does_not_index_automatically(self):
         self.assertIn("window.addEventListener('focus', maybeCheckIndexFreshnessOnFocus)", self.ui)
         self.assertIn("/v1/index/freshness", self.ui)
+        self.assertIn("let dismissedFreshnessSignature = '';", self.ui)
+        self.assertIn("freshness?.change_signature", self.ui)
         focus_body = self.ui.split("async function maybeCheckIndexFreshnessOnFocus", 1)[1].split("async function reindexCodebase", 1)[0]
         self.assertNotIn("indexCodebase(", focus_body)
+        self.assertIn("signature !== dismissedFreshnessSignature", focus_body)
+        self.assertIn("dismissedFreshnessSignature = freshnessSignature(freshness);", self.ui)
+        self.assertIn("dismissedFreshnessSignature = '';", self.ui)
+        self.assertNotIn("freshnessPromptDismissedForChange", self.ui)
         self.assertIn("await indexCodebase(false)", self.ui)
         self.assertIn("await indexCodebase(true)", self.ui)

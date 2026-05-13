@@ -1239,7 +1239,7 @@ let isIndexing = false;
 let currentProjectPath = "";
 let conversationCreatedAt = new Date().toISOString();
 let lastFreshnessCheckAt = 0;
-let freshnessPromptDismissedForChange = false;
+let dismissedFreshnessSignature = '';
 
 // ── Init ─────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {
@@ -1609,7 +1609,7 @@ async function indexCodebase(forceRefresh = false) {
             setProgress(100, doneMsg);
             indexedFiles = e.indexed;
             hasIndexed   = true;
-            freshnessPromptDismissedForChange = false;
+            dismissedFreshnessSignature = '';
             clearFreshnessPrompt();
             currentProjectPath = pathVal;
             document.getElementById('statIndexed').textContent = e.indexed;
@@ -1673,6 +1673,10 @@ function clearFreshnessPrompt() {
   if (prompt) prompt.remove();
 }
 
+function freshnessSignature(freshness) {
+  return freshness?.change_signature || `${freshness?.indexed_root || ''}:${freshness?.changed_count || 0}:${freshness?.deleted_count || 0}`;
+}
+
 function showFreshnessPrompt(freshness) {
   if (!hasIndexed || isIndexing || localIndexRequestActive) return;
   const status = document.getElementById('indexStatus');
@@ -1693,13 +1697,13 @@ function showFreshnessPrompt(freshness) {
   status.appendChild(prompt);
   document.getElementById('refreshIndexPromptBtn').addEventListener('click', async () => {
     clearFreshnessPrompt();
-    freshnessPromptDismissedForChange = false;
+    dismissedFreshnessSignature = '';
     const input = document.getElementById('indexPath');
     if (input && !input.value.trim() && currentProjectPath) input.value = currentProjectPath;
     await indexCodebase(false);
   });
   document.getElementById('dismissFreshnessPromptBtn').addEventListener('click', () => {
-    freshnessPromptDismissedForChange = true;
+    dismissedFreshnessSignature = freshnessSignature(freshness);
     clearFreshnessPrompt();
   });
 }
@@ -1717,7 +1721,8 @@ async function maybeCheckIndexFreshnessOnFocus() {
   lastFreshnessCheckAt = now;
   try {
     const freshness = await checkIndexFreshness();
-    if (freshness?.ok && freshness.changed && !freshnessPromptDismissedForChange) {
+    const signature = freshnessSignature(freshness);
+    if (freshness?.ok && freshness.changed && signature !== dismissedFreshnessSignature) {
       showFreshnessPrompt(freshness);
     }
   } catch (e) {
