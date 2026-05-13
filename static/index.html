@@ -1297,7 +1297,7 @@ function setIndexingState(active, labelText = 'Indexing...') {
 
   [pathInput, pickBtn, clearBtn, indexBtn, reindexBtn].forEach(el => { if (el) el.disabled = isIndexing; });
   if (indexBtn) indexBtn.innerHTML = isIndexing ? `<span class="spinner"></span> ${labelText}` : '<span>⚡</span> Index Project';
-  if (reindexBtn) reindexBtn.innerHTML = isIndexing ? '<span class="spinner"></span> Reindexing...' : '<span>↻</span> Reindex Project';
+  if (reindexBtn) reindexBtn.innerHTML = '<span>↻</span> Reindex Project';
   if (chatInput) {
     chatInput.disabled = isIndexing || !hasIndexed;
     chatInput.placeholder = isIndexing ? 'Indexing in progress...' : (hasIndexed ? 'Ask anything about your codebase...' : 'Index a project first ⬆');

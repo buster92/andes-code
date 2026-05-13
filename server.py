@@ -8,6 +8,7 @@ os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"]            = "false"
 
 import contextlib
+import inspect
 import json
 import logging
 import platform
@@ -489,6 +490,36 @@ def _index_progress_state() -> dict:
         "indexing_source": source if indexing else "",
     }
 
+
+
+def _call_index_stream_factory(factory, path: str, force_refresh: bool):
+    try:
+        sig = inspect.signature(factory)
+        supports_force = (
+            "force_refresh" in sig.parameters
+            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        )
+    except (TypeError, ValueError):
+        supports_force = True
+    if supports_force:
+        return factory(path, force_refresh=force_refresh)
+    return factory(path)
+
+
+def _call_run_index_stream_compat(run_fn, path: str, source: str, emit_event, *, force_refresh: bool):
+    try:
+        sig = inspect.signature(run_fn)
+        supports_force = (
+            "force_refresh" in sig.parameters
+            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        )
+    except (TypeError, ValueError):
+        supports_force = True
+    if supports_force:
+        return run_fn(path, source=source, emit_event=emit_event, force_refresh=force_refresh)
+    return run_fn(path, source=source, emit_event=emit_event)
+
+
 def _set_auto_status(message: str) -> None:
     global _auto_status_message
     with _auto_status_lock:
@@ -563,9 +594,10 @@ def _run_index_stream(path: str, source: str, emit_event, change_batch: ChangeBa
 
         from indexer import index_codebase_stream
         done_event = None
+        error_event = None
         embedding_started_logged = False
         storage_started_logged = False
-        for event in index_codebase_stream(path, force_refresh=force_refresh):
+        for event in _call_index_stream_factory(index_codebase_stream, path, force_refresh):
             event = dict(event)
             event["source"] = source
             etype = event.get("type")
@@ -585,6 +617,8 @@ def _run_index_stream(path: str, source: str, emit_event, change_batch: ChangeBa
                     _index_phase_log(source, "storage_completed", total=event.get("total"))
             elif etype == "mapping":
                 _index_phase_log(source, "project_map_workspace_build_started", message=event.get("message", "mapping"))
+            elif etype == "error":
+                error_event = event
             elif etype == "done":
                 _index_phase_log(
                     source,
@@ -605,7 +639,7 @@ def _run_index_stream(path: str, source: str, emit_event, change_batch: ChangeBa
             if source == "auto":
                 decision = done_event.get("decision", "unknown")
                 _set_auto_status(f"Auto-refresh complete ({decision})")
-        return True
+        return bool(done_event and not error_event)
     except Exception as exc:
         _index_phase_log(source, "index_failed", failed_phase="run_index_stream", error=exc)
         emit_event({"type": "error", "source": source, "message": str(exc)})
@@ -1126,7 +1160,7 @@ async def index_project(request: Request):
 
         def _producer():
             try:
-                _run_index_stream(path, source="manual", emit_event=q.put, force_refresh=force_refresh)
+                _call_run_index_stream_compat(_run_index_stream, path, "manual", q.put, force_refresh=force_refresh)
             except Exception as e:
                 q.put({"type": "error", "message": str(e)})
             finally:

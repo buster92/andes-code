@@ -29,6 +29,7 @@ def test_indexing_state_blocks_restore_and_competing_actions() -> None:
     assert '&& !serverIndexing' in UI
     assert 'if (isIndexing) return;' in UI
     assert 'serverReportedIndexing' in UI
+    assert "if (reindexBtn) reindexBtn.innerHTML = '<span>↻</span> Reindex Project';" in UI
     assert 'manual_index_in_progress' in SERVER
     assert 'indexing_in_progress' in SERVER
 
