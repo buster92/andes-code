@@ -120,6 +120,70 @@ class TestIndexStateDecisions(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+
+    def test_force_refresh_stream_forces_full_rebuild_and_invalidates_cache(self):
+        tmp = Path(tempfile.mkdtemp(dir=Path.cwd()))
+        original_hash_store = self.indexer.HASH_STORE
+        original_project_map = self.indexer.PROJECT_MAP
+        original_symbol_index = self.indexer.SYMBOL_INDEX
+        original_workspace_index = self.indexer.WORKSPACE_INDEX
+        original_index_state = self.indexer.INDEX_STATE
+        original_integrity_state = self.indexer.INTEGRITY_STATE
+        original_chunk_count_state = self.indexer.CHUNK_COUNT_STATE
+        original_cache = self.indexer.CACHE
+        original_eval = self.indexer.evaluate_index_state
+        try:
+            self.indexer.HASH_STORE = tmp / ".file_hashes.json"
+            self.indexer.PROJECT_MAP = tmp / "project_map.json"
+            self.indexer.SYMBOL_INDEX = tmp / "symbol_index.json"
+            self.indexer.WORKSPACE_INDEX = tmp / "workspace_index.json"
+            self.indexer.INDEX_STATE = tmp / "index_state.json"
+            self.indexer.INTEGRITY_STATE = tmp / "integrity_state.json"
+            self.indexer.CHUNK_COUNT_STATE = tmp / "chunk_counts.json"
+            self.indexer.CACHE = self.indexer.AndesCacheManager(tmp / "cache")
+
+            invalidated = []
+            original_invalidate_repo = self.indexer.CACHE.invalidate_repo
+
+            def _record_invalidate(repo_fp, include_workspace=False):
+                invalidated.append((repo_fp, include_workspace))
+                return original_invalidate_repo(repo_fp, include_workspace=include_workspace)
+
+            self.indexer.CACHE.invalidate_repo = _record_invalidate
+
+            code = tmp / "app.py"
+            code.write_text("def answer():\n    return 42\n", encoding="utf-8")
+            self.indexer._save_hashes({
+                "__root__": str(tmp.resolve()),
+                "app.py": self.indexer._file_hash(code),
+                "__fingerprint__": "previous-fingerprint",
+            })
+            self.indexer._save_index_state({"repo_root": str(tmp.resolve()), "index_version": "1"})
+
+            def _force_reuse(_current, _stored, repo_changed):
+                return {"decision": self.indexer.DECISION_REUSE_ALL, "reasons": ["Nothing changed"]}
+
+            self.indexer.evaluate_index_state = _force_reuse
+            events = list(self.indexer.index_codebase_stream(str(tmp), force_refresh=True))
+            decision = [e for e in events if e.get("type") == "decision"][0]
+            done = [e for e in events if e.get("type") == "done"][-1]
+
+            self.assertEqual(decision.get("level"), self.indexer.DECISION_FULL_REBUILD)
+            self.assertIn("Forced reindex requested", decision.get("message", ""))
+            self.assertEqual(done.get("decision"), self.indexer.DECISION_FULL_REBUILD)
+            self.assertTrue(any(include_workspace for _repo, include_workspace in invalidated))
+        finally:
+            self.indexer.HASH_STORE = original_hash_store
+            self.indexer.PROJECT_MAP = original_project_map
+            self.indexer.SYMBOL_INDEX = original_symbol_index
+            self.indexer.WORKSPACE_INDEX = original_workspace_index
+            self.indexer.INDEX_STATE = original_index_state
+            self.indexer.INTEGRITY_STATE = original_integrity_state
+            self.indexer.CHUNK_COUNT_STATE = original_chunk_count_state
+            self.indexer.CACHE = original_cache
+            self.indexer.evaluate_index_state = original_eval
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_manifest_discovery_refresh_path_with_workspace_rebuild(self):
         tmp = Path(tempfile.mkdtemp(dir=Path.cwd()))
         try:

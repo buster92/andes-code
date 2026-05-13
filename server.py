@@ -466,9 +466,28 @@ _print(f"  [2/4] ✓ Embedding model ready" if INDEXER_READY
        else f"  [2/4] ⚠  Indexer unavailable")
 
 _index_run_lock = threading.Lock()
+_index_status_lock = threading.Lock()
+_current_index_source = ""
 _auto_status_lock = threading.Lock()
 _auto_status_message = "Auto-index idle"
 
+
+
+def _set_index_source(source: str) -> None:
+    global _current_index_source
+    with _index_status_lock:
+        _current_index_source = source
+
+
+def _index_progress_state() -> dict:
+    with _index_status_lock:
+        source = _current_index_source
+    indexing = _index_run_lock.locked()
+    return {
+        "indexing_in_progress": indexing,
+        "manual_index_in_progress": bool(indexing and source == "manual"),
+        "indexing_source": source if indexing else "",
+    }
 
 def _set_auto_status(message: str) -> None:
     global _auto_status_message
@@ -531,6 +550,7 @@ def _run_index_stream(path: str, source: str, emit_event, change_batch: ChangeBa
         emit_event({"type": "status", "source": source, "message": "Index already in progress"})
         return False
 
+    _set_index_source(source)
     try:
         if source == "auto" and _auto_index_manager:
             _auto_index_manager.notify_auto_run_start()
@@ -593,6 +613,7 @@ def _run_index_stream(path: str, source: str, emit_event, change_batch: ChangeBa
             _set_auto_status(f"Auto-refresh failed: {exc}")
         return False
     finally:
+        _set_index_source("")
         _index_run_lock.release()
         if source == "auto" and _auto_index_manager:
             rerun = _auto_index_manager.notify_auto_run_end()
@@ -688,6 +709,7 @@ def _index_runtime_state() -> dict:
         "restored_requires_confirmation": bool(has_persisted_index and not active),
         "project_map": project_map if isinstance(project_map, dict) else {},
         "indexed_root": indexed_root,
+        **_index_progress_state(),
     }
 
 # ── App ───────────────────────────────────────────────────────────────────────

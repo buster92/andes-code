@@ -330,6 +330,10 @@ def index_codebase_stream(root: str, force_refresh: bool = False) -> Generator[d
                 pass
         if previous_repo_fp:
             CACHE.invalidate_repo(previous_repo_fp, include_workspace=True)
+        if repo_fp and repo_fp != previous_repo_fp:
+            CACHE.invalidate_repo(repo_fp, include_workspace=True)
+        elif repo_fp and not previous_repo_fp:
+            CACHE.invalidate_repo(repo_fp, include_workspace=True)
         _save_chunk_count_state({})
     elif decision["decision"] == DECISION_REBUILD_WORKSPACE_ONLY:
         for reason in decision["reasons"]:
@@ -521,7 +525,7 @@ def index_codebase_stream(root: str, force_refresh: bool = False) -> Generator[d
         "reused":  len(unchanged),
         "map":     pmap,
         "repo_fingerprint": repo_fp,
-        "decision": DECISION_INCREMENTAL_REINDEX if repo_changed else DECISION_REUSE_ALL,
+        "decision": decision["decision"],
     }
 
 
