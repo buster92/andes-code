@@ -1238,6 +1238,8 @@ let localIndexRequestActive = false;
 let isIndexing = false;
 let currentProjectPath = "";
 let conversationCreatedAt = new Date().toISOString();
+let lastFreshnessCheckAt = 0;
+let dismissedFreshnessSignature = '';
 
 // ── Init ─────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {
@@ -1259,6 +1261,10 @@ window.addEventListener('DOMContentLoaded', () => {
     syncDebugToggleState();
   });
   syncDebugToggleState();
+  window.addEventListener('focus', maybeCheckIndexFreshnessOnFocus);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') maybeCheckIndexFreshnessOnFocus();
+  });
 });
 
 function syncDebugToggleState() {
@@ -1325,15 +1331,12 @@ async function checkStatus() {
     const active = !!d.active_index_session;
     const hasPersisted = !!d.has_persisted_index;
     const restoreNeeded = !!d.restored_requires_confirmation;
-    const auto = d.auto_index || {};
-    const serverReportedIndexing = !!(d.indexing_in_progress || d.manual_index_in_progress || auto.auto_index_in_progress);
+    const serverReportedIndexing = !!(d.indexing_in_progress || d.manual_index_in_progress);
     const serverIndexing = isIndexing || serverReportedIndexing;
     if (serverReportedIndexing && !isIndexing) {
       setIndexingState(true, d.manual_index_in_progress ? 'Indexing...' : 'Indexing...');
       document.getElementById('progressWrap').classList.add('visible');
-      document.getElementById('progressLabel').textContent = d.manual_index_in_progress
-        ? 'Indexing in progress...'
-        : 'Background indexing in progress...';
+      document.getElementById('progressLabel').textContent = 'Indexing in progress...';
       document.getElementById('progressPct').textContent = '…';
       document.getElementById('progressBar').style.width = '20%';
     } else if (!serverReportedIndexing && isIndexing && !localIndexRequestActive) {
@@ -1384,16 +1387,7 @@ async function checkStatus() {
 
     const autoLine = document.getElementById('autoIndexStatus');
     if (autoLine) {
-      const rootName = (auto.indexed_root || '').split('/').filter(Boolean).pop();
-      if (auto.watcher_enabled && auto.indexed_root) {
-        const pending = auto.pending_change_count || 0;
-        const state = auto.auto_index_in_progress ? 'indexing in background' : (auto.watcher_status || 'watching');
-        autoLine.textContent = `Auto-index: ${state}${rootName ? ` · ${rootName}` : ''}${pending ? ` · pending ${pending}` : ''}`;
-      } else if (auto.watcher_enabled) {
-        autoLine.textContent = 'Auto-index: idle';
-      } else {
-        autoLine.textContent = 'Auto-index: disabled';
-      }
+      autoLine.textContent = 'Freshness: checked on ask';
     }
   } catch {
     dot.className    = 'status-dot error';
@@ -1615,6 +1609,8 @@ async function indexCodebase(forceRefresh = false) {
             setProgress(100, doneMsg);
             indexedFiles = e.indexed;
             hasIndexed   = true;
+            dismissedFreshnessSignature = '';
+            clearFreshnessPrompt();
             currentProjectPath = pathVal;
             document.getElementById('statIndexed').textContent = e.indexed;
             document.getElementById('chatInput').placeholder   = 'Ask anything about your codebase...';
@@ -1665,6 +1661,75 @@ async function indexCodebase(forceRefresh = false) {
   }
 }
 
+function setProjectControlsDisabled(disabled) {
+  ['indexPath', 'pickFolderBtn', 'clearIndexBtn', 'indexBtn', 'reindexBtn'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = !!disabled;
+  });
+}
+
+function clearFreshnessPrompt() {
+  const prompt = document.getElementById('freshnessPrompt');
+  if (prompt) prompt.remove();
+}
+
+function freshnessSignature(freshness) {
+  return freshness?.change_signature || `${freshness?.indexed_root || ''}:${freshness?.changed_count || 0}:${freshness?.deleted_count || 0}`;
+}
+
+function showFreshnessPrompt(freshness) {
+  if (!hasIndexed || isIndexing || localIndexRequestActive) return;
+  const status = document.getElementById('indexStatus');
+  if (!status || document.getElementById('freshnessPrompt')) return;
+  const prompt = document.createElement('div');
+  prompt.id = 'freshnessPrompt';
+  prompt.style.display = 'grid';
+  prompt.style.gap = '8px';
+  prompt.innerHTML = `
+    <div>Project changed since last index.</div>
+    <div style="display:flex;gap:8px;">
+      <button class="btn btn-primary" id="refreshIndexPromptBtn" type="button">Refresh Index</button>
+      <button class="btn btn-ghost" id="dismissFreshnessPromptBtn" type="button">Dismiss</button>
+    </div>
+  `;
+  status.textContent = '';
+  status.className = 'index-status';
+  status.appendChild(prompt);
+  document.getElementById('refreshIndexPromptBtn').addEventListener('click', async () => {
+    clearFreshnessPrompt();
+    dismissedFreshnessSignature = '';
+    const input = document.getElementById('indexPath');
+    if (input && !input.value.trim() && currentProjectPath) input.value = currentProjectPath;
+    await indexCodebase(false);
+  });
+  document.getElementById('dismissFreshnessPromptBtn').addEventListener('click', () => {
+    dismissedFreshnessSignature = freshnessSignature(freshness);
+    clearFreshnessPrompt();
+  });
+}
+
+async function checkIndexFreshness() {
+  const resp = await fetch(`${API}/v1/index/freshness`);
+  if (!resp.ok) throw new Error(`Server error ${resp.status}`);
+  return resp.json();
+}
+
+async function maybeCheckIndexFreshnessOnFocus() {
+  if (!hasIndexed || isIndexing || localIndexRequestActive || isStreaming) return;
+  const now = Date.now();
+  if (now - lastFreshnessCheckAt < 60000) return;
+  lastFreshnessCheckAt = now;
+  try {
+    const freshness = await checkIndexFreshness();
+    const signature = freshnessSignature(freshness);
+    if (freshness?.ok && freshness.changed && signature !== dismissedFreshnessSignature) {
+      showFreshnessPrompt(freshness);
+    }
+  } catch (e) {
+    console.warn('[AndesCode] freshness check failed', e);
+  }
+}
+
 async function reindexCodebase() {
   const input = document.getElementById('indexPath');
   if (!input.value.trim() && currentProjectPath) input.value = currentProjectPath;
@@ -1695,7 +1760,7 @@ async function clearIndex() {
   } catch (_) {}
   pendingRestore = false;
   const autoLine = document.getElementById('autoIndexStatus');
-  if (autoLine) autoLine.textContent = 'Auto-index: idle';
+  if (autoLine) autoLine.textContent = 'Freshness: checked on ask';
 
   showToast('Index cleared — select a new project to index', 'success');
 }
@@ -1755,6 +1820,7 @@ function handleKey(e) {
 async function streamResponse(userText) {
   isStreaming = true;
   document.getElementById('sendBtn').disabled = true;
+  setProjectControlsDisabled(true);
 
   const t0   = performance.now();
   let   ttft = null;
@@ -1841,7 +1907,7 @@ async function streamResponse(userText) {
         if (content.includes('⚙️') || content.includes('📂') || content.includes('🧠') ||
             content.includes('Analyzing') || content.includes('Planning') ||
             content.includes('Loading') || content.includes('Thinking') ||
-            content.includes('Searching')) {
+            content.includes('Searching') || content.includes('Refreshing')) {
           // Update status line with step info
           const s = document.getElementById('statusMsg');
           if (s) {
@@ -1977,6 +2043,7 @@ async function streamResponse(userText) {
     </div>`;
   } finally {
     isStreaming = false;
+    setProjectControlsDisabled(false);
     document.getElementById('sendBtn').disabled = false;
     currentMsgEl = null;
     scrollToBottom();

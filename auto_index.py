@@ -1,4 +1,3 @@
-import os
 import threading
 import time
 from dataclasses import dataclass
@@ -56,10 +55,6 @@ class AutoIndexManager:
         self._rerun_requested = False
         self._last_auto_index_at: str | None = None
         self._watcher_status = "disabled" if not enabled else "idle"
-
-    @staticmethod
-    def env_enabled() -> bool:
-        return os.getenv("ANDESCODE_AUTO_INDEX", "1").strip().lower() in {"1", "true", "yes", "on"}
 
     @staticmethod
     def is_relevant_project_path(

@@ -8,6 +8,7 @@ os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"]            = "false"
 
 import contextlib
+import hashlib
 import inspect
 import json
 import logging
@@ -52,7 +53,6 @@ from andes_cache.routing import (
     semantic_cache_allowed,
     orchestration_plan,
 )
-from auto_index import AutoIndexManager, ChangeBatch
 from ask_orchestrator import (
     FunctionAnswerContextBuilder,
     FunctionRetrievalProvider,
@@ -469,8 +469,8 @@ _print(f"  [2/4] ✓ Embedding model ready" if INDEXER_READY
 _index_run_lock = threading.Lock()
 _index_status_lock = threading.Lock()
 _current_index_source = ""
-_auto_status_lock = threading.Lock()
-_auto_status_message = "Auto-index idle"
+_freshness_status_message = "Index freshness: checked on ask"
+_auto_index_manager = None  # compatibility only; no background refresh is started.
 
 
 
@@ -520,18 +520,8 @@ def _call_run_index_stream_compat(run_fn, path: str, source: str, emit_event, *,
     return run_fn(path, source=source, emit_event=emit_event)
 
 
-def _set_auto_status(message: str) -> None:
-    global _auto_status_message
-    with _auto_status_lock:
-        _auto_status_message = message
-    audit.info(f"AUTO_INDEX | {message}")
-
-
 def _read_integrity_probe_from_indexer() -> dict:
-    """
-    Optional startup visibility helper.
-    Keeps endpoint behavior testable even when the indexer is partially stubbed.
-    """
+    """Optional startup visibility helper that tolerates partial indexer stubs."""
     if not (INDEXER_READY and _indexer_module):
         return {}
     getter = getattr(_indexer_module, "get_startup_integrity_probe", None)
@@ -543,30 +533,165 @@ def _read_integrity_probe_from_indexer() -> dict:
         return {}
 
 
-def _snapshot_relevant_files(root_path: Path) -> dict[str, str]:
+def _indexable_current_hashes(root_path: Path) -> dict[str, str]:
+    """Return current hashes for indexable project files using indexer inclusion rules."""
     if not _indexer_module:
         return {}
-    supported = set(getattr(_indexer_module, "SUPPORTED_EXTENSIONS", set()))
-    manifests = set(getattr(_indexer_module, "MANIFEST_FILES", set()))
-    skip_dirs = set(getattr(_indexer_module, "SKIP_DIRS", set()))
-    file_hash = getattr(_indexer_module, "_file_hash")
+    collect_files = getattr(_indexer_module, "_collect_files", None)
+    file_hash = getattr(_indexer_module, "_file_hash", None)
+    if not callable(collect_files) or not callable(file_hash):
+        return {}
     snapshot: dict[str, str] = {}
-    for fp in root_path.rglob("*"):
-        if not fp.is_file():
+    for fp in collect_files(root_path):
+        try:
+            snapshot[str(Path(fp).relative_to(root_path))] = file_hash(Path(fp))
+        except Exception:
             continue
-        rel = str(fp.relative_to(root_path))
-        if not AutoIndexManager.is_relevant_project_path(
-            rel,
-            supported_suffixes=supported,
-            authoritative_basenames=manifests,
-            skip_dirs=skip_dirs,
-        ):
-            continue
-        snapshot[rel] = file_hash(fp)
     return snapshot
 
 
-def _run_index_stream(path: str, source: str, emit_event, change_batch: ChangeBatch | None = None, force_refresh: bool = False) -> bool:
+def _freshness_change_signature(
+    *,
+    indexed_root: str,
+    changed_count: int,
+    deleted_count: int,
+    changed_paths: list[str] | None = None,
+    deleted_paths: list[str] | None = None,
+) -> str:
+    """Stable opaque signature for one observed freshness-change state."""
+    digest_input = {
+        "indexed_root": indexed_root,
+        "changed_count": int(changed_count),
+        "deleted_count": int(deleted_count),
+        "changed_paths": sorted(changed_paths or []),
+        "deleted_paths": sorted(deleted_paths or []),
+    }
+    encoded = json.dumps(digest_input, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24]
+
+
+def _index_freshness_payload() -> dict:
+    t0 = time.perf_counter()
+    checked_at = datetime.now(timezone.utc).isoformat()
+    if not _load_indexer() or not _indexer_module:
+        return {
+            "ok": False,
+            "has_index": False,
+            "indexed_root": "",
+            "changed": False,
+            "changed_count": 0,
+            "deleted_count": 0,
+            "change_signature": "",
+            "checked_at": checked_at,
+            "check_duration_ms": int((time.perf_counter() - t0) * 1000),
+            "error": "Indexer not available",
+        }
+    try:
+        hashes = _indexer_module._load_hashes() if hasattr(_indexer_module, "_load_hashes") else {}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "has_index": False,
+            "indexed_root": "",
+            "changed": False,
+            "changed_count": 0,
+            "deleted_count": 0,
+            "change_signature": "",
+            "checked_at": checked_at,
+            "check_duration_ms": int((time.perf_counter() - t0) * 1000),
+            "error": f"Unable to read index snapshot: {exc}",
+        }
+    indexed_root = str(hashes.get("__root__", "") or "") if isinstance(hashes, dict) else ""
+    indexed_hashes = {k: v for k, v in (hashes or {}).items() if not str(k).startswith("__")}
+    has_index = bool(indexed_root and indexed_hashes)
+    if not indexed_root or not indexed_hashes:
+        return {
+            "ok": True,
+            "has_index": False,
+            "indexed_root": indexed_root,
+            "changed": False,
+            "changed_count": 0,
+            "deleted_count": 0,
+            "change_signature": "",
+            "checked_at": checked_at,
+            "check_duration_ms": int((time.perf_counter() - t0) * 1000),
+        }
+    root_path = Path(indexed_root)
+    if not root_path.exists():
+        deleted_paths = sorted(indexed_hashes)
+        deleted_count = len(deleted_paths)
+        return {
+            "ok": True,
+            "has_index": True,
+            "indexed_root": indexed_root,
+            "changed": True,
+            "changed_count": 0,
+            "deleted_count": deleted_count,
+            "change_signature": _freshness_change_signature(
+                indexed_root=indexed_root,
+                changed_count=0,
+                deleted_count=deleted_count,
+                deleted_paths=deleted_paths,
+            ),
+            "checked_at": checked_at,
+            "check_duration_ms": int((time.perf_counter() - t0) * 1000),
+        }
+    current_hashes = _indexable_current_hashes(root_path)
+    current_paths = set(current_hashes)
+    indexed_paths = set(indexed_hashes)
+    changed_paths = sorted(rel for rel, digest in current_hashes.items() if indexed_hashes.get(rel) != digest)
+    deleted_paths = sorted(indexed_paths - current_paths)
+    changed_count = len(changed_paths)
+    deleted_count = len(deleted_paths)
+    changed = bool(changed_count or deleted_count)
+    return {
+        "ok": True,
+        "has_index": has_index,
+        "indexed_root": indexed_root,
+        "changed": changed,
+        "changed_count": changed_count,
+        "deleted_count": deleted_count,
+        "change_signature": (
+            _freshness_change_signature(
+                indexed_root=indexed_root,
+                changed_count=changed_count,
+                deleted_count=deleted_count,
+                changed_paths=changed_paths,
+                deleted_paths=deleted_paths,
+            )
+            if changed else ""
+        ),
+        "checked_at": checked_at,
+        "check_duration_ms": int((time.perf_counter() - t0) * 1000),
+    }
+
+
+def _refresh_index_before_answer_if_needed(emit_event=None) -> tuple[bool, str, dict]:
+    freshness = _index_freshness_payload()
+    if not freshness.get("ok", False):
+        return False, str(freshness.get("error") or "Unable to check index freshness"), freshness
+    if not freshness.get("has_index", False) or not freshness.get("changed", False):
+        return True, "", freshness
+    root = str(freshness.get("indexed_root") or "")
+    if not root:
+        return False, "No indexed project root is available for refresh.", freshness
+    events = []
+    def _emit(event):
+        events.append(event)
+        if callable(emit_event):
+            emit_event(event)
+    ok = _run_index_stream(root, source="query", emit_event=_emit, force_refresh=False)
+    if not ok:
+        message = "Index refresh failed before answering."
+        for event in reversed(events):
+            if event.get("type") == "error" and event.get("message"):
+                message = str(event.get("message"))
+                break
+        return False, message, freshness
+    return True, "", freshness
+
+
+def _run_index_stream(path: str, source: str, emit_event, change_batch=None, force_refresh: bool = False) -> bool:
     _index_phase_log(source, "index_request_started", path=path)
     if not _load_indexer():
         _index_phase_log(source, "index_failed", failed_phase="load_indexer", error="Indexer not available")
@@ -575,23 +700,11 @@ def _run_index_stream(path: str, source: str, emit_event, change_batch: ChangeBa
 
     acquired = _index_run_lock.acquire(blocking=False)
     if not acquired:
-        if source == "auto" and _auto_index_manager:
-            _auto_index_manager.request_rerun_if_busy()
-            _set_auto_status("Index already in progress; queued one follow-up auto-refresh")
         emit_event({"type": "status", "source": source, "message": "Index already in progress"})
         return False
 
     _set_index_source(source)
     try:
-        if source == "auto" and _auto_index_manager:
-            _auto_index_manager.notify_auto_run_start()
-            count = change_batch.count if change_batch else 0
-            if change_batch and change_batch.deleted_paths:
-                _set_auto_status(f"{count} file changes detected; file deletion detected, performing safe rebuild check")
-            else:
-                _set_auto_status(f"{count} file changes detected; running background refresh")
-            emit_event({"type": "auto_status", "source": source, "message": "Detected file changes, refreshing index..."})
-
         from indexer import index_codebase_stream
         done_event = None
         error_event = None
@@ -628,55 +741,20 @@ def _run_index_stream(path: str, source: str, emit_event, change_batch: ChangeBa
                     decision=event.get("decision"),
                 )
                 _index_phase_log(source, "project_map_workspace_build_completed", indexed=event.get("indexed"))
-            if source == "auto" and event.get("type") == "decision":
-                _set_auto_status(event.get("message", "Auto-index decision emitted"))
             emit_event(event)
             if event.get("type") == "done":
                 done_event = event
 
-        if done_event and _auto_index_manager:
-            _auto_index_manager.start_for_root(path)
-            if source == "auto":
-                decision = done_event.get("decision", "unknown")
-                _set_auto_status(f"Auto-refresh complete ({decision})")
         return bool(done_event and not error_event)
     except Exception as exc:
         _index_phase_log(source, "index_failed", failed_phase="run_index_stream", error=exc)
         emit_event({"type": "error", "source": source, "message": str(exc)})
-        if source == "auto":
-            _set_auto_status(f"Auto-refresh failed: {exc}")
         return False
     finally:
         _set_index_source("")
         _index_run_lock.release()
-        if source == "auto" and _auto_index_manager:
-            rerun = _auto_index_manager.notify_auto_run_end()
-            if rerun:
-                _set_auto_status("Additional file changes arrived during indexing; running one follow-up refresh")
-                _start_auto_index(path, ChangeBatch(changed_paths=set(), deleted_paths=set()))
 
 
-def _auto_run_index(path: str, batch: ChangeBatch) -> None:
-    _run_index_stream(path, source="auto", emit_event=lambda _event: None, change_batch=batch)
-
-
-def _start_auto_index(path: str, batch: ChangeBatch) -> bool:
-    if _index_run_lock.locked():
-        if _auto_index_manager:
-            _auto_index_manager.request_rerun_if_busy()
-        return False
-    threading.Thread(target=_auto_run_index, args=(path, batch), daemon=True).start()
-    return True
-
-
-_auto_index_manager = AutoIndexManager(
-    snapshot_fn=_snapshot_relevant_files,
-    run_index_fn=_start_auto_index,
-    status_logger=_set_auto_status,
-    debounce_seconds=float(os.getenv("ANDESCODE_AUTO_INDEX_DEBOUNCE_SEC", "2.0")),
-    poll_interval=float(os.getenv("ANDESCODE_AUTO_INDEX_POLL_SEC", "1.0")),
-    enabled=AutoIndexManager.env_enabled(),
-)
 
 # ── Step 3: KV cache warm-up ──────────────────────────────────────────────────
 _print(f"  [3/4] Warming KV cache...")
@@ -767,10 +845,8 @@ def serve_ui():
 @app.get("/v1")
 def root():
     runtime_state = _index_runtime_state()
-    auto_state = _auto_index_manager.status() if _auto_index_manager else {}
-    integrity_probe = {}
-    with _auto_status_lock:
-        auto_message = _auto_status_message
+    auto_state = {}
+    auto_message = _freshness_status_message
     integrity_probe = _read_integrity_probe_from_indexer()
     # Expose both startup snapshot and current env state so UI/debug tooling can
     # distinguish "started with debug" from "debug is currently enabled now".
@@ -793,12 +869,13 @@ def root():
 
 @app.get("/v1/index/state")
 def index_state():
-    state = _auto_index_manager.status() if _auto_index_manager else {}
-    integrity_probe = {}
-    with _auto_status_lock:
-        message = _auto_status_message
     integrity_probe = _read_integrity_probe_from_indexer()
-    return {**state, **_index_runtime_state(), "status_message": message, "integrity_probe": integrity_probe}
+    return {**_index_runtime_state(), "status_message": _freshness_status_message, "integrity_probe": integrity_probe}
+
+
+@app.get("/v1/index/freshness")
+def index_freshness():
+    return _index_freshness_payload()
 
 
 
@@ -857,6 +934,28 @@ async def chat(request: Request):
 
     if execution_mode == ExecutionMode.REMOTE_INFERENCE:
         _phase_log(request_id, "remote_mode_enabled", enabled=True)
+        if stream:
+            return StreamingResponse(
+                _remote_proxy_stream_with_freshness(messages, max_tokens, request_id, debug_mode),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+            )
+        ok, refresh_error, freshness = _refresh_index_before_answer_if_needed()
+        if not ok:
+            _phase_log(request_id, "index_refresh_failed", error=refresh_error)
+            return _remote_error_payload(
+                "index_refresh_failed",
+                f"Index refresh failed before answering: {refresh_error}",
+                request_id=request_id,
+                details={"freshness": freshness},
+            )
+        if not freshness.get("has_index", False) and not hasattr(_indexer_module, "ROOT"):
+            return _remote_error_payload(
+                "index_not_ready",
+                "Local index is required for REMOTE_INFERENCE mode retrieval.",
+                request_id=request_id,
+                details={"freshness": freshness},
+            )
         payload, client_debug = _collect_local_remote_payload(
             messages=messages,
             request_id=request_id,
@@ -994,11 +1093,23 @@ async def chat(request: Request):
     if stream:
         # TODO(phase3): streaming path not yet wrapped by LocalAskOrchestrator — bypasses orchestration boundary
         return StreamingResponse(
-            _stream(messages, max_tokens, request_id, t_start, debug_mode=debug_mode),
+            _stream_with_freshness(messages, max_tokens, request_id, t_start, debug_mode=debug_mode),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
                      "X-Accel-Buffering": "no"},
         )
+
+    ok, refresh_error, freshness = _refresh_index_before_answer_if_needed()
+    if not ok:
+        _phase_log(request_id, "index_refresh_failed", error=refresh_error)
+        return {
+            "ok": False,
+            "error": {
+                "code": "index_refresh_failed",
+                "message": f"Index refresh failed before answering: {refresh_error}",
+                "freshness": freshness,
+            },
+        }
 
     orchestrator = LocalAskOrchestrator(
         retrieval=FunctionRetrievalProvider(build_context_fn=_build_context),
@@ -1038,6 +1149,133 @@ async def chat(request: Request):
                      "finish_reason": "stop"}],
         "debug": (debug_payload if debug_mode else None),
     }
+
+
+async def _stream_with_freshness(messages: list, max_tokens: int, request_id: str, t_start: float, debug_mode: bool = False):
+    freshness = _index_freshness_payload()
+    if freshness.get("ok") and freshness.get("has_index") and freshness.get("changed"):
+        yield _make_chunk("⚙️ _Refreshing index before answering..._", request_id)
+        events = []
+        def _emit(event):
+            events.append(event)
+        ok = _run_index_stream(str(freshness.get("indexed_root") or ""), source="query", emit_event=_emit, force_refresh=False)
+        if not ok:
+            message = "Index refresh failed before answering."
+            for event in reversed(events):
+                if event.get("type") == "error" and event.get("message"):
+                    message = str(event.get("message"))
+                    break
+            yield _make_pipeline_error_event(request_id, "index_refresh", RuntimeError(message))
+            yield _make_error_chunk(request_id, "index_refresh", RuntimeError(message))
+            yield "data: [DONE]\n\n"
+            return
+    elif not freshness.get("ok", False):
+        message = str(freshness.get("error") or "Unable to check index freshness")
+        yield _make_pipeline_error_event(request_id, "index_freshness", RuntimeError(message))
+        yield _make_error_chunk(request_id, "index_freshness", RuntimeError(message))
+        yield "data: [DONE]\n\n"
+        return
+
+    async for chunk in _stream(messages, max_tokens, request_id, t_start, debug_mode=debug_mode):
+        yield chunk
+
+
+async def _remote_proxy_stream_with_freshness(messages: list, max_tokens: int, request_id: str, debug_mode: bool = False):
+    freshness = _index_freshness_payload()
+    if freshness.get("ok") and freshness.get("has_index") and freshness.get("changed"):
+        yield _make_chunk("⚙️ _Refreshing index before answering..._", request_id)
+        events = []
+        def _emit(event):
+            events.append(event)
+        ok = _run_index_stream(str(freshness.get("indexed_root") or ""), source="query", emit_event=_emit, force_refresh=False)
+        if not ok:
+            message = "Index refresh failed before answering."
+            for event in reversed(events):
+                if event.get("type") == "error" and event.get("message"):
+                    message = str(event.get("message"))
+                    break
+            yield _remote_proxy_sse_error(request_id, "index_refresh_failed", f"Index refresh failed before answering: {message}", phase="index_refresh")
+            yield "data: [DONE]\n\n"
+            return
+    elif not freshness.get("ok", False):
+        message = str(freshness.get("error") or "Unable to check index freshness")
+        yield _remote_proxy_sse_error(request_id, "index_freshness_failed", message, phase="index_freshness")
+        yield "data: [DONE]\n\n"
+        return
+
+    if not freshness.get("has_index", False) and not hasattr(_indexer_module, "ROOT"):
+        yield _remote_proxy_sse_error(
+            request_id,
+            "index_not_ready",
+            "Local index is required for REMOTE_INFERENCE mode retrieval.",
+            phase="index_freshness",
+        )
+        yield "data: [DONE]\n\n"
+        return
+
+    payload, client_debug = _collect_local_remote_payload(
+        messages=messages,
+        request_id=request_id,
+        max_tokens=max_tokens,
+        debug_mode=debug_mode,
+        stream=True,
+    )
+    if payload is None:
+        yield _remote_proxy_sse_error(
+            request_id,
+            "remote_payload_unavailable",
+            "Failed to build remote inference payload.",
+            phase="remote_payload",
+        )
+        yield "data: [DONE]\n\n"
+        return
+
+    endpoint = f"{REMOTE_INFERENCE_SERVER_URL}/v1/ask"
+    serialized = json.dumps(payload).encode("utf-8")
+    saw_done = False
+    done_scan_buffer = ""
+    try:
+        req = url_request.Request(
+            endpoint,
+            data=serialized,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        _phase_log(request_id, "remote_payload_send_started", endpoint=endpoint, stream=True)
+        with url_request.urlopen(req, timeout=180) as resp:
+            while True:
+                part = resp.read(4096)
+                if not part:
+                    break
+                decoded = part.decode("utf-8", errors="ignore")
+                done_scan_buffer = f"{done_scan_buffer}{decoded}"[-32:]
+                if "[DONE]" in done_scan_buffer:
+                    saw_done = True
+                yield decoded
+        _phase_log(request_id, "remote_payload_send_succeeded", stream=True)
+    except url_error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        _phase_log(request_id, "remote_payload_send_failed", stream=True, error=reason)
+        yield _remote_proxy_sse_error(request_id, "remote_unreachable", f"Remote server unreachable: {reason}")
+        yield "data: [DONE]\n\n"
+    except url_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        _phase_log(request_id, "remote_payload_send_failed", stream=True, status=exc.code)
+        yield _remote_proxy_sse_error(request_id, "remote_http_error", detail or str(exc))
+        yield "data: [DONE]\n\n"
+    except Exception as exc:
+        _phase_log(request_id, "remote_payload_send_failed", stream=True, error=exc)
+        yield _remote_proxy_sse_error(request_id, "remote_stream_interrupted", str(exc))
+        yield "data: [DONE]\n\n"
+    else:
+        if not saw_done:
+            _phase_log(request_id, "remote_stream_interrupted", reason="missing_done_event")
+            yield _remote_proxy_sse_error(
+                request_id,
+                "remote_stream_interrupted",
+                "Remote stream ended unexpectedly before completion marker.",
+            )
+            yield "data: [DONE]\n\n"
 
 
 @app.post("/v1/ask")
@@ -1196,8 +1434,6 @@ async def index_project(request: Request):
 
 @app.post("/v1/index/clear")
 async def clear_index_state():
-    _auto_index_manager.stop()
-    _set_auto_status("Index watcher stopped")
     if INDEXER_READY and _indexer_module:
         try:
             _indexer_module.chroma.delete_collection(_indexer_module.COLLECTION)
@@ -1225,7 +1461,7 @@ async def clear_index_state():
         except Exception:
             pass
     _set_active_index_session(False)
-    return {"ok": True, "doc_count": 0, "active_index_session": False, "watcher_status": _auto_index_manager.status()}
+    return {"ok": True, "doc_count": 0, "active_index_session": False}
 
 
 @app.post("/v1/index/restore")
