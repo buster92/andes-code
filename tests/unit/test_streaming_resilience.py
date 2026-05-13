@@ -170,6 +170,43 @@ class TestStreamingResilience(unittest.TestCase):
         self.assertIn("phase=embedding_completed", logs)
         self.assertIn("phase=storage_completed", logs)
 
+
+    def test_manual_index_state_reports_active_then_resets(self):
+        server = self.server
+        server.INDEXER_READY = True
+        server._indexer_module = object()
+        old_auto_manager = server._auto_index_manager
+        server._auto_index_manager = None
+
+        import sys
+        fake_indexer = sys.modules["indexer"]
+        old_stream = getattr(fake_indexer, "index_codebase_stream", None)
+        observed = []
+
+        def _stream(_path):
+            active_state = server.index_state()
+            observed.append(active_state)
+            yield {"type": "scan", "files": 1, "new": 1, "unchanged": 0}
+            yield {"type": "done", "indexed": 1, "chunks": 1, "decision": "incremental"}
+
+        fake_indexer.index_codebase_stream = _stream
+        try:
+            ok = server._run_index_stream("/tmp/project", "manual", lambda _event: None)
+            self.assertTrue(ok)
+            self.assertTrue(observed)
+            self.assertTrue(observed[0]["indexing_in_progress"])
+            self.assertTrue(observed[0]["manual_index_in_progress"])
+            self.assertEqual(observed[0]["indexing_source"], "manual")
+
+            complete_state = server.index_state()
+            self.assertFalse(complete_state["indexing_in_progress"])
+            self.assertFalse(complete_state["manual_index_in_progress"])
+            self.assertEqual(complete_state["indexing_source"], "")
+        finally:
+            if old_stream is not None:
+                fake_indexer.index_codebase_stream = old_stream
+            server._auto_index_manager = old_auto_manager
+
     def test_file_neighborhood_handles_structured_import_graph_without_type_error(self):
         server = self.server
         workspace = {

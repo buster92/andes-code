@@ -8,6 +8,7 @@ os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"]            = "false"
 
 import contextlib
+import inspect
 import json
 import logging
 import platform
@@ -27,6 +28,7 @@ from urllib import request as url_request
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 from runtime_paths import get_runtime_log_path
+from conversation_export import write_conversation_export
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -465,8 +467,57 @@ _print(f"  [2/4] ✓ Embedding model ready" if INDEXER_READY
        else f"  [2/4] ⚠  Indexer unavailable")
 
 _index_run_lock = threading.Lock()
+_index_status_lock = threading.Lock()
+_current_index_source = ""
 _auto_status_lock = threading.Lock()
 _auto_status_message = "Auto-index idle"
+
+
+
+def _set_index_source(source: str) -> None:
+    global _current_index_source
+    with _index_status_lock:
+        _current_index_source = source
+
+
+def _index_progress_state() -> dict:
+    with _index_status_lock:
+        source = _current_index_source
+    indexing = _index_run_lock.locked()
+    return {
+        "indexing_in_progress": indexing,
+        "manual_index_in_progress": bool(indexing and source == "manual"),
+        "indexing_source": source if indexing else "",
+    }
+
+
+
+def _call_index_stream_factory(factory, path: str, force_refresh: bool):
+    try:
+        sig = inspect.signature(factory)
+        supports_force = (
+            "force_refresh" in sig.parameters
+            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        )
+    except (TypeError, ValueError):
+        supports_force = True
+    if supports_force:
+        return factory(path, force_refresh=force_refresh)
+    return factory(path)
+
+
+def _call_run_index_stream_compat(run_fn, path: str, source: str, emit_event, *, force_refresh: bool):
+    try:
+        sig = inspect.signature(run_fn)
+        supports_force = (
+            "force_refresh" in sig.parameters
+            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        )
+    except (TypeError, ValueError):
+        supports_force = True
+    if supports_force:
+        return run_fn(path, source=source, emit_event=emit_event, force_refresh=force_refresh)
+    return run_fn(path, source=source, emit_event=emit_event)
 
 
 def _set_auto_status(message: str) -> None:
@@ -515,7 +566,7 @@ def _snapshot_relevant_files(root_path: Path) -> dict[str, str]:
     return snapshot
 
 
-def _run_index_stream(path: str, source: str, emit_event, change_batch: ChangeBatch | None = None) -> bool:
+def _run_index_stream(path: str, source: str, emit_event, change_batch: ChangeBatch | None = None, force_refresh: bool = False) -> bool:
     _index_phase_log(source, "index_request_started", path=path)
     if not _load_indexer():
         _index_phase_log(source, "index_failed", failed_phase="load_indexer", error="Indexer not available")
@@ -530,6 +581,7 @@ def _run_index_stream(path: str, source: str, emit_event, change_batch: ChangeBa
         emit_event({"type": "status", "source": source, "message": "Index already in progress"})
         return False
 
+    _set_index_source(source)
     try:
         if source == "auto" and _auto_index_manager:
             _auto_index_manager.notify_auto_run_start()
@@ -542,9 +594,10 @@ def _run_index_stream(path: str, source: str, emit_event, change_batch: ChangeBa
 
         from indexer import index_codebase_stream
         done_event = None
+        error_event = None
         embedding_started_logged = False
         storage_started_logged = False
-        for event in index_codebase_stream(path):
+        for event in _call_index_stream_factory(index_codebase_stream, path, force_refresh):
             event = dict(event)
             event["source"] = source
             etype = event.get("type")
@@ -564,6 +617,8 @@ def _run_index_stream(path: str, source: str, emit_event, change_batch: ChangeBa
                     _index_phase_log(source, "storage_completed", total=event.get("total"))
             elif etype == "mapping":
                 _index_phase_log(source, "project_map_workspace_build_started", message=event.get("message", "mapping"))
+            elif etype == "error":
+                error_event = event
             elif etype == "done":
                 _index_phase_log(
                     source,
@@ -584,7 +639,7 @@ def _run_index_stream(path: str, source: str, emit_event, change_batch: ChangeBa
             if source == "auto":
                 decision = done_event.get("decision", "unknown")
                 _set_auto_status(f"Auto-refresh complete ({decision})")
-        return True
+        return bool(done_event and not error_event)
     except Exception as exc:
         _index_phase_log(source, "index_failed", failed_phase="run_index_stream", error=exc)
         emit_event({"type": "error", "source": source, "message": str(exc)})
@@ -592,6 +647,7 @@ def _run_index_stream(path: str, source: str, emit_event, change_batch: ChangeBa
             _set_auto_status(f"Auto-refresh failed: {exc}")
         return False
     finally:
+        _set_index_source("")
         _index_run_lock.release()
         if source == "auto" and _auto_index_manager:
             rerun = _auto_index_manager.notify_auto_run_end()
@@ -662,6 +718,7 @@ def _get_active_index_session() -> bool:
 def _index_runtime_state() -> dict:
     doc_count = 0
     project_map = {}
+    indexed_root = ""
     has_persisted_index = False
     if INDEXER_READY and _indexer_module:
         try:
@@ -672,6 +729,11 @@ def _index_runtime_state() -> dict:
             project_map = _indexer_module._load_project_map() if hasattr(_indexer_module, "_load_project_map") else {}
         except Exception:
             project_map = {}
+        try:
+            hashes = _indexer_module._load_hashes() if hasattr(_indexer_module, "_load_hashes") else {}
+            indexed_root = str(hashes.get("__root__", "") or "") if isinstance(hashes, dict) else ""
+        except Exception:
+            indexed_root = ""
         has_persisted_index = bool(doc_count > 0)
     active = _get_active_index_session()
     return {
@@ -680,6 +742,8 @@ def _index_runtime_state() -> dict:
         "active_index_session": active,
         "restored_requires_confirmation": bool(has_persisted_index and not active),
         "project_map": project_map if isinstance(project_map, dict) else {},
+        "indexed_root": indexed_root,
+        **_index_progress_state(),
     }
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -735,6 +799,27 @@ def index_state():
         message = _auto_status_message
     integrity_probe = _read_integrity_probe_from_indexer()
     return {**state, **_index_runtime_state(), "status_message": message, "integrity_probe": integrity_probe}
+
+
+
+@app.post("/v1/conversation/export")
+async def export_conversation(request: Request):
+    body = await request.json()
+    messages = body.get("messages") or []
+    title = str(body.get("title") or "AndesCode Conversation")
+    created_at = body.get("created_at")
+
+    if not isinstance(messages, list) or not messages:
+        raise HTTPException(status_code=400, detail="No conversation messages to export.")
+
+    try:
+        path = write_conversation_export(messages, title=title, created_at=created_at)
+    except Exception as exc:
+        audit.error(f"EXPORT | failed | error={exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to export conversation: {exc}")
+
+    audit.info(f"EXPORT | conversation | path={_safe(str(path))} | messages={len(messages)}")
+    return {"ok": True, "path": str(path)}
 
 
 @app.get("/v1/models")
@@ -1061,6 +1146,7 @@ async def debug_explain(request: Request):
 async def index_project(request: Request):
     body = await request.json()
     path = body.get("path", ".")
+    force_refresh = bool(body.get("force_refresh") or body.get("reindex"))
 
     _set_active_index_session(False)
 
@@ -1074,7 +1160,7 @@ async def index_project(request: Request):
 
         def _producer():
             try:
-                _run_index_stream(path, source="manual", emit_event=q.put)
+                _call_run_index_stream_compat(_run_index_stream, path, "manual", q.put, force_refresh=force_refresh)
             except Exception as e:
                 q.put({"type": "error", "message": str(e)})
             finally:
