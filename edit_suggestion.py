@@ -52,6 +52,36 @@ def is_edit_suggestion_query(query: str) -> bool:
     return any(pattern.search(q) for pattern in _EDIT_INTENT_PATTERNS)
 
 
+def is_symbol_optional_file(path: str) -> bool:
+    """Return True for config/build/docs files where indexed symbols are not expected."""
+    normalized = (path or "").replace("\\", "/").lower().strip()
+    if not normalized:
+        return False
+    name = Path(normalized).name
+    if normalized.startswith(".github/workflows/") or "/.github/workflows/" in normalized:
+        return True
+    if name in {
+        "package.json",
+        "dockerfile",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "settings.gradle",
+        "settings.gradle.kts",
+        "build.gradle",
+        "build.gradle.kts",
+    }:
+        return True
+    return any(
+        normalized.endswith(ext)
+        for ext in (".yml", ".yaml", ".json", ".toml", ".ini", ".md", ".txt")
+    )
+
+
+def requires_symbol_evidence(path: str) -> bool:
+    """Return True when edit evidence should include a symbol/method/class name."""
+    return bool(path and not is_symbol_optional_file(path))
+
+
 def edit_suggestion_policy() -> str:
     """Strict prompt contract for read-only, repo-grounded edit suggestions."""
     return (
@@ -142,8 +172,9 @@ def build_edit_suggestion_context(chunks: list[dict[str, Any]], *, query: str = 
     missing: list[str] = []
     if not files:
         missing.append("relevant files")
-    if not symbols:
-        missing.append("symbols or methods in the relevant files")
+    has_symbol_optional_file = any(is_symbol_optional_file(path) for path in files)
+    if not symbols and files and not has_symbol_optional_file:
+        missing.append("symbols or methods in the relevant source files")
     return EditSuggestionContext(files=files, symbols=symbols, validation_commands=commands, existing_mechanisms=existing, missing_context=tuple(missing))
 
 
@@ -156,9 +187,12 @@ def safe_context_fallback(missing_context: Iterable[str]) -> str:
 
 def answer_has_file_and_symbol_evidence(answer: str, ctx: EditSuggestionContext) -> bool:
     text = answer or ""
-    has_file = any(f and f in text for f in ctx.files)
-    has_symbol = any(s and re.search(rf"\b{re.escape(s)}\b", text) for s in ctx.symbols)
-    return has_file and has_symbol
+    cited_files = [f for f in ctx.files if f and f in text]
+    if not cited_files:
+        return False
+    if any(is_symbol_optional_file(f) for f in cited_files):
+        return True
+    return any(s and re.search(rf"\b{re.escape(s)}\b", text) for s in ctx.symbols)
 
 
 def enforce_edit_suggestion_output(answer: str, ctx: EditSuggestionContext) -> str:

@@ -17,6 +17,7 @@ from edit_suggestion import (
     edit_suggestion_policy,
     enforce_edit_suggestion_output,
     is_edit_suggestion_query,
+    is_symbol_optional_file,
 )
 from tests.unit.test_server_stream_debug_mode import _import_server_with_stubs
 
@@ -55,6 +56,17 @@ class _ValidEditAnswerLlm:
         if stream:
             return iter([{"choices": [{"text": answer}]}])
         return {"choices": [{"text": "src/cache.py"}]}
+
+
+def _contract_answer(file_path, evidence="file-only"):
+    return (
+        f"Finding: `{file_path}` currently contains the behavior to update.\n\n"
+        f"Evidence: `{file_path}` and {evidence}.\n\n"
+        f"Recommended change: Make one minimal change in `{file_path}`.\n\n"
+        f"Patch plan: Update `{file_path}` only.\n\n"
+        "Validation: pytest\n\n"
+        "Confidence: high"
+    )
 
 
 class TestEditSuggestionMode(unittest.TestCase):
@@ -98,6 +110,54 @@ class TestEditSuggestionMode(unittest.TestCase):
         answer = "You should add a repository layer and improve error handling."
         filtered = enforce_edit_suggestion_output(answer, ctx)
         self.assertIn("I do not have enough repo-grounded context to propose a safe edit.", filtered)
+        self.assertIn("relevant files", filtered)
+
+    def test_config_build_docs_file_only_evidence_survives_without_symbols(self):
+        cases = [
+            ("package.json", "{}"),
+            (".github/workflows/ci.yml", "name: ci"),
+            ("Dockerfile", "FROM python:3.11"),
+            ("README.md", "# Project"),
+        ]
+        for path, content in cases:
+            with self.subTest(path=path):
+                self.assertTrue(is_symbol_optional_file(path))
+                ctx = build_edit_suggestion_context(
+                    [{"file": path, "content": content, "symbols": ""}],
+                    query="suggest one update",
+                )
+                self.assertEqual(ctx.missing_context, ())
+                answer = _contract_answer(path)
+                self.assertEqual(enforce_edit_suggestion_output(answer, ctx), answer)
+
+    def test_source_code_without_symbols_still_falls_back(self):
+        ctx = build_edit_suggestion_context(
+            [{"file": "src/cache.py", "content": "CACHE_ENABLED = True", "symbols": ""}],
+            query="fix this bug",
+        )
+        answer = _contract_answer("src/cache.py")
+        filtered = enforce_edit_suggestion_output(answer, ctx)
+        self.assertIn("I do not have enough repo-grounded context", filtered)
+        self.assertIn("symbols or methods in the relevant source files", filtered)
+
+    def test_source_code_with_file_and_symbol_still_passes(self):
+        ctx = build_edit_suggestion_context(
+            [
+                {
+                    "file": "src/cache.py",
+                    "content": "class CacheManager:\n    pass\n",
+                    "symbols": "CacheManager",
+                }
+            ],
+            query="fix this bug",
+        )
+        answer = _contract_answer("src/cache.py", evidence="`CacheManager`")
+        self.assertEqual(enforce_edit_suggestion_output(answer, ctx), answer)
+
+    def test_safe_fallback_still_appears_when_no_relevant_files_are_retrieved(self):
+        ctx = build_edit_suggestion_context([], query="fix this bug")
+        filtered = enforce_edit_suggestion_output(_contract_answer("package.json"), ctx)
+        self.assertIn("I do not have enough repo-grounded context", filtered)
         self.assertIn("relevant files", filtered)
 
     def test_existing_mechanism_is_reported_instead_of_suggested_as_new(self):
