@@ -130,6 +130,13 @@ def _remote_error_event(code="remote_failed", message="remote failed"):
     }) + "\n\n"
 
 
+def _remote_debug_event():
+    return "event: debug\n" + "data: " + json.dumps({
+        "object": "debug.payload",
+        "debug": {"query": "fix this bug", "retrieval": {"strategy": "test"}},
+    }) + "\n\n"
+
+
 class _GenericRemoteLlm:
     def __call__(self, _prompt, max_tokens=0, stream=False, echo=False):
         text = "You should consider improving architecture."
@@ -625,8 +632,8 @@ class TestEditSuggestionRemoteAndPackedEnforcement(unittest.TestCase):
         self.assertNotIn("You should consider improving architecture.", text)
         self.assertEqual(events[-1].strip(), "data: [DONE]")
 
-    def _collect_proxy_events(self, server, *, query="fix this bug", remote_events=None):
-        payload = _remote_request_body(stream=True)
+    def _collect_proxy_events(self, server, *, query="fix this bug", remote_events=None, debug_mode=False):
+        payload = _remote_request_body(stream=True, debug=debug_mode)
         payload["query"]["text"] = query
         client_debug = {
             "final_context": {
@@ -652,7 +659,7 @@ class TestEditSuggestionRemoteAndPackedEnforcement(unittest.TestCase):
                 return [
                     event
                     async for event in server._remote_proxy_stream_with_freshness(
-                        messages, 128, "req-proxy-edit", debug_mode=False
+                        messages, 128, "req-proxy-edit", debug_mode=debug_mode
                     )
                 ]
 
@@ -675,6 +682,44 @@ class TestEditSuggestionRemoteAndPackedEnforcement(unittest.TestCase):
         text = _stream_text(events)
         self.assertIn("I do not have enough repo-grounded context", text)
         self.assertNotIn("You should consider improving architecture.", text)
+        self.assertEqual(events[-1].strip(), "data: [DONE]")
+
+    def test_remote_proxy_edit_stream_debug_enabled_preserves_debug_event_after_answer(self):
+        server = _import_server_with_stubs()
+        events = self._collect_proxy_events(
+            server,
+            remote_events=[
+                _remote_chunk_event("You should consider improving architecture."),
+                _remote_debug_event(),
+                "data: [DONE]\n\n",
+            ],
+            debug_mode=True,
+        )
+        joined = "".join(events)
+
+        self.assertIn("I do not have enough repo-grounded context", _stream_text(events))
+        self.assertIn("event: debug", joined)
+        self.assertIn('"object": "debug.payload"', joined)
+        debug_index = next(i for i, event in enumerate(events) if event.startswith("event: debug"))
+        self.assertGreater(debug_index, 0)
+        self.assertEqual(events[-1].strip(), "data: [DONE]")
+
+    def test_remote_proxy_edit_stream_debug_disabled_drops_debug_event(self):
+        server = _import_server_with_stubs()
+        events = self._collect_proxy_events(
+            server,
+            remote_events=[
+                _remote_chunk_event("You should consider improving architecture."),
+                _remote_debug_event(),
+                "data: [DONE]\n\n",
+            ],
+            debug_mode=False,
+        )
+        joined = "".join(events)
+
+        self.assertIn("I do not have enough repo-grounded context", _stream_text(events))
+        self.assertNotIn("event: debug", joined)
+        self.assertNotIn('"object": "debug.payload"', joined)
         self.assertEqual(events[-1].strip(), "data: [DONE]")
 
     def test_remote_proxy_edit_stream_without_done_reports_interrupted_not_fallback(self):
@@ -736,6 +781,21 @@ class TestEditSuggestionRemoteAndPackedEnforcement(unittest.TestCase):
 
         self.assertIn(remote, events)
         self.assertIn("pass-through-token", "".join(events))
+        self.assertEqual(events[-1].strip(), "data: [DONE]")
+
+    def test_remote_proxy_non_edit_debug_stream_passes_through_unchanged(self):
+        server = _import_server_with_stubs()
+        remote = _remote_chunk_event("pass-through-token")
+        debug = _remote_debug_event()
+        events = self._collect_proxy_events(
+            server,
+            query="how does this work?",
+            remote_events=[remote, debug, "data: [DONE]\n\n"],
+            debug_mode=True,
+        )
+
+        self.assertIn(remote, events)
+        self.assertIn(debug, events)
         self.assertEqual(events[-1].strip(), "data: [DONE]")
 
     def test_remote_proxy_non_edit_truncated_stream_still_passes_partial_then_error(self):

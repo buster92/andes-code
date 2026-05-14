@@ -1256,6 +1256,17 @@ def _remote_sse_error_event(decoded: str) -> str | None:
             return f"data: {json.dumps(data)}\n\n"
     return None
 
+
+def _remote_sse_debug_event(decoded: str) -> str | None:
+    has_debug_event = False
+    for raw_line in decoded.splitlines():
+        if raw_line.strip() == "event: debug":
+            has_debug_event = True
+            break
+    if not has_debug_event:
+        return None
+    return decoded if decoded.endswith("\n\n") else f"{decoded}\n\n"
+
 def _enforce_edit_suggestion_answer(text: str, debug_payload: dict | None, query: str) -> str:
     stripped = _strip_thinking(text or "", strip_edges=True)
     if not is_edit_suggestion_query(query):
@@ -1320,6 +1331,7 @@ async def _remote_proxy_stream_with_freshness(messages: list, max_tokens: int, r
     edit_query = is_edit_suggestion_query(payload.get("query", {}).get("text", "") if isinstance(payload, dict) else "")
     buffered_answer = ""
     sse_buffer = ""
+    debug_events: list[str] = []
     try:
         req = url_request.Request(
             endpoint,
@@ -1346,6 +1358,9 @@ async def _remote_proxy_stream_with_freshness(messages: list, max_tokens: int, r
                             yield error_event
                             yield "data: [DONE]\n\n"
                             return
+                        debug_event = _remote_sse_debug_event(event_text)
+                        if debug_event and debug_mode:
+                            debug_events.append(debug_event)
                         buffered_answer += _remote_sse_text(event_text)
                 else:
                     yield decoded
@@ -1356,9 +1371,14 @@ async def _remote_proxy_stream_with_freshness(messages: list, max_tokens: int, r
                     yield error_event
                     yield "data: [DONE]\n\n"
                     return
+                debug_event = _remote_sse_debug_event(sse_buffer)
+                if debug_event and debug_mode:
+                    debug_events.append(debug_event)
                 buffered_answer += _remote_sse_text(sse_buffer)
             enforced = _enforce_edit_suggestion_answer(buffered_answer, client_debug, payload.get("query", {}).get("text", ""))
             yield _make_chunk(enforced, request_id)
+            for debug_event in debug_events:
+                yield debug_event
             yield "data: [DONE]\n\n"
         _phase_log(request_id, "remote_payload_send_succeeded", stream=True)
     except url_error.URLError as exc:
