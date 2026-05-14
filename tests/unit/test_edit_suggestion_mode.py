@@ -45,6 +45,84 @@ async def _collect_stream(server, query="fix this bug"):
     return events
 
 
+def _remote_request_body(*, stream=False, debug=False):
+    return {
+        "client": {
+            "client_version": "test",
+            "protocol_version": "andes.remote.v1",
+            "platform": "test",
+        },
+        "workspace": {
+            "workspace_id": "repo",
+            "repo_name": "repo",
+            "repo_root_name": "repo",
+            "branch": "main",
+            "commit_hash": "abc",
+            "is_dirty": False,
+        },
+        "query": {
+            "request_id": "req-remote-edit",
+            "text": "fix this bug",
+            "requested_at": "2026-05-14T00:00:00+00:00",
+        },
+        "retrieval": {
+            "strategy": "test",
+            "top_k": 1,
+            "indexed_at": "2026-05-14T00:00:00+00:00",
+            "index_state": "ready",
+            "total_candidate_files": 1,
+            "retrieved_chunk_count": 1,
+            "retrieval_mode": "remote_inference",
+        },
+        "chunks": [
+            {
+                "chunk_id": "c1",
+                "path": "src/cache.py",
+                "language": "py",
+                "start_line": 1,
+                "end_line": 3,
+                "score": 1.0,
+                "source_type": "source_code",
+                "authority": "referenced",
+                "authority_reason": "test",
+                "content": "class CacheManager:\n    def refresh_cache(self):\n        return None\n",
+            }
+        ],
+        "options": {"stream": stream, "debug": debug, "max_answer_tokens": 128},
+    }
+
+
+class _JsonRequest:
+    def __init__(self, body):
+        self._body = body
+
+    async def json(self):
+        return self._body
+
+
+class _GenericRemoteLlm:
+    def __call__(self, _prompt, max_tokens=0, stream=False, echo=False):
+        text = "You should consider improving architecture."
+        if stream:
+            return iter([{"choices": [{"text": text}]}])
+        return {"choices": [{"text": text}]}
+
+
+class _GroundedRemoteLlm:
+    def __call__(self, _prompt, max_tokens=0, stream=False, echo=False):
+        text = (
+            "Finding: `src/cache.py` currently routes refresh through `CacheManager.refresh_cache`.\n\n"
+            "Evidence: `src/cache.py`, `CacheManager`, `refresh_cache`.\n\n"
+            "Recommended change: Add one guard in `refresh_cache`.\n\n"
+            "Patch plan: In `src/cache.py`, update `CacheManager.refresh_cache`.\n\n"
+            "Validation: pytest\n\n"
+            "Confidence: high"
+        )
+        if stream:
+            return iter([{"choices": [{"text": text}]}])
+        return {"choices": [{"text": text}]}
+
+
 class _ValidEditAnswerLlm:
     def __call__(self, _prompt, max_tokens=0, stream=False, echo=False):
         answer = (
@@ -432,6 +510,91 @@ class TestEditSuggestionChunkMerging(unittest.TestCase):
         self.assertIn("src/cache.py", loaded)
         self.assertIn("class CacheManager", context)
         self.assertEqual(context.count("return None"), 1)
+
+
+class TestEditSuggestionRemoteAndPackedEnforcement(unittest.TestCase):
+    def test_edit_context_prefers_post_pack_chunks_over_dropped_retrieval(self):
+        server = _import_server_with_stubs()
+        debug_payload = {
+            "normalized_retrieval": {
+                "chunks": [
+                    {"path": "src/dropped.py", "content": "class DroppedThing:\n    pass\n", "symbols": "DroppedThing"}
+                ]
+            },
+            "final_context": {
+                "packed_chunks": [
+                    {"file": "src/kept.py", "content": "class KeptThing:\n    pass\n", "symbols": "KeptThing"}
+                ]
+            },
+        }
+        dropped_answer = _contract_answer("src/dropped.py", evidence="`DroppedThing`")
+        kept_answer = _contract_answer("src/kept.py", evidence="`KeptThing`")
+
+        self.assertIn(
+            "I do not have enough repo-grounded context",
+            server._enforce_edit_suggestion_answer(dropped_answer, debug_payload, "fix this bug"),
+        )
+        self.assertEqual(
+            server._enforce_edit_suggestion_answer(kept_answer, debug_payload, "fix this bug"),
+            kept_answer,
+        )
+
+    def test_edit_context_fails_closed_without_post_pack_chunks(self):
+        server = _import_server_with_stubs()
+        debug_payload = {
+            "normalized_retrieval": {
+                "chunks": [
+                    {"path": "src/cache.py", "content": "class CacheManager:\n    pass\n", "symbols": "CacheManager"}
+                ]
+            }
+        }
+        answer = _contract_answer("src/cache.py", evidence="`CacheManager`")
+
+        self.assertIn(
+            "I do not have enough repo-grounded context",
+            server._enforce_edit_suggestion_answer(answer, debug_payload, "fix this bug"),
+        )
+
+    def test_remote_non_stream_edit_suggestion_response_is_enforced(self):
+        server = _import_server_with_stubs()
+        server.llm = _GenericRemoteLlm()
+
+        response = asyncio.run(server.remote_inference_ask(_JsonRequest(_remote_request_body(stream=False))))
+
+        self.assertTrue(response["ok"])
+        self.assertIn("I do not have enough repo-grounded context", response["answer"])
+        self.assertIn("answer with concrete file paths and symbols", response["answer"])
+
+    def test_remote_non_stream_grounded_edit_suggestion_survives(self):
+        server = _import_server_with_stubs()
+        server.llm = _GroundedRemoteLlm()
+
+        response = asyncio.run(server.remote_inference_ask(_JsonRequest(_remote_request_body(stream=False))))
+
+        self.assertTrue(response["ok"])
+        self.assertIn("Finding:", response["answer"])
+        self.assertIn("src/cache.py", response["answer"])
+        self.assertIn("CacheManager", response["answer"])
+        self.assertNotIn("I do not have enough repo-grounded context", response["answer"])
+
+    def test_remote_stream_edit_suggestion_is_buffered_and_enforced(self):
+        server = _import_server_with_stubs()
+        server.llm = _GenericRemoteLlm()
+        original_streaming_response = server.StreamingResponse
+        try:
+            server.StreamingResponse = lambda gen, **kwargs: {"gen": gen, "kwargs": kwargs}
+            response = asyncio.run(server.remote_inference_ask(_JsonRequest(_remote_request_body(stream=True))))
+            async def _collect():
+                return [event async for event in response["gen"]]
+            events = asyncio.run(_collect())
+        finally:
+            server.StreamingResponse = original_streaming_response
+
+        text = _stream_text(events)
+        self.assertIn("I do not have enough repo-grounded context", text)
+        self.assertNotIn("You should consider improving architecture.", text)
+        self.assertEqual(events[-1].strip(), "data: [DONE]")
+
 
 
 if __name__ == "__main__":

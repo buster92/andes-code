@@ -1076,6 +1076,11 @@ async def chat(request: Request):
                     )
                 answer_text = str(remote_response.get("answer") or "")
                 remote_debug = remote_response.get("debug")
+                answer_text = _enforce_edit_suggestion_answer(
+                    answer_text,
+                    remote_debug if isinstance(remote_debug, dict) else client_debug,
+                    payload.get("query", {}).get("text", "") if isinstance(payload, dict) else "",
+                )
                 return {
                     "id": f"chatcmpl-{request_id}",
                     "object": "chat.completion",
@@ -1193,6 +1198,47 @@ async def _stream_with_freshness(messages: list, max_tokens: int, request_id: st
         yield chunk
 
 
+def _remote_payload_chunks_for_edit_context(payload: dict | None) -> list[dict]:
+    chunks = (payload or {}).get("chunks", []) if isinstance(payload, dict) else []
+    if not isinstance(chunks, list):
+        return []
+    return [
+        {
+            "file": c.get("path", c.get("file", "")),
+            "path": c.get("path", c.get("file", "")),
+            "content": c.get("content", ""),
+            "language": c.get("language", ""),
+            "source_type": c.get("source_type", "source_code"),
+        }
+        for c in chunks
+        if isinstance(c, dict)
+    ]
+
+
+def _remote_sse_text(decoded: str) -> str:
+    text_parts: list[str] = []
+    for raw_line in decoded.splitlines():
+        if not raw_line.startswith("data: "):
+            continue
+        payload = raw_line[len("data: "):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            data = json.loads(payload)
+        except Exception:
+            continue
+        if isinstance(data, dict) and data.get("object") == "chat.completion.chunk":
+            text_parts.append(str(data.get("choices", [{}])[0].get("delta", {}).get("content", "") or ""))
+    return "".join(text_parts)
+
+
+def _enforce_edit_suggestion_answer(text: str, debug_payload: dict | None, query: str) -> str:
+    stripped = _strip_thinking(text or "", strip_edges=True)
+    if not is_edit_suggestion_query(query):
+        return stripped
+    return enforce_edit_suggestion_output(stripped, _edit_context_from_debug_payload(debug_payload, query))
+
+
 async def _remote_proxy_stream_with_freshness(messages: list, max_tokens: int, request_id: str, debug_mode: bool = False):
     freshness = _index_freshness_payload()
     if freshness.get("ok") and freshness.get("has_index") and freshness.get("changed"):
@@ -1247,6 +1293,9 @@ async def _remote_proxy_stream_with_freshness(messages: list, max_tokens: int, r
     serialized = json.dumps(payload).encode("utf-8")
     saw_done = False
     done_scan_buffer = ""
+    edit_query = is_edit_suggestion_query(payload.get("query", {}).get("text", "") if isinstance(payload, dict) else "")
+    buffered_answer = ""
+    sse_buffer = ""
     try:
         req = url_request.Request(
             endpoint,
@@ -1264,7 +1313,20 @@ async def _remote_proxy_stream_with_freshness(messages: list, max_tokens: int, r
                 done_scan_buffer = f"{done_scan_buffer}{decoded}"[-32:]
                 if "[DONE]" in done_scan_buffer:
                     saw_done = True
-                yield decoded
+                if edit_query:
+                    sse_buffer += decoded
+                    while "\n\n" in sse_buffer:
+                        event_text, sse_buffer = sse_buffer.split("\n\n", 1)
+                        buffered_answer += _remote_sse_text(event_text)
+                else:
+                    yield decoded
+        if edit_query:
+            if sse_buffer:
+                buffered_answer += _remote_sse_text(sse_buffer)
+            enforced = _enforce_edit_suggestion_answer(buffered_answer, client_debug, payload.get("query", {}).get("text", ""))
+            yield _make_chunk(enforced, request_id)
+            yield "data: [DONE]\n\n"
+            saw_done = True
         _phase_log(request_id, "remote_payload_send_succeeded", stream=True)
     except url_error.URLError as exc:
         reason = getattr(exc, "reason", exc)
@@ -1335,13 +1397,18 @@ async def remote_inference_ask(request: Request):
     if remote_request.options.stream:
         async def _remote_stream():
             final_text = ""
+            edit_query = is_edit_suggestion_query(remote_request.query.text)
             try:
                 for chunk in llm(prompt, max_tokens=max_tokens, stream=True, echo=False):
                     token = chunk["choices"][0]["text"]
                     if not token:
                         continue
                     final_text += token
-                    yield _make_chunk(token, request_id)
+                    if not edit_query:
+                        yield _make_chunk(token, request_id)
+                if edit_query:
+                    final_text = _enforce_edit_suggestion_answer(final_text, debug_payload, remote_request.query.text)
+                    yield _make_chunk(final_text, request_id)
                 if remote_request.options.debug:
                     yield format_debug_sse_event(debug_payload)
                 _phase_log(request_id, "remote_stream_completed", answer_chars=len(final_text))
@@ -1364,12 +1431,13 @@ async def remote_inference_ask(request: Request):
         _phase_log(request_id, "remote_answer_generation_failed", stream=False, error=exc)
         return _remote_error_payload("generation_failed", str(exc), request_id=request_id)
 
+    text = _enforce_edit_suggestion_answer(text, debug_payload, remote_request.query.text)
     _phase_log(request_id, "remote_answer_generation_finished", stream=False, answer_chars=len(text or ""))
     response = {
         "ok": True,
         "event": "final_answer",
         "request_id": request_id,
-        "answer": _strip_thinking(text, strip_edges=True),
+        "answer": text,
         "finished_at": datetime.now(timezone.utc).isoformat(),
     }
     if remote_request.options.debug:
@@ -1647,6 +1715,13 @@ def _build_context(
             f"CONTEXT {request_id} | chunks={len(normalized_chunks)} | "
             f"packed={packing_info['packed_chunks']} | files={packing_info['kept_files']}"
         )
+        if retrieval_debug is not None:
+            packed_chunks = packing_info["packed_chunks_raw"]
+            retrieval_debug["final_context"] = {
+                "files_used": [c.get("file") for c in packed_chunks if c.get("file")],
+                "context_size": sum(len(c.get("content", "")) for c in packed_chunks),
+                "packed_chunks": packed_chunks,
+            }
 
         base = [{"role": "system", "content": system}] + [
             m for m in messages if m.get("role") != "system"
@@ -2004,6 +2079,19 @@ def _build_remote_prompt_messages(remote_request: RemoteInferenceRequest) -> tup
             "total_candidate_files": retrieval_meta.total_candidate_files,
             "files_retrieved": sorted({c.path for c in chunks_sorted}),
         },
+        "final_context": {
+            "files_used": sorted({c.path for c in chunks_sorted}),
+            "packed_chunks": [
+                {
+                    "file": c.path,
+                    "path": c.path,
+                    "content": c.content,
+                    "language": c.language or "",
+                    "source_type": c.source_type,
+                }
+                for c in chunks_sorted
+            ],
+        },
     }
     return prompt_messages, debug_payload
 
@@ -2120,12 +2208,17 @@ def _collect_local_remote_payload(
             "max_answer_tokens": max_tokens,
         },
     }
+    payload_chunks = _remote_payload_chunks_for_edit_context(payload)
     client_debug = {
         "mode": "remote_inference_client",
         "request_id": request_id,
         "remote_server_url": REMOTE_INFERENCE_SERVER_URL,
         "retrieval": normalized.to_debug_dict(),
         "retrieval_debug": retrieval_debug,
+        "final_context": {
+            "files_used": [c.get("file") for c in payload_chunks if c.get("file")],
+            "packed_chunks": payload_chunks,
+        },
     }
     return payload, client_debug
 
@@ -2969,6 +3062,7 @@ def _build_context_from_plan(
         }
         debug_payload["final_context"]["files_used"] = [c.get("file") for c in packed_chunks if c.get("file")]
         debug_payload["final_context"]["context_size"] = sum(len(c.get("content", "")) for c in packed_chunks)
+        debug_payload["final_context"]["packed_chunks"] = packed_chunks
     return (final_messages, files_loaded, debug_payload) if return_debug else (final_messages, files_loaded)
 
 
@@ -3279,10 +3373,14 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
 def _edit_context_from_debug_payload(debug_payload: dict | None, query: str):
     if not isinstance(debug_payload, dict):
         return build_edit_suggestion_context([], query=query)
-    retrieval = debug_payload.get("normalized_retrieval") or debug_payload.get("retrieval") or {}
-    chunks = retrieval.get("chunks", []) if isinstance(retrieval, dict) else []
-    if chunks and "content" in chunks[0] and "file" not in chunks[0]:
-        # dataclass-asdict shape from LocalRetrievedChunk uses path rather than file.
+    final_context = debug_payload.get("final_context") if isinstance(debug_payload.get("final_context"), dict) else {}
+    chunks = final_context.get("packed_chunks") or final_context.get("packed_chunks_raw") or []
+    if not isinstance(chunks, list) or not chunks:
+        # Enforcement must be based on code actually sent to the model; if that
+        # post-pack context is unavailable, fail closed instead of trusting
+        # broader pre-pack retrieval candidates.
+        return build_edit_suggestion_context([], query=query)
+    if chunks and isinstance(chunks[0], dict) and "content" in chunks[0] and "file" not in chunks[0]:
         chunks = [{**c, "file": c.get("path", "")} for c in chunks]
     return build_edit_suggestion_context(chunks if isinstance(chunks, list) else [], query=query)
 
