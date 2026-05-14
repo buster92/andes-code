@@ -1011,8 +1011,8 @@ async def chat(request: Request):
                             if not part:
                                 break
                             decoded = part.decode("utf-8", errors="ignore")
-                            done_scan_buffer = f"{done_scan_buffer}{decoded}"[-32:]
-                            if "[DONE]" in done_scan_buffer:
+                            done_scan_buffer = f"{done_scan_buffer}{decoded}"[-4096:]
+                            if _remote_sse_has_done_event(done_scan_buffer):
                                 saw_done = True
                             yield decoded
                     _phase_log(request_id, "remote_payload_send_succeeded", stream=True)
@@ -1215,6 +1215,15 @@ def _remote_payload_chunks_for_edit_context(payload: dict | None) -> list[dict]:
     ]
 
 
+def _remote_sse_has_done_event(decoded: str) -> bool:
+    for raw_line in decoded.splitlines():
+        if not raw_line.startswith("data:"):
+            continue
+        payload = raw_line[len("data:"):].strip()
+        if payload == "[DONE]":
+            return True
+    return False
+
 def _remote_sse_text(decoded: str) -> str:
     text_parts: list[str] = []
     for raw_line in decoded.splitlines():
@@ -1325,8 +1334,8 @@ async def _remote_proxy_stream_with_freshness(messages: list, max_tokens: int, r
                 if not part:
                     break
                 decoded = part.decode("utf-8", errors="ignore")
-                done_scan_buffer = f"{done_scan_buffer}{decoded}"[-32:]
-                if "[DONE]" in done_scan_buffer:
+                done_scan_buffer = f"{done_scan_buffer}{decoded}"[-4096:]
+                if _remote_sse_has_done_event(done_scan_buffer):
                     saw_done = True
                 if edit_query:
                     sse_buffer += decoded
@@ -1340,7 +1349,7 @@ async def _remote_proxy_stream_with_freshness(messages: list, max_tokens: int, r
                         buffered_answer += _remote_sse_text(event_text)
                 else:
                     yield decoded
-        if edit_query:
+        if edit_query and saw_done:
             if sse_buffer:
                 error_event = _remote_sse_error_event(sse_buffer)
                 if error_event:
@@ -1351,7 +1360,6 @@ async def _remote_proxy_stream_with_freshness(messages: list, max_tokens: int, r
             enforced = _enforce_edit_suggestion_answer(buffered_answer, client_debug, payload.get("query", {}).get("text", ""))
             yield _make_chunk(enforced, request_id)
             yield "data: [DONE]\n\n"
-            saw_done = True
         _phase_log(request_id, "remote_payload_send_succeeded", stream=True)
     except url_error.URLError as exc:
         reason = getattr(exc, "reason", exc)

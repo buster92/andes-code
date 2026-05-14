@@ -677,6 +677,37 @@ class TestEditSuggestionRemoteAndPackedEnforcement(unittest.TestCase):
         self.assertNotIn("You should consider improving architecture.", text)
         self.assertEqual(events[-1].strip(), "data: [DONE]")
 
+    def test_remote_proxy_edit_stream_without_done_reports_interrupted_not_fallback(self):
+        server = _import_server_with_stubs()
+        events = self._collect_proxy_events(
+            server,
+            remote_events=[
+                _remote_chunk_event("Finding: partial answer from upstream"),
+            ],
+        )
+        joined = "".join(events)
+
+        self.assertIn("andescode.error", joined)
+        self.assertIn("remote_stream_interrupted", joined)
+        self.assertNotIn("I do not have enough repo-grounded context", joined)
+        self.assertEqual(events[-1].strip(), "data: [DONE]")
+
+    def test_remote_proxy_edit_stream_done_text_without_marker_reports_interrupted(self):
+        server = _import_server_with_stubs()
+        events = self._collect_proxy_events(
+            server,
+            remote_events=[
+                _remote_chunk_event("Finding: literal [DONE] text but no completion marker"),
+            ],
+        )
+        joined = "".join(events)
+
+        self.assertIn("andescode.error", joined)
+        self.assertIn("remote_stream_interrupted", joined)
+        self.assertNotIn("I do not have enough repo-grounded context", joined)
+        self.assertNotIn("literal [DONE] text", joined)
+        self.assertEqual(events[-1].strip(), "data: [DONE]")
+
     def test_remote_proxy_edit_stream_error_surfaces_without_safe_fallback(self):
         server = _import_server_with_stubs()
         events = self._collect_proxy_events(
@@ -707,6 +738,21 @@ class TestEditSuggestionRemoteAndPackedEnforcement(unittest.TestCase):
         self.assertIn("pass-through-token", "".join(events))
         self.assertEqual(events[-1].strip(), "data: [DONE]")
 
+    def test_remote_proxy_non_edit_truncated_stream_still_passes_partial_then_error(self):
+        server = _import_server_with_stubs()
+        remote = _remote_chunk_event("partial-pass-through-token")
+        events = self._collect_proxy_events(
+            server,
+            query="how does this work?",
+            remote_events=[remote],
+        )
+        joined = "".join(events)
+
+        self.assertIn(remote, events)
+        self.assertIn("partial-pass-through-token", joined)
+        self.assertIn("andescode.error", joined)
+        self.assertIn("remote_stream_interrupted", joined)
+        self.assertEqual(events[-1].strip(), "data: [DONE]")
 
 
 if __name__ == "__main__":
