@@ -1658,9 +1658,115 @@ def _build_context(
         return (messages, None) if return_debug else messages
 
 
+_FILE_HEADER_RE = re.compile(r"^\s*(?:#|//|--|;)?\s*File:\s+", re.IGNORECASE)
+
+
+def _chunk_start_line(chunk: dict) -> int | None:
+    raw = chunk.get("start_line", chunk.get("line"))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 1 else None
+
+
+def _chunk_end_line(chunk: dict, line_count: int) -> int | None:
+    raw = chunk.get("end_line")
+    if raw is not None:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value >= 1 else None
+    start = _chunk_start_line(chunk)
+    if start is None:
+        return None
+    return start + max(line_count, 1) - 1
+
+
+def _read_indexed_file_from_disk(filename: str) -> str | None:
+    """Read the indexed file directly when the index root is available."""
+    root = None
+    try:
+        if _indexer_module and hasattr(_indexer_module, "_load_hashes"):
+            hashes = _indexer_module._load_hashes()
+            if isinstance(hashes, dict) and hashes.get("__root__"):
+                root = Path(str(hashes["__root__"])).resolve()
+    except Exception as exc:
+        audit.warning(f"EDIT_DISK_ROOT_LOOKUP_FAIL | {filename} | {exc}")
+        root = None
+    if root is None and _indexer_module and hasattr(_indexer_module, "ROOT"):
+        try:
+            root = Path(str(getattr(_indexer_module, "ROOT"))).resolve()
+        except Exception:
+            root = None
+    if root is None:
+        return None
+
+    target = (root / filename).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        return None
+    if not target.exists() or not target.is_file():
+        return None
+    try:
+        return target.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return target.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        audit.warning(f"EDIT_DISK_FILE_READ_FAIL | {filename} | {exc}")
+        return None
+
+
+def _deoverlap_indexed_chunks(ordered: list[dict]) -> tuple[str, bool, int]:
+    merged_lines: list[str] = []
+    current_end: int | None = None
+    clean = True
+    saw_header = False
+    removed_headers = 0
+
+    for chunk in ordered:
+        content = str(chunk.get("content") or "")
+        if not content:
+            continue
+        raw_lines = content.splitlines()
+        start = _chunk_start_line(chunk)
+        end = _chunk_end_line(chunk, len(raw_lines))
+        if start is None or end is None or end < start:
+            clean = False
+
+        lines = list(raw_lines)
+        if current_end is not None and start is not None and start <= current_end:
+            overlap = min(current_end - start + 1, len(lines))
+            if overlap > 0:
+                lines = lines[overlap:]
+        elif current_end is not None and start is not None and start > current_end + 1:
+            clean = False
+
+        filtered_lines: list[str] = []
+        for line in lines:
+            if _FILE_HEADER_RE.match(line):
+                if saw_header:
+                    removed_headers += 1
+                    clean = False
+                    continue
+                saw_header = True
+            filtered_lines.append(line)
+        merged_lines.extend(filtered_lines)
+
+        if end is not None:
+            current_end = end if current_end is None else max(current_end, end)
+        else:
+            clean = False
+
+    if ordered and _chunk_start_line(ordered[0]) != 1:
+        clean = False
+    return "\n".join(merged_lines), clean, removed_headers
+
 
 def _merge_indexed_file_chunks(filename: str) -> dict | None:
-    """Load all indexed chunks for a file as one prompt chunk for edit targeting."""
+    """Load an edit target as direct file contents or de-overlapped indexed chunks."""
     if not INDEXER_READY or not _indexer_module or not filename:
         return None
     try:
@@ -1670,25 +1776,43 @@ def _merge_indexed_file_chunks(filename: str) -> dict | None:
         return None
     if not file_chunks:
         return None
-    ordered = sorted(file_chunks, key=lambda c: int(c.get("line", c.get("start_line", 1)) or 1))
-    content = "\n".join(str(c.get("content") or "") for c in ordered if c.get("content"))
+    ordered = sorted(file_chunks, key=lambda c: _chunk_start_line(c) or 1)
+    first = ordered[0]
+    disk_content = _read_indexed_file_from_disk(filename)
+    if disk_content is not None:
+        content = disk_content
+        full_file = True
+        partial = False
+        source = "disk_file"
+        removed_headers = 0
+    else:
+        content, clean, removed_headers = _deoverlap_indexed_chunks(ordered)
+        full_file = bool(clean)
+        partial = not full_file
+        source = "indexed_chunks_deoverlapped" if clean else "indexed_chunks_merged_partial"
+
     if not content.strip():
         return None
-    first = ordered[0]
-    last = ordered[-1]
+    end_line = content.count("\n") + 1 if content else 1
     return {
         "file": filename,
         "content": content,
         "language": first.get("language", ""),
         "symbols": " ".join(str(c.get("symbols") or "") for c in ordered if c.get("symbols")),
         "score": max(float(c.get("score") or 0.0) for c in ordered),
-        "line": int(first.get("line", first.get("start_line", 1)) or 1),
-        "end_line": int(last.get("end_line", last.get("line", 1)) or 1),
-        "full_file": True,
-        "coverage": {"returned": len(ordered), "total": len(ordered), "partial": False},
+        "line": 1,
+        "end_line": end_line,
+        "full_file": full_file,
+        "coverage": {
+            "returned": len(ordered),
+            "total": len(ordered),
+            "partial": partial,
+            "source": source,
+            "removed_repeated_file_headers": removed_headers,
+        },
         "source_type": first.get("source_type", "source_code"),
         "authority": first.get("authority", "referenced"),
-        "authority_reason": first.get("authority_reason", "edit_full_file_load"),
+        "authority_reason": "edit_full_file_load" if full_file else "edit_indexed_chunk_merge_partial",
     }
 
 

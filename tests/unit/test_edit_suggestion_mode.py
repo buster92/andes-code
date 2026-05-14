@@ -1,7 +1,9 @@
 import asyncio
 import json
+import tempfile
 import types
 import unittest
+from pathlib import Path
 
 from andes_cache.routing import (
     DEPENDENCY_OR_BUILD_INVENTORY,
@@ -288,6 +290,118 @@ class TestEditSuggestionMode(unittest.TestCase):
         text = _stream_text(events)
         self.assertIn("I do not have enough repo-grounded context to propose a safe edit.", text)
         self.assertIn("relevant files", text)
+
+
+class TestEditSuggestionChunkMerging(unittest.TestCase):
+    def _server_with_chunks(self, chunks):
+        server = _import_server_with_stubs()
+        server.INDEXER_READY = True
+        server._indexer_module = types.SimpleNamespace(
+            get_chunks_for_file=lambda fname: chunks if fname == "src/cache.py" else [],
+        )
+        return server
+
+    def test_direct_file_contents_are_preferred_when_index_root_is_available(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "src").mkdir()
+            (root / "src" / "cache.py").write_text("real_line1\nreal_line2\n", encoding="utf-8")
+            server = _import_server_with_stubs()
+            server.INDEXER_READY = True
+            server._indexer_module = types.SimpleNamespace(
+                _load_hashes=lambda: {"__root__": str(root)},
+                get_chunks_for_file=lambda fname: [
+                    {"file": fname, "line": 1, "end_line": 2, "content": "stale_chunk1\nstale_chunk2", "symbols": "CacheManager"}
+                ],
+            )
+
+            merged = server._merge_indexed_file_chunks("src/cache.py")
+
+            self.assertEqual(merged["content"], "real_line1\nreal_line2\n")
+            self.assertTrue(merged["full_file"])
+            self.assertEqual(merged["coverage"]["source"], "disk_file")
+
+    def test_non_overlapping_chunks_merge_normally(self):
+        server = self._server_with_chunks(
+            [
+                {"file": "src/cache.py", "line": 1, "end_line": 2, "content": "line1\nline2", "symbols": "CacheManager"},
+                {"file": "src/cache.py", "line": 3, "end_line": 4, "content": "line3\nline4", "symbols": "refresh_cache"},
+            ]
+        )
+
+        merged = server._merge_indexed_file_chunks("src/cache.py")
+
+        self.assertEqual(merged["content"], "line1\nline2\nline3\nline4")
+        self.assertTrue(merged["full_file"])
+        self.assertFalse(merged["coverage"]["partial"])
+
+    def test_overlapping_chunks_do_not_duplicate_overlap_lines(self):
+        server = self._server_with_chunks(
+            [
+                {"file": "src/cache.py", "line": 1, "end_line": 3, "content": "line1\nline2\nline3", "symbols": "CacheManager"},
+                {"file": "src/cache.py", "line": 3, "end_line": 5, "content": "line3\nline4\nline5", "symbols": "refresh_cache"},
+            ]
+        )
+
+        merged = server._merge_indexed_file_chunks("src/cache.py")
+
+        self.assertEqual(merged["content"], "line1\nline2\nline3\nline4\nline5")
+        self.assertEqual(merged["content"].count("line3"), 1)
+        self.assertTrue(merged["full_file"])
+
+    def test_repeated_file_headers_are_not_duplicated(self):
+        server = self._server_with_chunks(
+            [
+                {"file": "src/cache.py", "line": 1, "end_line": 2, "content": "# File: src/cache.py\nline1", "symbols": "CacheManager"},
+                {"file": "src/cache.py", "line": 3, "end_line": 4, "content": "# File: src/cache.py\nline2", "symbols": "refresh_cache"},
+            ]
+        )
+
+        merged = server._merge_indexed_file_chunks("src/cache.py")
+
+        self.assertEqual(merged["content"], "# File: src/cache.py\nline1\nline2")
+        self.assertEqual(merged["content"].count("# File:"), 1)
+        self.assertEqual(merged["coverage"]["removed_repeated_file_headers"], 1)
+
+    def test_unranged_chunks_are_not_labeled_clean_full_file(self):
+        server = self._server_with_chunks(
+            [
+                {"file": "src/cache.py", "content": "line1\nline2", "symbols": "CacheManager"},
+                {"file": "src/cache.py", "content": "line2\nline3", "symbols": "refresh_cache"},
+            ]
+        )
+
+        merged = server._merge_indexed_file_chunks("src/cache.py")
+
+        self.assertFalse(merged["full_file"])
+        self.assertTrue(merged["coverage"]["partial"])
+        self.assertEqual(merged["coverage"]["source"], "indexed_chunks_merged_partial")
+
+    def test_edit_suggestion_context_includes_deoverlapped_merged_file(self):
+        server = self._server_with_chunks(
+            [
+                {"file": "src/cache.py", "line": 1, "end_line": 3, "content": "class CacheManager:\n    def refresh_cache(self):\n        return None", "symbols": "CacheManager refresh_cache"},
+                {"file": "src/cache.py", "line": 3, "end_line": 5, "content": "        return None\n# tail\nDONE = True", "symbols": "refresh_cache"},
+            ]
+        )
+        server.MODEL_CONTEXT_WINDOW = 4000
+
+        chunks, loaded = server._expand_edit_suggestion_chunks(
+            "fix src/cache.py bug",
+            [{"file": "src/cache.py", "content": "snippet", "symbols": "CacheManager"}],
+            {},
+            {},
+        )
+        context, _info = server._pack_context_section(
+            query="fix src/cache.py bug",
+            map_section="",
+            chunks=chunks,
+            request_id="req-merge",
+        )
+
+        self.assertIn("src/cache.py", loaded)
+        self.assertIn("class CacheManager", context)
+        self.assertEqual(context.count("return None"), 1)
 
 
 if __name__ == "__main__":
