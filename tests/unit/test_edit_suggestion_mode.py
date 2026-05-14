@@ -349,6 +349,36 @@ class TestEditSuggestionChunkMerging(unittest.TestCase):
         self.assertEqual(merged["content"].count("line3"), 1)
         self.assertTrue(merged["full_file"])
 
+    def test_zero_based_overlapping_chunks_with_headers_deoverlap_cleanly(self):
+        first_lines = [f"line{i}" for i in range(1, 81)]
+        second_lines = [f"line{i}" for i in range(66, 101)]
+        server = self._server_with_chunks(
+            [
+                {
+                    "file": "src/cache.py",
+                    "line": 0,
+                    "content": "# File: src/cache.py\n\n" + "\n".join(first_lines),
+                    "symbols": "CacheManager",
+                },
+                {
+                    "file": "src/cache.py",
+                    "line": 65,
+                    "content": "# File: src/cache.py\n\n" + "\n".join(second_lines),
+                    "symbols": "refresh_cache",
+                },
+            ]
+        )
+
+        merged = server._merge_indexed_file_chunks("src/cache.py")
+
+        self.assertTrue(merged["full_file"])
+        self.assertFalse(merged["coverage"]["partial"])
+        self.assertEqual(merged["coverage"]["source"], "indexed_chunks_deoverlapped")
+        self.assertEqual(merged["coverage"]["removed_repeated_file_headers"], 2)
+        self.assertNotIn("# File:", merged["content"])
+        self.assertEqual(merged["content"].count("line66"), 1)
+        self.assertEqual(merged["content"].splitlines(), [f"line{i}" for i in range(1, 101)])
+
     def test_repeated_file_headers_are_not_duplicated(self):
         server = self._server_with_chunks(
             [
@@ -359,9 +389,9 @@ class TestEditSuggestionChunkMerging(unittest.TestCase):
 
         merged = server._merge_indexed_file_chunks("src/cache.py")
 
-        self.assertEqual(merged["content"], "# File: src/cache.py\nline1\nline2")
-        self.assertEqual(merged["content"].count("# File:"), 1)
-        self.assertEqual(merged["coverage"]["removed_repeated_file_headers"], 1)
+        self.assertEqual(merged["content"], "line1\nline2")
+        self.assertNotIn("# File:", merged["content"])
+        self.assertEqual(merged["coverage"]["removed_repeated_file_headers"], 2)
 
     def test_unranged_chunks_are_not_labeled_clean_full_file(self):
         server = self._server_with_chunks(

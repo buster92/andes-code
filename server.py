@@ -1661,24 +1661,51 @@ def _build_context(
 _FILE_HEADER_RE = re.compile(r"^\s*(?:#|//|--|;)?\s*File:\s+", re.IGNORECASE)
 
 
-def _chunk_start_line(chunk: dict) -> int | None:
+def _chunk_raw_start_line(chunk: dict) -> int | None:
     raw = chunk.get("start_line", chunk.get("line"))
     try:
         value = int(raw)
     except (TypeError, ValueError):
         return None
-    return value if value >= 1 else None
+    return value if value >= 0 else None
 
 
-def _chunk_end_line(chunk: dict, line_count: int) -> int | None:
+def _chunk_start_line(chunk: dict) -> int | None:
+    """Return a one-based start line for standalone chunk metadata checks."""
+    value = _chunk_raw_start_line(chunk)
+    if value is None:
+        return None
+    return value + 1 if value == 0 else value
+
+
+def _chunk_start_line_for_base(chunk: dict, *, zero_based: bool) -> int | None:
+    value = _chunk_raw_start_line(chunk)
+    if value is None:
+        return None
+    return value + 1 if zero_based else value
+
+
+def _strip_injected_file_header(lines: list[str]) -> tuple[list[str], int]:
+    """Remove synthetic indexer file headers from chunk text before line math."""
+    if not lines or not _FILE_HEADER_RE.match(lines[0]):
+        return lines, 0
+    start = 1
+    if len(lines) > 1 and not lines[1].strip():
+        start = 2
+    return lines[start:], 1
+
+
+def _chunk_end_line(chunk: dict, line_count: int, *, zero_based: bool = False) -> int | None:
     raw = chunk.get("end_line")
     if raw is not None:
         try:
             value = int(raw)
         except (TypeError, ValueError):
             return None
-        return value if value >= 1 else None
-    start = _chunk_start_line(chunk)
+        if value < 0:
+            return None
+        return value + 1 if zero_based else value
+    start = _chunk_start_line_for_base(chunk, zero_based=zero_based)
     if start is None:
         return None
     return start + max(line_count, 1) - 1
@@ -1723,20 +1750,22 @@ def _deoverlap_indexed_chunks(ordered: list[dict]) -> tuple[str, bool, int]:
     merged_lines: list[str] = []
     current_end: int | None = None
     clean = True
-    saw_header = False
     removed_headers = 0
+    zero_based = any(_chunk_raw_start_line(chunk) == 0 for chunk in ordered)
 
     for chunk in ordered:
         content = str(chunk.get("content") or "")
         if not content:
             continue
         raw_lines = content.splitlines()
-        start = _chunk_start_line(chunk)
-        end = _chunk_end_line(chunk, len(raw_lines))
+        source_lines, header_count = _strip_injected_file_header(raw_lines)
+        removed_headers += header_count
+        start = _chunk_start_line_for_base(chunk, zero_based=zero_based)
+        end = _chunk_end_line(chunk, len(source_lines), zero_based=zero_based)
         if start is None or end is None or end < start:
             clean = False
 
-        lines = list(raw_lines)
+        lines = list(source_lines)
         if current_end is not None and start is not None and start <= current_end:
             overlap = min(current_end - start + 1, len(lines))
             if overlap > 0:
@@ -1744,23 +1773,14 @@ def _deoverlap_indexed_chunks(ordered: list[dict]) -> tuple[str, bool, int]:
         elif current_end is not None and start is not None and start > current_end + 1:
             clean = False
 
-        filtered_lines: list[str] = []
-        for line in lines:
-            if _FILE_HEADER_RE.match(line):
-                if saw_header:
-                    removed_headers += 1
-                    clean = False
-                    continue
-                saw_header = True
-            filtered_lines.append(line)
-        merged_lines.extend(filtered_lines)
+        merged_lines.extend(lines)
 
         if end is not None:
             current_end = end if current_end is None else max(current_end, end)
         else:
             clean = False
 
-    if ordered and _chunk_start_line(ordered[0]) != 1:
+    if ordered and _chunk_start_line_for_base(ordered[0], zero_based=zero_based) != 1:
         clean = False
     return "\n".join(merged_lines), clean, removed_headers
 
