@@ -100,6 +100,36 @@ class _JsonRequest:
         return self._body
 
 
+class _FakeRemoteStreamResponse:
+    def __init__(self, events):
+        self._chunks = [event.encode("utf-8") for event in events]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self, _size):
+        if not self._chunks:
+            return b""
+        return self._chunks.pop(0)
+
+
+def _remote_chunk_event(content):
+    return "data: " + json.dumps({
+        "object": "chat.completion.chunk",
+        "choices": [{"delta": {"content": content}}],
+    }) + "\n\n"
+
+
+def _remote_error_event(code="remote_failed", message="remote failed"):
+    return "data: " + json.dumps({
+        "object": "andescode.error",
+        "error": {"code": code, "message": message, "phase": "remote_inference"},
+    }) + "\n\n"
+
+
 class _GenericRemoteLlm:
     def __call__(self, _prompt, max_tokens=0, stream=False, echo=False):
         text = "You should consider improving architecture."
@@ -593,6 +623,88 @@ class TestEditSuggestionRemoteAndPackedEnforcement(unittest.TestCase):
         text = _stream_text(events)
         self.assertIn("I do not have enough repo-grounded context", text)
         self.assertNotIn("You should consider improving architecture.", text)
+        self.assertEqual(events[-1].strip(), "data: [DONE]")
+
+    def _collect_proxy_events(self, server, *, query="fix this bug", remote_events=None):
+        payload = _remote_request_body(stream=True)
+        payload["query"]["text"] = query
+        client_debug = {
+            "final_context": {
+                "packed_chunks": [
+                    {
+                        "file": "src/cache.py",
+                        "content": "class CacheManager:\n    def refresh_cache(self):\n        return None\n",
+                        "symbols": "CacheManager refresh_cache",
+                    }
+                ]
+            }
+        }
+        original_freshness = server._index_freshness_payload
+        original_collect = server._collect_local_remote_payload
+        original_urlopen = server.url_request.urlopen
+        try:
+            server._index_freshness_payload = lambda: {"ok": True, "has_index": True, "changed": False}
+            server._collect_local_remote_payload = lambda **_kwargs: (payload, client_debug)
+            server.url_request.urlopen = lambda *_args, **_kwargs: _FakeRemoteStreamResponse(remote_events or [])
+
+            async def _collect():
+                messages = [{"role": "user", "content": query}]
+                return [
+                    event
+                    async for event in server._remote_proxy_stream_with_freshness(
+                        messages, 128, "req-proxy-edit", debug_mode=False
+                    )
+                ]
+
+            return asyncio.run(_collect())
+        finally:
+            server._index_freshness_payload = original_freshness
+            server._collect_local_remote_payload = original_collect
+            server.url_request.urlopen = original_urlopen
+
+    def test_remote_proxy_edit_stream_normal_chunks_are_buffered_and_enforced(self):
+        server = _import_server_with_stubs()
+        events = self._collect_proxy_events(
+            server,
+            remote_events=[
+                _remote_chunk_event("You should consider improving architecture."),
+                "data: [DONE]\n\n",
+            ],
+        )
+
+        text = _stream_text(events)
+        self.assertIn("I do not have enough repo-grounded context", text)
+        self.assertNotIn("You should consider improving architecture.", text)
+        self.assertEqual(events[-1].strip(), "data: [DONE]")
+
+    def test_remote_proxy_edit_stream_error_surfaces_without_safe_fallback(self):
+        server = _import_server_with_stubs()
+        events = self._collect_proxy_events(
+            server,
+            remote_events=[
+                _remote_error_event(code="remote_failed", message="boom"),
+                "data: [DONE]\n\n",
+            ],
+        )
+        joined = "".join(events)
+
+        self.assertIn("andescode.error", joined)
+        self.assertIn("remote_failed", joined)
+        self.assertIn("boom", joined)
+        self.assertNotIn("I do not have enough repo-grounded context", joined)
+        self.assertEqual(events[-1].strip(), "data: [DONE]")
+
+    def test_remote_proxy_non_edit_stream_passes_through_normally(self):
+        server = _import_server_with_stubs()
+        remote = _remote_chunk_event("pass-through-token")
+        events = self._collect_proxy_events(
+            server,
+            query="how does this work?",
+            remote_events=[remote, "data: [DONE]\n\n"],
+        )
+
+        self.assertIn(remote, events)
+        self.assertIn("pass-through-token", "".join(events))
         self.assertEqual(events[-1].strip(), "data: [DONE]")
 
 

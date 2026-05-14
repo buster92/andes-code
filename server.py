@@ -1232,6 +1232,21 @@ def _remote_sse_text(decoded: str) -> str:
     return "".join(text_parts)
 
 
+def _remote_sse_error_event(decoded: str) -> str | None:
+    for raw_line in decoded.splitlines():
+        if not raw_line.startswith("data: "):
+            continue
+        payload = raw_line[len("data: "):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            data = json.loads(payload)
+        except Exception:
+            continue
+        if isinstance(data, dict) and (data.get("object") == "andescode.error" or data.get("event") == "error"):
+            return f"data: {json.dumps(data)}\n\n"
+    return None
+
 def _enforce_edit_suggestion_answer(text: str, debug_payload: dict | None, query: str) -> str:
     stripped = _strip_thinking(text or "", strip_edges=True)
     if not is_edit_suggestion_query(query):
@@ -1317,11 +1332,21 @@ async def _remote_proxy_stream_with_freshness(messages: list, max_tokens: int, r
                     sse_buffer += decoded
                     while "\n\n" in sse_buffer:
                         event_text, sse_buffer = sse_buffer.split("\n\n", 1)
+                        error_event = _remote_sse_error_event(event_text)
+                        if error_event:
+                            yield error_event
+                            yield "data: [DONE]\n\n"
+                            return
                         buffered_answer += _remote_sse_text(event_text)
                 else:
                     yield decoded
         if edit_query:
             if sse_buffer:
+                error_event = _remote_sse_error_event(sse_buffer)
+                if error_event:
+                    yield error_event
+                    yield "data: [DONE]\n\n"
+                    return
                 buffered_answer += _remote_sse_text(sse_buffer)
             enforced = _enforce_edit_suggestion_answer(buffered_answer, client_debug, payload.get("query", {}).get("text", ""))
             yield _make_chunk(enforced, request_id)
