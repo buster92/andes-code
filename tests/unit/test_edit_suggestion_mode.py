@@ -189,19 +189,39 @@ def _contract_answer(file_path, evidence="file-only"):
 class TestEditSuggestionMode(unittest.TestCase):
     def test_edit_suggestion_mode_triggers_for_change_fix_and_performance_requests(self):
         queries = [
+            "implement retry handling",
+            "please implement cache invalidation",
             "improve this",
             "fix this bug",
             "make this faster",
             "suggest one update",
+            "suggest one change",
             "change this behavior",
+            "refactor refresh_cache to avoid duplicate work",
+            "optimize cache lookup",
             "why is this failing?",
             "what code should I edit?",
+            "what files should I change?",
         ]
         for query in queries:
             with self.subTest(query=query):
                 self.assertTrue(is_edit_suggestion_query(query))
                 self.assertEqual(classify_query_intent(query), EDIT_SUGGESTION)
                 self.assertEqual(retrieval_route_for_intent(EDIT_SUGGESTION), "edit_suggestion")
+
+    def test_bare_edit_words_in_explanatory_queries_do_not_trigger_edit_mode(self):
+        cases = {
+            "how is retry implemented?": GENERIC_SEMANTIC,
+            "where is the patch logic?": GENERIC_SEMANTIC,
+            "explain the refactor": GENERIC_SEMANTIC,
+            "what does this change do?": GENERIC_SEMANTIC,
+            "where is this configured?": "declaration_or_configuration",
+        }
+        for query, expected in cases.items():
+            with self.subTest(query=query):
+                self.assertFalse(is_edit_suggestion_query(query))
+                self.assertNotEqual(classify_query_intent(query), ROUTING_EDIT_SUGGESTION)
+                self.assertEqual(classify_query_intent(query), expected)
 
     def test_output_contract_requires_file_paths_and_symbols(self):
         chunks = [

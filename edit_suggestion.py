@@ -16,19 +16,20 @@ EDIT_SUGGESTION = "edit_suggestion"
 
 _SAFE_FALLBACK = "I do not have enough repo-grounded context to propose a safe edit."
 
+_EDIT_REQUEST_PREFIX = r"^\s*(?:(?:please|kindly)\s+)?(?:(?:can|could|would)\s+you\s+)?"
+
 _EDIT_INTENT_PATTERNS = [
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
-        r"\bimprove\s+(?:this|it|the|[\w./-]+|performance)\b",
-        r"\bfix\s+(?:this|it|the|a\s+)?(?:bug|failure|error|issue|test|crash)?\b",
-        r"\bmake\s+(?:this|it|the|[\w./-]+)\s+faster\b",
+        # Imperative edit requests.  These are anchored so explanatory questions
+        # such as "how is retry implemented?" or "where is the patch logic?" do
+        # not enter Edit Suggestion Mode merely because they contain edit words.
+        _EDIT_REQUEST_PREFIX + r"(?:implement|modify|patch|refactor|optimi[sz]e|improve|change|update|fix)\b\s+\S+",
+        _EDIT_REQUEST_PREFIX + r"add\s+(?:a|an|the|one|new|missing|some)?\s*[\w-]+\s*(?:check|guard|test|feature|method|function|class|field|parameter|validation|cache|retry|handler|endpoint|implementation)?\b",
+        r"^\s*(?:(?:please|kindly)\s+)?make\s+(?:this|it|the|[\w./-]+)\s+faster\b",
         r"\bsuggest\s+(?:one|a|an)\s+(?:concrete\s+)?(?:update|change|edit|fix|improvement)\b",
-        r"\bchange\s+(?:this|it|the)\s+behavior\b",
+        r"\bwhat\s+(?:code|files?)\s+should\s+i\s+(?:edit|change|update|modify)\b",
         r"\bwhy\s+is\s+(?:this|it|the|[\w./-]+)\s+failing\b",
-        r"\bwhat\s+code\s+should\s+i\s+edit\b",
-        r"^\s*(?:please\s+)?update\s+[\w./-]+\s+(?:to|so|for|with)\b",
-        r"^\s*(?:please\s+)?add\s+(?:a|an|the|one|new|missing|some)?\s*[\w-]+\s*(?:check|guard|test|feature|method|function|class|field|parameter|validation|cache|retry|handler|endpoint|implementation)?\b",
-        r"\b(?:implement|modify|refactor|patch|optimi[sz]e)\b",
     )
 ]
 
