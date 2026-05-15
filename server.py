@@ -61,6 +61,14 @@ from ask_orchestrator import (
 )
 from execution_mode import ExecutionMode, execution_mode_env_key, get_execution_mode
 from local_retrieval import normalize_local_retrieval
+from edit_suggestion import (
+    EDIT_SUGGESTION,
+    build_edit_suggestion_context,
+    edit_suggestion_policy,
+    enforce_edit_suggestion_output,
+    is_edit_suggestion_query,
+    safe_context_fallback,
+)
 from remote_inference_schema import (
     RemoteInferenceRequest,
     RemoteProtocol,
@@ -175,7 +183,10 @@ def _is_performance_query(query: str) -> bool:
 
 
 def _reasoning_policy_for_query(query: str) -> tuple[str, str]:
-    # Performance queries take the highest priority — they need execution-path analysis.
+    # Explicit edit requests get the strict read-only patch recommendation contract.
+    if is_edit_suggestion_query(query):
+        return (edit_suggestion_policy(), EDIT_SUGGESTION)
+    # Pure performance analysis remains high-signal and execution-path focused.
     if _is_performance_query(query):
         return (_HIGH_SIGNAL_PERFORMANCE_POLICY, "performance")
     # Declaration/dependency queries get structured source-of-truth guidance so the
@@ -1000,8 +1011,8 @@ async def chat(request: Request):
                             if not part:
                                 break
                             decoded = part.decode("utf-8", errors="ignore")
-                            done_scan_buffer = f"{done_scan_buffer}{decoded}"[-32:]
-                            if "[DONE]" in done_scan_buffer:
+                            done_scan_buffer = f"{done_scan_buffer}{decoded}"[-4096:]
+                            if _remote_sse_has_done_event(done_scan_buffer):
                                 saw_done = True
                             yield decoded
                     _phase_log(request_id, "remote_payload_send_succeeded", stream=True)
@@ -1065,6 +1076,11 @@ async def chat(request: Request):
                     )
                 answer_text = str(remote_response.get("answer") or "")
                 remote_debug = remote_response.get("debug")
+                answer_text = _enforce_edit_suggestion_answer(
+                    answer_text,
+                    remote_debug if isinstance(remote_debug, dict) else client_debug,
+                    payload.get("query", {}).get("text", "") if isinstance(payload, dict) else "",
+                )
                 return {
                     "id": f"chatcmpl-{request_id}",
                     "object": "chat.completion",
@@ -1128,9 +1144,11 @@ async def chat(request: Request):
         )
         audit.info(f"DEBUG_PAYLOAD {request_id} | generated={bool(debug_payload)}")
         user_query = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+        if is_edit_suggestion_query(user_query):
+            text = enforce_edit_suggestion_output(text, _edit_context_from_debug_payload(debug_payload, user_query))
         is_performance = _is_performance_query(user_query)
         _, filtered_out = _validate_high_signal_output(text, is_performance)
-        query_type = "performance" if is_performance else "general"
+        query_type = EDIT_SUGGESTION if is_edit_suggestion_query(user_query) else ("performance" if is_performance else "general")
         audit.info(
             f"HIGH_SIGNAL {request_id} | query_type={query_type} | "
             f"applied={is_performance} | filtered_out_items={filtered_out}"
@@ -1178,6 +1196,82 @@ async def _stream_with_freshness(messages: list, max_tokens: int, request_id: st
 
     async for chunk in _stream(messages, max_tokens, request_id, t_start, debug_mode=debug_mode):
         yield chunk
+
+
+def _remote_payload_chunks_for_edit_context(payload: dict | None) -> list[dict]:
+    chunks = (payload or {}).get("chunks", []) if isinstance(payload, dict) else []
+    if not isinstance(chunks, list):
+        return []
+    return [
+        {
+            "file": c.get("path", c.get("file", "")),
+            "path": c.get("path", c.get("file", "")),
+            "content": c.get("content", ""),
+            "language": c.get("language", ""),
+            "source_type": c.get("source_type", "source_code"),
+        }
+        for c in chunks
+        if isinstance(c, dict)
+    ]
+
+
+def _remote_sse_has_done_event(decoded: str) -> bool:
+    for raw_line in decoded.splitlines():
+        if not raw_line.startswith("data:"):
+            continue
+        payload = raw_line[len("data:"):].strip()
+        if payload == "[DONE]":
+            return True
+    return False
+
+def _remote_sse_text(decoded: str) -> str:
+    text_parts: list[str] = []
+    for raw_line in decoded.splitlines():
+        if not raw_line.startswith("data: "):
+            continue
+        payload = raw_line[len("data: "):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            data = json.loads(payload)
+        except Exception:
+            continue
+        if isinstance(data, dict) and data.get("object") == "chat.completion.chunk":
+            text_parts.append(str(data.get("choices", [{}])[0].get("delta", {}).get("content", "") or ""))
+    return "".join(text_parts)
+
+
+def _remote_sse_error_event(decoded: str) -> str | None:
+    for raw_line in decoded.splitlines():
+        if not raw_line.startswith("data: "):
+            continue
+        payload = raw_line[len("data: "):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            data = json.loads(payload)
+        except Exception:
+            continue
+        if isinstance(data, dict) and (data.get("object") == "andescode.error" or data.get("event") == "error"):
+            return f"data: {json.dumps(data)}\n\n"
+    return None
+
+
+def _remote_sse_debug_event(decoded: str) -> str | None:
+    has_debug_event = False
+    for raw_line in decoded.splitlines():
+        if raw_line.strip() == "event: debug":
+            has_debug_event = True
+            break
+    if not has_debug_event:
+        return None
+    return decoded if decoded.endswith("\n\n") else f"{decoded}\n\n"
+
+def _enforce_edit_suggestion_answer(text: str, debug_payload: dict | None, query: str) -> str:
+    stripped = _strip_thinking(text or "", strip_edges=True)
+    if not is_edit_suggestion_query(query):
+        return stripped
+    return enforce_edit_suggestion_output(stripped, _edit_context_from_debug_payload(debug_payload, query))
 
 
 async def _remote_proxy_stream_with_freshness(messages: list, max_tokens: int, request_id: str, debug_mode: bool = False):
@@ -1234,6 +1328,10 @@ async def _remote_proxy_stream_with_freshness(messages: list, max_tokens: int, r
     serialized = json.dumps(payload).encode("utf-8")
     saw_done = False
     done_scan_buffer = ""
+    edit_query = is_edit_suggestion_query(payload.get("query", {}).get("text", "") if isinstance(payload, dict) else "")
+    buffered_answer = ""
+    sse_buffer = ""
+    debug_events: list[str] = []
     try:
         req = url_request.Request(
             endpoint,
@@ -1248,10 +1346,40 @@ async def _remote_proxy_stream_with_freshness(messages: list, max_tokens: int, r
                 if not part:
                     break
                 decoded = part.decode("utf-8", errors="ignore")
-                done_scan_buffer = f"{done_scan_buffer}{decoded}"[-32:]
-                if "[DONE]" in done_scan_buffer:
+                done_scan_buffer = f"{done_scan_buffer}{decoded}"[-4096:]
+                if _remote_sse_has_done_event(done_scan_buffer):
                     saw_done = True
-                yield decoded
+                if edit_query:
+                    sse_buffer += decoded
+                    while "\n\n" in sse_buffer:
+                        event_text, sse_buffer = sse_buffer.split("\n\n", 1)
+                        error_event = _remote_sse_error_event(event_text)
+                        if error_event:
+                            yield error_event
+                            yield "data: [DONE]\n\n"
+                            return
+                        debug_event = _remote_sse_debug_event(event_text)
+                        if debug_event and debug_mode:
+                            debug_events.append(debug_event)
+                        buffered_answer += _remote_sse_text(event_text)
+                else:
+                    yield decoded
+        if edit_query and saw_done:
+            if sse_buffer:
+                error_event = _remote_sse_error_event(sse_buffer)
+                if error_event:
+                    yield error_event
+                    yield "data: [DONE]\n\n"
+                    return
+                debug_event = _remote_sse_debug_event(sse_buffer)
+                if debug_event and debug_mode:
+                    debug_events.append(debug_event)
+                buffered_answer += _remote_sse_text(sse_buffer)
+            enforced = _enforce_edit_suggestion_answer(buffered_answer, client_debug, payload.get("query", {}).get("text", ""))
+            yield _make_chunk(enforced, request_id)
+            for debug_event in debug_events:
+                yield debug_event
+            yield "data: [DONE]\n\n"
         _phase_log(request_id, "remote_payload_send_succeeded", stream=True)
     except url_error.URLError as exc:
         reason = getattr(exc, "reason", exc)
@@ -1322,13 +1450,18 @@ async def remote_inference_ask(request: Request):
     if remote_request.options.stream:
         async def _remote_stream():
             final_text = ""
+            edit_query = is_edit_suggestion_query(remote_request.query.text)
             try:
                 for chunk in llm(prompt, max_tokens=max_tokens, stream=True, echo=False):
                     token = chunk["choices"][0]["text"]
                     if not token:
                         continue
                     final_text += token
-                    yield _make_chunk(token, request_id)
+                    if not edit_query:
+                        yield _make_chunk(token, request_id)
+                if edit_query:
+                    final_text = _enforce_edit_suggestion_answer(final_text, debug_payload, remote_request.query.text)
+                    yield _make_chunk(final_text, request_id)
                 if remote_request.options.debug:
                     yield format_debug_sse_event(debug_payload)
                 _phase_log(request_id, "remote_stream_completed", answer_chars=len(final_text))
@@ -1351,12 +1484,13 @@ async def remote_inference_ask(request: Request):
         _phase_log(request_id, "remote_answer_generation_failed", stream=False, error=exc)
         return _remote_error_payload("generation_failed", str(exc), request_id=request_id)
 
+    text = _enforce_edit_suggestion_answer(text, debug_payload, remote_request.query.text)
     _phase_log(request_id, "remote_answer_generation_finished", stream=False, answer_chars=len(text or ""))
     response = {
         "ok": True,
         "event": "final_answer",
         "request_id": request_id,
-        "answer": _strip_thinking(text, strip_edges=True),
+        "answer": text,
         "finished_at": datetime.now(timezone.utc).isoformat(),
     }
     if remote_request.options.debug:
@@ -1539,15 +1673,21 @@ def _build_context(
 
         # ── Code retrieval ────────────────────────────────────────────────────
         retrieval_debug = None
-        if debug_mode:
+        if debug_mode or return_debug:
             chunks, retrieval_debug = search_codebase(
                 query,
                 n_results=CONTEXT_CHUNKS,
-                debug_mode=debug_mode,
+                debug_mode=(debug_mode or return_debug),
                 return_debug=True,
             )
         else:
             chunks = search_codebase(query, n_results=CONTEXT_CHUNKS, debug_mode=debug_mode)
+
+        edit_full_files: list[str] = []
+        if is_edit_suggestion_query(query):
+            chunks, edit_full_files = _expand_edit_suggestion_chunks(query, chunks, pmap, ws)
+            if retrieval_debug is not None:
+                retrieval_debug.setdefault("edit_suggestion", {})["full_files_loaded"] = list(edit_full_files)
 
         normalized = normalize_local_retrieval(
             query=query,
@@ -1558,15 +1698,25 @@ def _build_context(
             index_state=index_state if isinstance(index_state, dict) else {},
         )
         normalized_chunks = normalized.to_prompt_chunks()
+        if return_debug and retrieval_debug is None:
+            retrieval_debug = {
+                "query": query,
+                "intent": EDIT_SUGGESTION if is_edit_suggestion_query(query) else "direct_retrieval",
+                "retrieval_route": "direct_retrieval",
+                "retrieval": {"route_taken": "direct_retrieval", "files_retrieved": []},
+            }
         if retrieval_debug is not None:
             retrieval_debug["normalized_retrieval"] = normalized.to_debug_dict()
 
         if not normalized_chunks:
+            empty_retrieval_context = ""
+            if is_edit_suggestion_query(query):
+                empty_retrieval_context = safe_context_fallback(["relevant files", "symbols or methods in relevant files"])
             sections = build_prompt_sections(
                 system_prefix=_BASE_SYSTEM,
                 reasoning_policy=reasoning_policy,
                 workspace_prefix=map_section,
-                retrieval_context="",
+                retrieval_context=empty_retrieval_context,
                 user_turn="",
             )
             if cache and repo_fp and workspace_signature:
@@ -1618,6 +1768,13 @@ def _build_context(
             f"CONTEXT {request_id} | chunks={len(normalized_chunks)} | "
             f"packed={packing_info['packed_chunks']} | files={packing_info['kept_files']}"
         )
+        if retrieval_debug is not None:
+            packed_chunks = packing_info["packed_chunks_raw"]
+            retrieval_debug["final_context"] = {
+                "files_used": [c.get("file") for c in packed_chunks if c.get("file")],
+                "context_size": sum(len(c.get("content", "")) for c in packed_chunks),
+                "packed_chunks": packed_chunks,
+            }
 
         base = [{"role": "system", "content": system}] + [
             m for m in messages if m.get("role") != "system"
@@ -1628,6 +1785,257 @@ def _build_context(
         audit.warning(f"CONTEXT_FAIL {request_id} | {_safe(e)}")
         return (messages, None) if return_debug else messages
 
+
+_FILE_HEADER_RE = re.compile(r"^\s*(?:#|//|--|;)?\s*File:\s+", re.IGNORECASE)
+
+
+def _chunk_raw_start_line(chunk: dict) -> int | None:
+    raw = chunk.get("start_line", chunk.get("line"))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def _chunk_start_line(chunk: dict) -> int | None:
+    """Return a one-based start line for standalone chunk metadata checks."""
+    value = _chunk_raw_start_line(chunk)
+    if value is None:
+        return None
+    return value + 1 if value == 0 else value
+
+
+def _chunk_start_line_for_base(chunk: dict, *, zero_based: bool) -> int | None:
+    value = _chunk_raw_start_line(chunk)
+    if value is None:
+        return None
+    return value + 1 if zero_based else value
+
+
+def _strip_injected_file_header(lines: list[str]) -> tuple[list[str], int]:
+    """Remove synthetic indexer file headers from chunk text before line math."""
+    if not lines or not _FILE_HEADER_RE.match(lines[0]):
+        return lines, 0
+    start = 1
+    if len(lines) > 1 and not lines[1].strip():
+        start = 2
+    return lines[start:], 1
+
+
+def _chunk_end_line(chunk: dict, line_count: int, *, zero_based: bool = False) -> int | None:
+    raw = chunk.get("end_line")
+    if raw is not None:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        if value < 0:
+            return None
+        return value + 1 if zero_based else value
+    start = _chunk_start_line_for_base(chunk, zero_based=zero_based)
+    if start is None:
+        return None
+    return start + max(line_count, 1) - 1
+
+
+def _read_indexed_file_from_disk(filename: str) -> str | None:
+    """Read the indexed file directly when the index root is available."""
+    root = None
+    try:
+        if _indexer_module and hasattr(_indexer_module, "_load_hashes"):
+            hashes = _indexer_module._load_hashes()
+            if isinstance(hashes, dict) and hashes.get("__root__"):
+                root = Path(str(hashes["__root__"])).resolve()
+    except Exception as exc:
+        audit.warning(f"EDIT_DISK_ROOT_LOOKUP_FAIL | {filename} | {exc}")
+        root = None
+    if root is None and _indexer_module and hasattr(_indexer_module, "ROOT"):
+        try:
+            root = Path(str(getattr(_indexer_module, "ROOT"))).resolve()
+        except Exception:
+            root = None
+    if root is None:
+        return None
+
+    target = (root / filename).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        return None
+    if not target.exists() or not target.is_file():
+        return None
+    try:
+        return target.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return target.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        audit.warning(f"EDIT_DISK_FILE_READ_FAIL | {filename} | {exc}")
+        return None
+
+
+def _deoverlap_indexed_chunks(ordered: list[dict]) -> tuple[str, bool, int]:
+    merged_lines: list[str] = []
+    current_end: int | None = None
+    clean = True
+    removed_headers = 0
+    zero_based = any(_chunk_raw_start_line(chunk) == 0 for chunk in ordered)
+
+    for chunk in ordered:
+        content = str(chunk.get("content") or "")
+        if not content:
+            continue
+        raw_lines = content.splitlines()
+        source_lines, header_count = _strip_injected_file_header(raw_lines)
+        removed_headers += header_count
+        start = _chunk_start_line_for_base(chunk, zero_based=zero_based)
+        end = _chunk_end_line(chunk, len(source_lines), zero_based=zero_based)
+        if start is None or end is None or end < start:
+            clean = False
+
+        lines = list(source_lines)
+        if current_end is not None and start is not None and start <= current_end:
+            overlap = min(current_end - start + 1, len(lines))
+            if overlap > 0:
+                lines = lines[overlap:]
+        elif current_end is not None and start is not None and start > current_end + 1:
+            clean = False
+
+        merged_lines.extend(lines)
+
+        if end is not None:
+            current_end = end if current_end is None else max(current_end, end)
+        else:
+            clean = False
+
+    if ordered and _chunk_start_line_for_base(ordered[0], zero_based=zero_based) != 1:
+        clean = False
+    return "\n".join(merged_lines), clean, removed_headers
+
+
+def _merge_indexed_file_chunks(filename: str) -> dict | None:
+    """Load an edit target as direct file contents or de-overlapped indexed chunks."""
+    if not INDEXER_READY or not _indexer_module or not filename:
+        return None
+    try:
+        file_chunks = _indexer_module.get_chunks_for_file(filename)
+    except Exception as exc:
+        audit.warning(f"EDIT_FULL_FILE_FETCH_FAIL | {filename} | {exc}")
+        return None
+    if not file_chunks:
+        return None
+    ordered = sorted(file_chunks, key=lambda c: _chunk_start_line(c) or 1)
+    first = ordered[0]
+    disk_content = _read_indexed_file_from_disk(filename)
+    if disk_content is not None:
+        content = disk_content
+        full_file = True
+        partial = False
+        source = "disk_file"
+        removed_headers = 0
+    else:
+        content, clean, removed_headers = _deoverlap_indexed_chunks(ordered)
+        full_file = bool(clean)
+        partial = not full_file
+        source = "indexed_chunks_deoverlapped" if clean else "indexed_chunks_merged_partial"
+
+    if not content.strip():
+        return None
+    end_line = content.count("\n") + 1 if content else 1
+    return {
+        "file": filename,
+        "content": content,
+        "language": first.get("language", ""),
+        "symbols": " ".join(str(c.get("symbols") or "") for c in ordered if c.get("symbols")),
+        "score": max(float(c.get("score") or 0.0) for c in ordered),
+        "line": 1,
+        "end_line": end_line,
+        "full_file": full_file,
+        "coverage": {
+            "returned": len(ordered),
+            "total": len(ordered),
+            "partial": partial,
+            "source": source,
+            "removed_repeated_file_headers": removed_headers,
+        },
+        "source_type": first.get("source_type", "source_code"),
+        "authority": first.get("authority", "referenced"),
+        "authority_reason": "edit_full_file_load" if full_file else "edit_indexed_chunk_merge_partial",
+    }
+
+
+def _discover_edit_related_files(query: str, chunks: list[dict], pmap: dict, workspace: dict) -> list[str]:
+    """Combine filename, semantic, symbol, import-neighborhood, config, and test signals."""
+    discovered: list[str] = []
+
+    def add(path: str | None) -> None:
+        if path and path not in discovered:
+            discovered.append(path)
+
+    for anchor in _extract_anchor_files(query):
+        add(anchor)
+    for chunk in chunks[:5]:
+        add(chunk.get("file"))
+
+    file_symbols = pmap.get("file_symbols", {}) if isinstance(pmap, dict) else {}
+    query_lower = (query or "").lower()
+    role_terms = ("viewmodel", "view_model", "service", "repository", "repo", "test", "config")
+    for fname, symbols in file_symbols.items():
+        stem = Path(fname).stem.lower()
+        symbol_blob = " ".join(symbols or []).lower() if isinstance(symbols, list) else ""
+        if any(term in query_lower and term in (stem + " " + symbol_blob) for term in role_terms):
+            add(fname)
+        elif any(sym.lower() in query_lower for sym in (symbols or []) if len(str(sym)) >= 4):
+            add(fname)
+
+    imports = ((workspace or {}).get("import_graph", {}) or {}).get("samples", {}) if isinstance(workspace, dict) else {}
+    if not isinstance(imports, dict):
+        imports = {}
+    seeds = list(discovered)
+    for seed in seeds:
+        for dep in imports.get(seed, []) if isinstance(imports.get(seed, []), (list, tuple, set)) else []:
+            add(dep)
+        for source, deps in imports.items():
+            if isinstance(deps, (list, tuple, set)) and seed in deps:
+                add(source)
+
+    file_to_module = (workspace or {}).get("file_to_module_map", {}) if isinstance(workspace, dict) else {}
+    candidate_files = set(file_to_module) | set(file_symbols)
+    for seed in list(discovered):
+        stem = Path(seed).stem.lower()
+        for fname in sorted(candidate_files):
+            lower = fname.lower()
+            if stem and stem in lower and "test" in lower:
+                add(fname)
+            if any(role in lower for role in ("viewmodel", "view_model", "service", "repository", "repo")) and Path(fname).parent == Path(seed).parent:
+                add(fname)
+
+    config_files = ((workspace or {}).get("config_graph", {}) or {}).get("config_files", []) if isinstance(workspace, dict) else []
+    for cfg in config_files[:3]:
+        add(cfg)
+    for manifest in ((workspace or {}).get("manifests", []) or [])[:3] if isinstance(workspace, dict) else []:
+        add(manifest)
+
+    return discovered[:10]
+
+
+def _expand_edit_suggestion_chunks(query: str, chunks: list[dict], pmap: dict, workspace: dict) -> tuple[list[dict], list[str]]:
+    """Load full indexed files for likely edit targets and keep semantic chunks for support."""
+    related_files = _discover_edit_related_files(query, chunks, pmap, workspace)
+    expanded: list[dict] = []
+    loaded: list[str] = []
+    for fname in related_files:
+        merged = _merge_indexed_file_chunks(fname)
+        if merged:
+            expanded.append(merged)
+            loaded.append(fname)
+    seen_identity = {(c.get("file"), c.get("line"), c.get("content")) for c in expanded}
+    for chunk in chunks:
+        identity = (chunk.get("file"), chunk.get("line"), chunk.get("content"))
+        if identity not in seen_identity:
+            expanded.append(chunk)
+            seen_identity.add(identity)
+    return expanded or chunks, loaded
 
 def _remote_error_payload(code: str, message: str, *, request_id: str = "", details: dict | None = None) -> dict:
     return {
@@ -1723,6 +2131,19 @@ def _build_remote_prompt_messages(remote_request: RemoteInferenceRequest) -> tup
             "retrieved_chunk_count": retrieval_meta.retrieved_chunk_count,
             "total_candidate_files": retrieval_meta.total_candidate_files,
             "files_retrieved": sorted({c.path for c in chunks_sorted}),
+        },
+        "final_context": {
+            "files_used": sorted({c.path for c in chunks_sorted}),
+            "packed_chunks": [
+                {
+                    "file": c.path,
+                    "path": c.path,
+                    "content": c.content,
+                    "language": c.language or "",
+                    "source_type": c.source_type,
+                }
+                for c in chunks_sorted
+            ],
         },
     }
     return prompt_messages, debug_payload
@@ -1840,12 +2261,17 @@ def _collect_local_remote_payload(
             "max_answer_tokens": max_tokens,
         },
     }
+    payload_chunks = _remote_payload_chunks_for_edit_context(payload)
     client_debug = {
         "mode": "remote_inference_client",
         "request_id": request_id,
         "remote_server_url": REMOTE_INFERENCE_SERVER_URL,
         "retrieval": normalized.to_debug_dict(),
         "retrieval_debug": retrieval_debug,
+        "final_context": {
+            "files_used": [c.get("file") for c in payload_chunks if c.get("file")],
+            "packed_chunks": payload_chunks,
+        },
     }
     return payload, client_debug
 
@@ -2230,9 +2656,23 @@ def _pack_context_section(
             budget_tokens=budget.context_budget_tokens,
         )
     packed = pack_chunks_to_budget(candidates, budget.context_budget_tokens)
-    extracted_paths = _extract_execution_paths([c["chunk"] for c in packed.chunks], max_paths=5)
-    path_section = _render_execution_path_context(extracted_paths) if _is_performance_query(query) else ""
-    code_section = path_section + "## Retrieved Code (Validation Context)\n\n"
+    packed_raw_chunks = [c["chunk"] for c in packed.chunks]
+    extracted_paths = _extract_execution_paths(packed_raw_chunks, max_paths=5)
+    path_section = _render_execution_path_context(extracted_paths) if (_is_performance_query(query) or is_edit_suggestion_query(query)) else ""
+    edit_section = ""
+    if is_edit_suggestion_query(query):
+        edit_ctx = build_edit_suggestion_context(packed_raw_chunks, query=query)
+        edit_lines = [
+            "## Edit Suggestion Retrieval Checklist",
+            "",
+            "- Likely edit/entry files read: " + (", ".join(edit_ctx.files) if edit_ctx.files else "none"),
+            "- Symbols/methods/classes found: " + (", ".join(edit_ctx.symbols[:20]) if edit_ctx.symbols else "none"),
+            "- Existing mechanisms detected: " + ("; ".join(edit_ctx.existing_mechanisms) if edit_ctx.existing_mechanisms else "none in retrieved context"),
+            "- Inferred validation commands: " + ("; ".join(edit_ctx.validation_commands) if edit_ctx.validation_commands else "no test command could be inferred"),
+            "",
+        ]
+        edit_section = "\n".join(edit_lines)
+    code_section = path_section + edit_section + "## Retrieved Code (Validation Context)\n\n"
     for c in packed.chunks:
         code_section += c["text"]
     if packed.truncated:
@@ -2346,7 +2786,7 @@ def _plan_files(query: str, pmap: dict) -> list[str]:
 def _diagnose_query(query: str, intent: str) -> dict:
     """Deterministic diagnosis stage before planning/generation."""
     mode = "architecture" if intent == "architecture_overview" else "bugfix"
-    patch_intent = intent == "code_fix_or_patch"
+    patch_intent = intent in {"code_fix_or_patch", EDIT_SUGGESTION}
     return {
         "mode": mode,
         "safe_semantic": semantic_cache_allowed(intent, retrieval_route_for_intent(intent)),
@@ -2437,7 +2877,7 @@ def _build_context_from_plan(
     semantic_fallback_files = []
 
     debug_payload = None
-    if debug_mode:
+    if debug_mode or return_debug:
         debug_payload = {
             "query": query,
             "intent": (diagnosis or {}).get("intent", "planned_context"),
@@ -2537,6 +2977,12 @@ def _build_context_from_plan(
         neighbor_files.extend(neighborhood)
     for fname in expanded_files:
         try:
+            if is_edit_suggestion_query(query):
+                merged = _merge_indexed_file_chunks(fname)
+                if merged:
+                    all_chunks.append(merged)
+                    files_loaded.append(fname)
+                    continue
             file_chunks = _indexer_module.get_chunks_for_file(fname)
             if file_chunks:
                 all_chunks.extend(file_chunks)
@@ -2567,6 +3013,14 @@ def _build_context_from_plan(
                     semantic_fallback_files.append(c["file"])
     except Exception:
         pass
+
+    if is_edit_suggestion_query(query):
+        all_chunks, edit_loaded = _expand_edit_suggestion_chunks(query, all_chunks, pmap, workspace)
+        for fname in edit_loaded:
+            if fname not in files_loaded:
+                files_loaded.append(fname)
+        if debug_payload is not None:
+            debug_payload.setdefault("edit_suggestion", {})["full_files_loaded"] = list(edit_loaded)
 
     if not all_chunks:
         authoritative_retrieved = sorted(
@@ -2661,6 +3115,7 @@ def _build_context_from_plan(
         }
         debug_payload["final_context"]["files_used"] = [c.get("file") for c in packed_chunks if c.get("file")]
         debug_payload["final_context"]["context_size"] = sum(len(c.get("content", "")) for c in packed_chunks)
+        debug_payload["final_context"]["packed_chunks"] = packed_chunks
     return (final_messages, files_loaded, debug_payload) if return_debug else (final_messages, files_loaded)
 
 
@@ -2680,6 +3135,7 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
     retrieval_signature = ""
     filtered_out = 0
     is_performance = False
+    buffer_answer_for_contract = False
     stream_path = "direct_retrieval"
     cached_semantic = False
     debug_emitted = False
@@ -2695,6 +3151,7 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
         decision = classify_query_intent_details(query)
         intent = decision["intent"]
         retrieval_route = decision["retrieval_route"]
+        buffer_answer_for_contract = intent == EDIT_SUGGESTION
         _phase_log(request_id, "intent_classified", intent=intent, retrieval_route=retrieval_route)
         orchestration = orchestration_plan(intent)
         diagnosis = _diagnose_query(query, intent)
@@ -2823,7 +3280,7 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                     in_think = True
                     t_think_start = time.perf_counter()
                     if before.strip():
-                        if not emitted_answer:
+                        if not buffer_answer_for_contract and not emitted_answer:
                             yield _make_chunk("\n\n---\n\n", request_id)
                             emitted_answer = True
                         if t_first_token is None:
@@ -2831,7 +3288,8 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                             _phase_log(request_id, "first_token_emitted", seconds=f"{t_first_token - t_start:.2f}")
                         token_count += 1
                         final_text += before
-                        yield _make_chunk(before, request_id)
+                        if not buffer_answer_for_contract:
+                            yield _make_chunk(before, request_id)
                     continue
                 if in_think:
                     if think_close in buffer:
@@ -2844,7 +3302,7 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                     emit = _strip_thinking(buffer[:-len(think_open)])
                     buffer = buffer[-len(think_open):]
                     if emit:
-                        if not emitted_answer:
+                        if not buffer_answer_for_contract and not emitted_answer:
                             yield _make_chunk("\n\n---\n\n", request_id)
                             emitted_answer = True
                         if t_first_token is None:
@@ -2852,19 +3310,28 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                             _phase_log(request_id, "first_token_emitted", seconds=f"{t_first_token - t_start:.2f}")
                         token_count += 1
                         final_text += emit
-                        yield _make_chunk(emit, request_id)
+                        if not buffer_answer_for_contract:
+                            yield _make_chunk(emit, request_id)
 
             if buffer and not in_think:
                 remainder = _strip_thinking(buffer)
                 if remainder:
-                    if not emitted_answer:
+                    if not buffer_answer_for_contract and not emitted_answer:
                         yield _make_chunk("\n\n---\n\n", request_id)
                         emitted_answer = True
                     final_text += remainder
-                    yield _make_chunk(remainder, request_id)
+                    if not buffer_answer_for_contract:
+                        yield _make_chunk(remainder, request_id)
 
             filtered_text, filtered_out = _validate_high_signal_output(final_text, is_performance)
-            if is_performance and filtered_text.strip() and filtered_text.strip() != final_text.strip():
+            if buffer_answer_for_contract:
+                filtered_text = enforce_edit_suggestion_output(
+                    filtered_text,
+                    _edit_context_from_debug_payload(debug_payload, query),
+                )
+                yield _make_chunk("\n\n---\n\n", request_id)
+                yield _make_chunk(filtered_text, request_id)
+            elif is_performance and filtered_text.strip() and filtered_text.strip() != final_text.strip():
                 yield _make_chunk(
                     "\n\n🔎 Refined high-signal summary:\n",
                     request_id,
@@ -2889,7 +3356,7 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
                 chunks=token_count,
             )
 
-        query_type = "performance" if is_performance else "general"
+        query_type = EDIT_SUGGESTION if intent == EDIT_SUGGESTION else ("performance" if is_performance else "general")
         audit.info(
             f"HIGH_SIGNAL {request_id} | query_type={query_type} | "
             f"applied={is_performance} | filtered_out_items={filtered_out}"
@@ -2954,6 +3421,21 @@ async def _stream(messages: list, max_tokens: int, request_id: str, t_start: flo
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _edit_context_from_debug_payload(debug_payload: dict | None, query: str):
+    if not isinstance(debug_payload, dict):
+        return build_edit_suggestion_context([], query=query)
+    final_context = debug_payload.get("final_context") if isinstance(debug_payload.get("final_context"), dict) else {}
+    chunks = final_context.get("packed_chunks") or final_context.get("packed_chunks_raw") or []
+    if not isinstance(chunks, list) or not chunks:
+        # Enforcement must be based on code actually sent to the model; if that
+        # post-pack context is unavailable, fail closed instead of trusting
+        # broader pre-pack retrieval candidates.
+        return build_edit_suggestion_context([], query=query)
+    if chunks and isinstance(chunks[0], dict) and "content" in chunks[0] and "file" not in chunks[0]:
+        chunks = [{**c, "file": c.get("path", "")} for c in chunks]
+    return build_edit_suggestion_context(chunks if isinstance(chunks, list) else [], query=query)
 
 def _messages_to_prompt(messages: list) -> str:
     prompt = ""
